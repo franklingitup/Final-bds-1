@@ -1,0 +1,988 @@
+openapi: 3.0.3
+info:
+  title: Platform API Gateway
+  version: 1.0.0
+  description: |
+    Unified API Gateway for the multi-tenant cloud deployment platform.
+    All frontend traffic is routed through this gateway which handles:
+    - Authentication (JWT and service account tokens)
+    - Authorization (organization and project scope)
+    - Rate limiting
+    - Request correlation
+    - Distributed tracing
+
+servers:
+  - url: http://localhost:8080/v1
+    description: Local development
+
+security:
+  - BearerAuth: []
+
+tags:
+  - name: Auth
+    description: Authentication and identity management
+  - name: Organizations
+    description: Organization management
+  - name: Members
+    description: Organization membership management
+  - name: Invitations
+    description: Invitation management
+  - name: Projects
+    description: Project management
+  - name: Project Members
+    description: Project membership management
+  - name: Audit
+    description: Audit log queries
+  - name: Service Accounts
+    description: Service account management
+  - name: API Tokens
+    description: API token management
+
+paths:
+  # ============================================================================
+  # Auth Service Routes
+  # ============================================================================
+  /auth/signup:
+    post:
+      tags: [Auth]
+      operationId: signup
+      summary: Create new user account
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SignupRequest"
+      responses:
+        "201":
+          description: Account created
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Authenticate user
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      operationId: refreshToken
+      summary: Refresh access token
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefreshRequest"
+      responses:
+        "200":
+          description: Token refreshed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: Revoke current session
+      responses:
+        "204":
+          description: Logged out
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      operationId: getCurrentUser
+      summary: Get current user info
+      responses:
+        "200":
+          description: User info
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /auth/verify-email:
+    post:
+      tags: [Auth]
+      operationId: verifyEmail
+      summary: Verify email address
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VerifyEmailRequest"
+      responses:
+        "200":
+          description: Email verified
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /auth/password-reset:
+    post:
+      tags: [Auth]
+      operationId: requestPasswordReset
+      summary: Request password reset
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PasswordResetRequest"
+      responses:
+        "200":
+          description: Reset email sent
+
+  /auth/password-reset/confirm:
+    post:
+      tags: [Auth]
+      operationId: confirmPasswordReset
+      summary: Confirm password reset
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConfirmPasswordResetRequest"
+      responses:
+        "200":
+          description: Password reset
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /auth/mfa/setup:
+    post:
+      tags: [Auth]
+      operationId: setupMFA
+      summary: Start MFA setup
+      responses:
+        "200":
+          description: MFA setup initiated
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /auth/mfa/enable:
+    post:
+      tags: [Auth]
+      operationId: enableMFA
+      summary: Enable MFA with TOTP code
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MFAEnableRequest"
+      responses:
+        "200":
+          description: MFA enabled
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /auth/mfa/disable:
+    post:
+      tags: [Auth]
+      operationId: disableMFA
+      summary: Disable MFA
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MFADisableRequest"
+      responses:
+        "200":
+          description: MFA disabled
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  # ============================================================================
+  # Tenant Service Routes
+  # ============================================================================
+  /organizations:
+    post:
+      tags: [Organizations]
+      operationId: createOrganization
+      summary: Create organization
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateOrganizationRequest"
+      responses:
+        "201":
+          description: Organization created
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /organizations/{orgId}:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+    get:
+      tags: [Organizations]
+      operationId: getOrganization
+      summary: Get organization
+      responses:
+        "200":
+          description: Organization details
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [Organizations]
+      operationId: updateOrganization
+      summary: Update organization
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateOrganizationRequest"
+      responses:
+        "200":
+          description: Organization updated
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    delete:
+      tags: [Organizations]
+      operationId: deleteOrganization
+      summary: Delete organization
+      responses:
+        "204":
+          description: Organization deleted
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /organizations/{orgId}/members:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+    get:
+      tags: [Members]
+      operationId: listMembers
+      summary: List organization members
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Member list
+
+  /organizations/{orgId}/members/{userId}:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+      - $ref: "#/components/parameters/UserId"
+    patch:
+      tags: [Members]
+      operationId: changeRole
+      summary: Change member role
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChangeRoleRequest"
+      responses:
+        "200":
+          description: Role changed
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    delete:
+      tags: [Members]
+      operationId: removeMember
+      summary: Remove member
+      responses:
+        "204":
+          description: Member removed
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /organizations/{orgId}/invitations:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+    post:
+      tags: [Invitations]
+      operationId: inviteMember
+      summary: Invite member
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InviteMemberRequest"
+      responses:
+        "201":
+          description: Invitation sent
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    get:
+      tags: [Invitations]
+      operationId: listInvitations
+      summary: List pending invitations
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Invitation list
+
+  /organizations/{orgId}/invitations/{id}:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      tags: [Invitations]
+      operationId: revokeInvitation
+      summary: Revoke invitation
+      responses:
+        "204":
+          description: Invitation revoked
+
+  /invitations/accept:
+    post:
+      tags: [Invitations]
+      operationId: acceptInvitation
+      summary: Accept invitation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AcceptInvitationRequest"
+      responses:
+        "200":
+          description: Invitation accepted
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  # ============================================================================
+  # Project Service Routes
+  # ============================================================================
+  /organizations/{orgId}/projects:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+    post:
+      tags: [Projects]
+      operationId: createProject
+      summary: Create project
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateProjectRequest"
+      responses:
+        "201":
+          description: Project created
+        "409":
+          $ref: "#/components/responses/Conflict"
+    get:
+      tags: [Projects]
+      operationId: listProjects
+      summary: List projects
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Project list
+
+  /organizations/{orgId}/projects/{projectId}:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      tags: [Projects]
+      operationId: getProject
+      summary: Get project
+      responses:
+        "200":
+          description: Project details
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [Projects]
+      operationId: updateProject
+      summary: Update project
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateProjectRequest"
+      responses:
+        "200":
+          description: Project updated
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    delete:
+      tags: [Projects]
+      operationId: deleteProject
+      summary: Delete project
+      responses:
+        "204":
+          description: Project deleted
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /organizations/{orgId}/projects/{projectId}/members:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+      - $ref: "#/components/parameters/ProjectId"
+    post:
+      tags: [Project Members]
+      operationId: addProjectMember
+      summary: Add project member
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AddProjectMemberRequest"
+      responses:
+        "201":
+          description: Member added
+        "409":
+          $ref: "#/components/responses/Conflict"
+    get:
+      tags: [Project Members]
+      operationId: listProjectMembers
+      summary: List project members
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Member list
+
+  /organizations/{orgId}/projects/{projectId}/members/{userId}:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/UserId"
+    patch:
+      tags: [Project Members]
+      operationId: changeProjectMemberRole
+      summary: Change project member role
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChangeProjectRoleRequest"
+      responses:
+        "200":
+          description: Role changed
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    delete:
+      tags: [Project Members]
+      operationId: removeProjectMember
+      summary: Remove project member
+      responses:
+        "204":
+          description: Member removed
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  # ============================================================================
+  # Audit Service Routes
+  # ============================================================================
+  /organizations/{orgId}/audit-logs:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+    get:
+      tags: [Audit]
+      operationId: listAuditLogs
+      summary: List audit logs
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - name: domain
+          in: query
+          schema:
+            type: string
+          description: Filter by event domain (e.g., auth, tenant, project)
+        - name: eventType
+          in: query
+          schema:
+            type: string
+          description: Filter by event type
+        - name: startTime
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Filter events after this time
+        - name: endTime
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Filter events before this time
+      responses:
+        "200":
+          description: Audit log list
+
+  /organizations/{orgId}/audit-logs/{eventId}:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+      - name: eventId
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Event ID
+    get:
+      tags: [Audit]
+      operationId: getAuditLog
+      summary: Get audit log entry
+      responses:
+        "200":
+          description: Audit log entry
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ============================================================================
+  # Service Account Routes
+  # ============================================================================
+  /organizations/{orgId}/service-accounts:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+    post:
+      tags: [Service Accounts]
+      operationId: createServiceAccount
+      summary: Create service account
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateServiceAccountRequest"
+      responses:
+        "201":
+          description: Service account created
+    get:
+      tags: [Service Accounts]
+      operationId: listServiceAccounts
+      summary: List service accounts
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Service account list
+
+  /organizations/{orgId}/service-accounts/{accountId}:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+      - name: accountId
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Service account ID
+    get:
+      tags: [Service Accounts]
+      operationId: getServiceAccount
+      summary: Get service account
+      responses:
+        "200":
+          description: Service account details
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Service Accounts]
+      operationId: deleteServiceAccount
+      summary: Delete service account
+      responses:
+        "204":
+          description: Service account deleted
+
+  # ============================================================================
+  # API Token Routes
+  # ============================================================================
+  /organizations/{orgId}/api-tokens:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+    post:
+      tags: [API Tokens]
+      operationId: createAPIToken
+      summary: Create API token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAPITokenRequest"
+      responses:
+        "201":
+          description: API token created
+    get:
+      tags: [API Tokens]
+      operationId: listAPITokens
+      summary: List API tokens
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: API token list
+
+  /organizations/{orgId}/api-tokens/{tokenId}:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+      - name: tokenId
+        in: path
+        required: true
+        schema:
+          type: string
+        description: API token ID
+    delete:
+      tags: [API Tokens]
+      operationId: revokeAPIToken
+      summary: Revoke API token
+      responses:
+        "204":
+          description: API token revoked
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Access token issued by the auth service
+
+  parameters:
+    OrgId:
+      name: orgId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: Organization ID
+    ProjectId:
+      name: projectId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: Project ID
+    UserId:
+      name: userId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: User ID
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+      description: Maximum number of items to return
+    Cursor:
+      name: cursor
+      in: query
+      schema:
+        type: string
+      description: Pagination cursor from previous response
+
+  schemas:
+    SignupRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 8
+      required: [email, password]
+
+    LoginRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+        totpCode:
+          type: string
+          description: TOTP code if MFA is enabled
+      required: [email, password]
+
+    TokenResponse:
+      type: object
+      properties:
+        accessToken:
+          type: string
+        refreshToken:
+          type: string
+        expiresIn:
+          type: integer
+          description: Access token TTL in seconds
+
+    RefreshRequest:
+      type: object
+      properties:
+        refreshToken:
+          type: string
+      required: [refreshToken]
+
+    VerifyEmailRequest:
+      type: object
+      properties:
+        token:
+          type: string
+      required: [token]
+
+    PasswordResetRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+      required: [email]
+
+    ConfirmPasswordResetRequest:
+      type: object
+      properties:
+        token:
+          type: string
+        newPassword:
+          type: string
+          minLength: 8
+      required: [token, newPassword]
+
+    MFAEnableRequest:
+      type: object
+      properties:
+        totpCode:
+          type: string
+      required: [totpCode]
+
+    MFADisableRequest:
+      type: object
+      properties:
+        totpCode:
+          type: string
+      required: [totpCode]
+
+    CreateOrganizationRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 64
+        slug:
+          type: string
+          pattern: "^[a-z0-9][a-z0-9-]*[a-z0-9]$"
+      required: [name, slug]
+
+    UpdateOrganizationRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        plan:
+          type: string
+
+    InviteMemberRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+        role:
+          type: string
+          enum: [admin, developer, viewer]
+      required: [email, role]
+
+    AcceptInvitationRequest:
+      type: object
+      properties:
+        token:
+          type: string
+      required: [token]
+
+    ChangeRoleRequest:
+      type: object
+      properties:
+        role:
+          type: string
+          enum: [owner, admin, developer, viewer]
+      required: [role]
+
+    CreateProjectRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 64
+        slug:
+          type: string
+          pattern: "^[a-z0-9][a-z0-9-]*[a-z0-9]$"
+        description:
+          type: string
+      required: [name, slug]
+
+    UpdateProjectRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+
+    AddProjectMemberRequest:
+      type: object
+      properties:
+        userId:
+          type: string
+          format: uuid
+        role:
+          type: string
+          enum: [admin, developer, viewer]
+      required: [userId, role]
+
+    ChangeProjectRoleRequest:
+      type: object
+      properties:
+        role:
+          type: string
+          enum: [admin, developer, viewer]
+      required: [role]
+
+    CreateServiceAccountRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+      required: [name]
+
+    CreateAPITokenRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        expiresIn:
+          type: string
+          description: Duration like "30d" or "1y"
+        scopes:
+          type: array
+          items:
+            type: string
+      required: [name]
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+        code:
+          type: string
+        requestId:
+          type: string
+      required: [error]
+
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Authentication required
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: Insufficient permissions
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: Resource conflict
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    TooManyRequests:
+      description: Rate limit exceeded
+      headers:
+        X-RateLimit-Limit:
+          schema:
+            type: integer
+          description: Requests allowed per minute
+        X-RateLimit-Remaining:
+          schema:
+            type: integer
+          description: Remaining requests
+        X-RateLimit-Reset:
+          schema:
+            type: integer
+          description: Seconds until limit resets
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"

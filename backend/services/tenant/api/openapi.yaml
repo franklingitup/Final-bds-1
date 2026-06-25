@@ -1,0 +1,364 @@
+openapi: 3.0.3
+info:
+  title: Tenant Service API
+  version: "1.0.0"
+  description: >
+    Organizations, memberships, and role-based access control for the platform.
+    All endpoints require a Bearer access token issued by the auth service.
+    Per-operation authorization is enforced against the caller's organization
+    membership role (owner, admin, developer, viewer).
+servers:
+  - url: /v1
+security:
+  - bearerAuth: []
+tags:
+  - name: Organizations
+  - name: Members
+  - name: Invitations
+
+paths:
+  /organizations:
+    post:
+      tags: [Organizations]
+      summary: Create an organization
+      description: Creates an organization and makes the caller its owner.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateOrganizationRequest' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Organization' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /organizations/{orgId}:
+    parameters:
+      - $ref: '#/components/parameters/OrgId'
+    get:
+      tags: [Organizations]
+      summary: Get an organization
+      description: Any member of the organization may read it.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Organization' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Organizations]
+      summary: Update an organization
+      description: Requires the owner role (org:manage).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateOrganizationRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Organization' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+    delete:
+      tags: [Organizations]
+      summary: Delete an organization
+      description: Requires the owner role. Fails if the org still has projects.
+      responses:
+        '204': { description: No Content }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /organizations/{orgId}/members:
+    parameters:
+      - $ref: '#/components/parameters/OrgId'
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+    get:
+      tags: [Members]
+      summary: List members
+      description: Any member may list the organization's members.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MemberList' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /organizations/{orgId}/members/{userId}:
+    parameters:
+      - $ref: '#/components/parameters/OrgId'
+      - $ref: '#/components/parameters/UserId'
+    patch:
+      tags: [Members]
+      summary: Change a member's role
+      description: >
+        Requires members:manage (owner or admin). Only an owner may grant or
+        modify the owner role, and the last owner cannot be demoted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChangeRoleRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Member' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [Members]
+      summary: Remove a member
+      description: >
+        Requires members:manage. Only an owner may remove an owner, and the
+        last owner cannot be removed.
+      responses:
+        '204': { description: No Content }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /organizations/{orgId}/invitations:
+    parameters:
+      - $ref: '#/components/parameters/OrgId'
+    post:
+      tags: [Invitations]
+      summary: Invite a user
+      description: Requires members:manage. Role must be admin, developer, or viewer.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InviteMemberRequest' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InvitationCreated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+    get:
+      tags: [Invitations]
+      summary: List invitations
+      description: Requires members:manage.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InvitationList' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /organizations/{orgId}/invitations/{id}:
+    parameters:
+      - $ref: '#/components/parameters/OrgId'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    delete:
+      tags: [Invitations]
+      summary: Revoke an invitation
+      description: Requires members:manage. Idempotent for non-pending invitations.
+      responses:
+        '204': { description: No Content }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /invitations/accept:
+    post:
+      tags: [Invitations]
+      summary: Accept an invitation
+      description: >
+        Consumes an invitation token and creates the caller's membership. The
+        caller's email must match the invitation's email.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AcceptInviteRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AcceptInviteResponse' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '410': { $ref: '#/components/responses/Gone' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    OrgId:
+      name: orgId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    UserId:
+      name: userId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema: { type: string }
+
+  schemas:
+    Role:
+      type: string
+      enum: [owner, admin, developer, viewer]
+    CreateOrganizationRequest:
+      type: object
+      required: [name, slug]
+      properties:
+        name: { type: string, minLength: 2, maxLength: 64 }
+        slug: { type: string, pattern: '^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$' }
+    UpdateOrganizationRequest:
+      type: object
+      properties:
+        name: { type: string, minLength: 2, maxLength: 64 }
+        plan: { type: string }
+    Organization:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        slug: { type: string }
+        plan: { type: string }
+        status: { type: string }
+        createdAt: { type: string, format: date-time }
+    Member:
+      type: object
+      properties:
+        userId: { type: string, format: uuid }
+        role: { $ref: '#/components/schemas/Role' }
+        status: { type: string }
+        createdAt: { type: string, format: date-time }
+    MemberList:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Member' }
+        nextCursor: { type: string }
+    ChangeRoleRequest:
+      type: object
+      required: [role]
+      properties:
+        role: { $ref: '#/components/schemas/Role' }
+    InviteMemberRequest:
+      type: object
+      required: [email, role]
+      properties:
+        email: { type: string, format: email }
+        role:
+          type: string
+          enum: [admin, developer, viewer]
+    InvitationCreated:
+      type: object
+      properties:
+        invitationId: { type: string, format: uuid }
+        status: { type: string, example: pending }
+    Invitation:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        role: { $ref: '#/components/schemas/Role' }
+        status: { type: string, enum: [pending, accepted, revoked, expired] }
+        expiresAt: { type: string, format: date-time }
+        createdAt: { type: string, format: date-time }
+    InvitationList:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Invitation' }
+        nextCursor: { type: string }
+    AcceptInviteRequest:
+      type: object
+      required: [token]
+      properties:
+        token: { type: string }
+    AcceptInviteResponse:
+      type: object
+      properties:
+        orgId: { type: string, format: uuid }
+        role: { $ref: '#/components/schemas/Role' }
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+            details:
+              type: array
+              items: { type: string }
+            requestId: { type: string }
+
+  responses:
+    Unauthenticated:
+      description: Missing or invalid credentials
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Authenticated but not authorized
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Resource not found or out of scope
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: State conflict (duplicate, last owner, etc.)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ValidationFailed:
+      description: Request schema/business validation failed
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Gone:
+      description: Invitation is no longer valid
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }

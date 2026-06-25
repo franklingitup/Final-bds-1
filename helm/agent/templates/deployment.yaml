@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "agent.name" . }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "agent.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "agent.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        {{- include "agent.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "agent.name" . }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agent
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: CONTROL_PLANE_ENDPOINT
+              value: {{ .Values.controlPlane.endpoint | quote }}
+            - name: MANAGED_NAMESPACE_PREFIX
+              value: {{ .Values.managedNamespacePrefix | quote }}
+            - name: INSTALL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "agent.name" . }}-install
+                  key: token
+                  optional: true
+          ports:
+            - name: http
+              containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

@@ -1,0 +1,8 @@
+# Environment overrides for dev. Apply with:
+#   helm upgrade --install control-plane helm/control-plane -f helm/values/dev.yaml
+api-gateway:
+  replicaCount: 1
+  autoscaling:
+    enabled: false
+auth:
+  replicaCount: 1

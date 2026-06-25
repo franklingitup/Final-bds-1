@@ -1,0 +1,16 @@
+# Binaries
+platform-agent
+*.exe
+
+# State files
+state.json
+
+# Go
+go.sum
+
+# IDE
+.idea/
+.vscode/
+
+# Testing
+coverage.out

@@ -1,0 +1,7 @@
+# Environment overrides for prod.
+api-gateway:
+  replicaCount: 3
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 30

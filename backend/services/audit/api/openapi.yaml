@@ -1,0 +1,137 @@
+openapi: 3.0.3
+info:
+  title: Audit Service API
+  version: "1.0.0"
+  description: >
+    Read-only, tenant-scoped access to the platform's immutable audit trail. The
+    audit service consumes platform domain events (auth.*, tenant.*, project.*,
+    cluster.*, deployment.*, secret.*) and records one append-only row per event.
+    All endpoints require a Bearer access token issued by the auth service;
+    results are isolated to the organization in the path via row-level security.
+servers:
+  - url: /v1
+security:
+  - bearerAuth: []
+tags:
+  - name: Audit Logs
+
+paths:
+  /organizations/{orgId}/audit-logs:
+    parameters:
+      - $ref: '#/components/parameters/OrgId'
+    get:
+      tags: [Audit Logs]
+      summary: List audit logs
+      description: >
+        Returns a cursor-paginated, reverse-chronological page of audit records
+        for the organization. Optional filters narrow by event type, domain,
+        actor, resource, and occurrence-time range.
+      parameters:
+        - { name: eventType, in: query, required: false, schema: { type: string }, description: 'Exact event type, e.g. tenant.organization.created' }
+        - { name: domain, in: query, required: false, schema: { type: string, enum: [auth, tenant, project, cluster, deployment, secret] }, description: 'Leading domain segment of the event type' }
+        - { name: actorId, in: query, required: false, schema: { type: string } }
+        - { name: resourceType, in: query, required: false, schema: { type: string } }
+        - { name: resourceId, in: query, required: false, schema: { type: string } }
+        - { name: from, in: query, required: false, schema: { type: string, format: date-time }, description: 'Inclusive lower bound on the event timestamp (RFC3339)' }
+        - { name: to, in: query, required: false, schema: { type: string, format: date-time }, description: 'Inclusive upper bound on the event timestamp (RFC3339)' }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuditLogList' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /organizations/{orgId}/audit-logs/{eventId}:
+    parameters:
+      - $ref: '#/components/parameters/OrgId'
+      - { name: eventId, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [Audit Logs]
+      summary: Get an audit log by source event id
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuditLog' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    OrgId:
+      name: orgId
+      in: path
+      required: true
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema: { type: string }
+
+  schemas:
+    AuditLog:
+      type: object
+      properties:
+        id: { type: string, format: uuid, description: 'Audit record id' }
+        eventId: { type: string, description: 'Source event id (unique; idempotency key)' }
+        eventType: { type: string, example: tenant.organization.created }
+        organizationId: { type: string }
+        actorId: { type: string }
+        resourceType: { type: string }
+        resourceId: { type: string }
+        timestamp: { type: string, format: date-time, description: 'When the event occurred' }
+        recordedAt: { type: string, format: date-time, description: 'When the audit row was written' }
+        payload: { type: object, additionalProperties: true, description: 'Event body as published' }
+    AuditLogList:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/AuditLog' }
+        nextCursor: { type: string }
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+            details:
+              type: array
+              items: { type: string }
+            requestId: { type: string }
+
+  responses:
+    Unauthenticated:
+      description: Missing or invalid credentials
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Resource not found or out of scope
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ValidationFailed:
+      description: Request schema/business validation failed
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }

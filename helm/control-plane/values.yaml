@@ -1,0 +1,63 @@
+# Per-service overrides for the umbrella chart. Each key matches a dependency
+# alias and is passed to the reusable `service` chart.
+_defaults: &defaults
+  replicaCount: 2
+  image:
+    repository: ghcr.io/bdsplatform/platform
+  serviceMonitor:
+    enabled: true
+
+api-gateway:
+  <<: *defaults
+  image:
+    repository: ghcr.io/bdsplatform/platform/api-gateway
+  replicaCount: 3
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 20
+
+auth:
+  image:
+    repository: ghcr.io/bdsplatform/platform/auth
+  replicaCount: 2
+
+tenant:
+  image:
+    repository: ghcr.io/bdsplatform/platform/tenant
+
+cluster:
+  image:
+    repository: ghcr.io/bdsplatform/platform/cluster
+
+provisioning:
+  image:
+    repository: ghcr.io/bdsplatform/platform/provisioning
+
+deployment:
+  image:
+    repository: ghcr.io/bdsplatform/platform/deployment
+
+build:
+  image:
+    repository: ghcr.io/bdsplatform/platform/build
+
+secrets:
+  image:
+    repository: ghcr.io/bdsplatform/platform/secrets
+
+domain:
+  image:
+    repository: ghcr.io/bdsplatform/platform/domain
+
+observability:
+  image:
+    repository: ghcr.io/bdsplatform/platform/observability
+
+notification:
+  image:
+    repository: ghcr.io/bdsplatform/platform/notification
+
+audit:
+  image:
+    repository: ghcr.io/bdsplatform/platform/audit

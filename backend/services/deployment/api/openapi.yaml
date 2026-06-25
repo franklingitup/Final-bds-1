@@ -1,0 +1,921 @@
+openapi: 3.0.3
+info:
+  title: Deployment Service API
+  version: 1.0.0
+  description: |
+    Manages applications, deployments, and releases for workload deployment
+    onto registered Kubernetes clusters.
+
+servers:
+  - url: http://localhost:8086/v1
+    description: Local development
+
+security:
+  - BearerAuth: []
+
+tags:
+  - name: Applications
+    description: Application management
+  - name: Deployments
+    description: Deployment management
+  - name: Releases
+    description: Release history and rollback
+  - name: Agent
+    description: Agent-specific endpoints for cluster reconciliation
+
+paths:
+  /organizations/{orgId}/projects/{projectId}/applications:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      tags: [Applications]
+      operationId: listApplications
+      summary: List applications
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Application list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApplicationList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [Applications]
+      operationId: createApplication
+      summary: Create application
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateApplicationRequest"
+      responses:
+        "201":
+          description: Application created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Application"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /organizations/{orgId}/applications/{appId}:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+      - $ref: "#/components/parameters/AppId"
+    get:
+      tags: [Applications]
+      operationId: getApplication
+      summary: Get application
+      responses:
+        "200":
+          description: Application details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Application"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [Applications]
+      operationId: updateApplication
+      summary: Update application
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateApplicationRequest"
+      responses:
+        "200":
+          description: Application updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Application"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Applications]
+      operationId: deleteApplication
+      summary: Delete application
+      responses:
+        "204":
+          description: Application deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /organizations/{orgId}/deployments:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+    post:
+      tags: [Deployments]
+      operationId: createDeployment
+      summary: Create deployment
+      description: Creates a new deployment and initial release.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDeploymentRequest"
+      responses:
+        "201":
+          description: Deployment created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeploymentWithRelease"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Application or cluster not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /organizations/{orgId}/applications/{appId}/deployments:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+      - $ref: "#/components/parameters/AppId"
+    get:
+      tags: [Deployments]
+      operationId: listDeployments
+      summary: List deployments for an application
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Deployment list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeploymentList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /organizations/{orgId}/deployments/{deploymentId}:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+      - $ref: "#/components/parameters/DeploymentId"
+    get:
+      tags: [Deployments]
+      operationId: getDeployment
+      summary: Get deployment
+      responses:
+        "200":
+          description: Deployment details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Deployment"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [Deployments]
+      operationId: updateDeployment
+      summary: Update deployment
+      description: Updates deployment configuration and creates a new release.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateDeploymentRequest"
+      responses:
+        "200":
+          description: Deployment updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeploymentWithRelease"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /organizations/{orgId}/deployments/{deploymentId}/rollback:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+      - $ref: "#/components/parameters/DeploymentId"
+    post:
+      tags: [Deployments]
+      operationId: rollbackDeployment
+      summary: Rollback deployment
+      description: Rolls back to a previous successful release.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RollbackRequest"
+      responses:
+        "200":
+          description: Rollback initiated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeploymentWithRelease"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: No previous successful release to rollback to
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /organizations/{orgId}/deployments/{deploymentId}/releases:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+      - $ref: "#/components/parameters/DeploymentId"
+    get:
+      tags: [Releases]
+      operationId: listReleases
+      summary: List releases for a deployment
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Release list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReleaseList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /organizations/{orgId}/deployments/{deploymentId}/releases/{releaseId}:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+      - $ref: "#/components/parameters/DeploymentId"
+      - $ref: "#/components/parameters/ReleaseId"
+    get:
+      tags: [Releases]
+      operationId: getRelease
+      summary: Get release
+      responses:
+        "200":
+          description: Release details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Release"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /organizations/{orgId}/deployments/{deploymentId}/releases/{releaseId}/status:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+      - $ref: "#/components/parameters/DeploymentId"
+      - $ref: "#/components/parameters/ReleaseId"
+    post:
+      tags: [Releases]
+      operationId: updateReleaseStatus
+      summary: Update release status
+      description: Called by the agent to report deployment progress.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateStatusRequest"
+      responses:
+        "200":
+          description: Status updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /organizations/{orgId}/clusters/{clusterId}/deployments:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+      - $ref: "#/components/parameters/ClusterId"
+    get:
+      tags: [Deployments]
+      operationId: listDeploymentsByCluster
+      summary: List deployments for a cluster
+      description: |
+        Legacy endpoint for listing deployments by cluster.
+        For agents, use /agent/clusters/{clusterId}/desired-state instead.
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Deployment list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeploymentList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # Agent Endpoints - Cluster credential authentication
+  /agent/clusters/{clusterId}/desired-state:
+    parameters:
+      - $ref: "#/components/parameters/ClusterId"
+    get:
+      tags: [Agent]
+      operationId: getDesiredState
+      summary: Get desired deployment state
+      description: |
+        Returns the desired deployment state for the authenticated cluster.
+        This endpoint is specifically designed for agents to consume during reconciliation.
+        
+        Authentication is via cluster credentials (X-Cluster-ID and X-Agent-ID headers)
+        rather than user JWT tokens.
+      security:
+        - ClusterAuth: []
+      responses:
+        "200":
+          description: Desired deployment state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DesiredStateResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Cluster ID mismatch or invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /agent/deployments/{deploymentId}/releases/{releaseId}/status:
+    parameters:
+      - $ref: "#/components/parameters/DeploymentId"
+      - $ref: "#/components/parameters/ReleaseId"
+    post:
+      tags: [Agent]
+      operationId: updateDeploymentStatusFromAgent
+      summary: Update deployment status (agent)
+      description: |
+        Called by agents to report deployment progress during reconciliation.
+        
+        Authentication is via cluster credentials (X-Cluster-ID and X-Agent-ID headers)
+        rather than user JWT tokens.
+      security:
+        - ClusterAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateStatusRequest"
+      responses:
+        "200":
+          description: Status updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    ClusterAuth:
+      type: apiKey
+      in: header
+      name: X-Cluster-ID
+      description: |
+        Cluster credential authentication for agents.
+        Requires both X-Cluster-ID and X-Agent-ID headers.
+
+  parameters:
+    OrgId:
+      name: orgId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ProjectId:
+      name: projectId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    AppId:
+      name: appId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    DeploymentId:
+      name: deploymentId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ReleaseId:
+      name: releaseId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ClusterId:
+      name: clusterId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    Cursor:
+      name: cursor
+      in: query
+      schema:
+        type: string
+
+  schemas:
+    Application:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        organizationId:
+          type: string
+          format: uuid
+        projectId:
+          type: string
+          format: uuid
+        name:
+          type: string
+        slug:
+          type: string
+        description:
+          type: string
+        runtimeType:
+          type: string
+          enum: [container, function, job]
+        createdAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - organizationId
+        - projectId
+        - name
+        - slug
+        - runtimeType
+        - createdAt
+
+    ApplicationList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Application"
+        nextCursor:
+          type: string
+      required:
+        - items
+
+    CreateApplicationRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 64
+        slug:
+          type: string
+          minLength: 2
+          maxLength: 64
+          pattern: "^[a-z0-9][a-z0-9-]*[a-z0-9]$"
+        description:
+          type: string
+          maxLength: 500
+        runtimeType:
+          type: string
+          enum: [container, function, job]
+          default: container
+      required:
+        - name
+        - slug
+
+    UpdateApplicationRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 64
+        description:
+          type: string
+          maxLength: 500
+
+    Deployment:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        organizationId:
+          type: string
+          format: uuid
+        applicationId:
+          type: string
+          format: uuid
+        clusterId:
+          type: string
+          format: uuid
+        image:
+          type: string
+        replicas:
+          type: integer
+        cpuRequest:
+          type: string
+        cpuLimit:
+          type: string
+        memoryRequest:
+          type: string
+        memoryLimit:
+          type: string
+        port:
+          type: integer
+        envVars:
+          type: array
+          items:
+            $ref: "#/components/schemas/EnvVar"
+        status:
+          type: string
+          enum: [pending, running, succeeded, failed, rolled_back]
+        readyReplicas:
+          type: integer
+        desiredReplicas:
+          type: integer
+        currentRevision:
+          type: integer
+        createdAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - organizationId
+        - applicationId
+        - clusterId
+        - image
+        - replicas
+        - status
+        - createdAt
+
+    DeploymentList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Deployment"
+        nextCursor:
+          type: string
+      required:
+        - items
+
+    DeploymentWithRelease:
+      type: object
+      properties:
+        deployment:
+          $ref: "#/components/schemas/Deployment"
+        release:
+          $ref: "#/components/schemas/Release"
+      required:
+        - deployment
+        - release
+
+    CreateDeploymentRequest:
+      type: object
+      properties:
+        applicationId:
+          type: string
+          format: uuid
+        clusterId:
+          type: string
+          format: uuid
+        image:
+          type: string
+        replicas:
+          type: integer
+          minimum: 1
+          default: 1
+        cpuRequest:
+          type: string
+          example: "100m"
+        cpuLimit:
+          type: string
+          example: "500m"
+        memoryRequest:
+          type: string
+          example: "128Mi"
+        memoryLimit:
+          type: string
+          example: "512Mi"
+        port:
+          type: integer
+        envVars:
+          type: array
+          items:
+            $ref: "#/components/schemas/EnvVar"
+      required:
+        - applicationId
+        - clusterId
+        - image
+        - replicas
+
+    UpdateDeploymentRequest:
+      type: object
+      properties:
+        image:
+          type: string
+        replicas:
+          type: integer
+          minimum: 1
+        cpuRequest:
+          type: string
+        cpuLimit:
+          type: string
+        memoryRequest:
+          type: string
+        memoryLimit:
+          type: string
+        port:
+          type: integer
+        envVars:
+          type: array
+          items:
+            $ref: "#/components/schemas/EnvVar"
+
+    RollbackRequest:
+      type: object
+      properties:
+        targetRevision:
+          type: integer
+          description: Revision to rollback to. If not specified, rolls back to previous successful release.
+
+    EnvVar:
+      type: object
+      properties:
+        name:
+          type: string
+        value:
+          type: string
+      required:
+        - name
+        - value
+
+    Release:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        deploymentId:
+          type: string
+          format: uuid
+        revision:
+          type: integer
+        image:
+          type: string
+        replicas:
+          type: integer
+        status:
+          type: string
+          enum: [pending, deploying, succeeded, failed, rolled_back]
+        startedAt:
+          type: string
+          format: date-time
+        finishedAt:
+          type: string
+          format: date-time
+        errorMessage:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - deploymentId
+        - revision
+        - image
+        - replicas
+        - status
+        - createdAt
+
+    ReleaseList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Release"
+        nextCursor:
+          type: string
+      required:
+        - items
+
+    UpdateStatusRequest:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [started, succeeded, failed]
+        readyReplicas:
+          type: integer
+        errorMessage:
+          type: string
+      required:
+        - status
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+        code:
+          type: string
+      required:
+        - error
+
+    # Agent-specific schemas
+    DesiredStateResponse:
+      type: object
+      description: Response containing desired deployment state for agent reconciliation.
+      properties:
+        clusterId:
+          type: string
+          format: uuid
+          description: The cluster these deployments are for.
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/DesiredDeployment"
+        nextCursor:
+          type: string
+          description: Pagination cursor for next page.
+      required:
+        - clusterId
+        - items
+
+    DesiredDeployment:
+      type: object
+      description: |
+        Represents the desired state for a single deployment.
+        This is a denormalized view joining applications, deployments, and releases.
+      properties:
+        deploymentId:
+          type: string
+          format: uuid
+          description: Unique deployment identifier.
+        releaseId:
+          type: string
+          format: uuid
+          description: ID of the current/latest active release.
+        applicationId:
+          type: string
+          format: uuid
+          description: ID of the application this deployment belongs to.
+        applicationName:
+          type: string
+          description: Human-readable application name.
+        applicationSlug:
+          type: string
+          description: URL-safe application identifier.
+        namespace:
+          type: string
+          description: Kubernetes namespace for the deployment (defaults to application slug).
+        image:
+          type: string
+          description: Container image to deploy.
+        revision:
+          type: integer
+          description: Release revision number.
+        replicas:
+          type: integer
+          description: Desired number of replicas.
+        port:
+          type: integer
+          description: Container port to expose.
+        envVars:
+          type: array
+          items:
+            $ref: "#/components/schemas/EnvVar"
+          description: Environment variables to set.
+        resourceRequests:
+          $ref: "#/components/schemas/ResourceSpec"
+          description: Kubernetes resource requests.
+        resourceLimits:
+          $ref: "#/components/schemas/ResourceSpec"
+          description: Kubernetes resource limits.
+        status:
+          type: string
+          enum: [pending, deploying, succeeded, failed]
+          description: Current deployment status.
+      required:
+        - deploymentId
+        - releaseId
+        - applicationId
+        - applicationName
+        - applicationSlug
+        - image
+        - revision
+        - replicas
+        - status
+
+    ResourceSpec:
+      type: object
+      description: Kubernetes resource specification.
+      properties:
+        cpu:
+          type: string
+          example: "100m"
+          description: CPU request/limit in Kubernetes format.
+        memory:
+          type: string
+          example: "128Mi"
+          description: Memory request/limit in Kubernetes format.
+
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Authentication required
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: Resource conflict
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"

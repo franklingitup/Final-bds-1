@@ -1,0 +1,20 @@
+# Rendered by the Provisioning Service from the cluster provision request.
+# Placeholders ({{ ... }}) are substituted with validated user input.
+cluster_name       = "{{ .ClusterName }}"
+region             = "{{ .Region }}"
+kubernetes_version = "{{ .KubernetesVersion }}"
+
+node_pools = [
+{{- range .NodePools }}
+  {
+    name          = "{{ .Name }}"
+    instance_type = "{{ .InstanceType }}"
+    min           = {{ .Min }}
+    max           = {{ .Max }}
+  },
+{{- end }}
+]
+
+networking = {
+  vpc_cidr = "{{ .Networking.VpcCidr }}"
+}

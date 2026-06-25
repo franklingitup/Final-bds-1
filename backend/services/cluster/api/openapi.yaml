@@ -1,0 +1,598 @@
+openapi: 3.0.3
+info:
+  title: Cluster Service API
+  version: 1.0.0
+  description: |
+    Manages customer Kubernetes cluster registration.
+    Phase 1: Existing cluster registration only (no EKS/GKE/AKS creation).
+
+servers:
+  - url: http://localhost:8085/v1
+    description: Local development
+
+security:
+  - BearerAuth: []
+
+tags:
+  - name: Clusters
+    description: Cluster CRUD operations
+  - name: Registration
+    description: Agent registration and tokens
+  - name: Health
+    description: Cluster health and heartbeat
+
+paths:
+  /organizations/{orgId}/clusters:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+    get:
+      tags: [Clusters]
+      operationId: listClusters
+      summary: List clusters
+      description: Returns a paginated list of clusters in the organization.
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, registering, connected, disconnected]
+          description: Filter by cluster status
+      responses:
+        "200":
+          description: Cluster list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClusterList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [Clusters]
+      operationId: createCluster
+      summary: Create cluster
+      description: Creates a new cluster in pending status awaiting agent registration.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateClusterRequest"
+      responses:
+        "201":
+          description: Cluster created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Cluster"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /organizations/{orgId}/clusters/{clusterId}:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+      - $ref: "#/components/parameters/ClusterId"
+    get:
+      tags: [Clusters]
+      operationId: getCluster
+      summary: Get cluster
+      description: Returns cluster details including inventory and health status.
+      responses:
+        "200":
+          description: Cluster details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Cluster"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [Clusters]
+      operationId: updateCluster
+      summary: Update cluster
+      description: Updates cluster metadata (name, description, labels).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateClusterRequest"
+      responses:
+        "200":
+          description: Cluster updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Cluster"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Clusters]
+      operationId: deleteCluster
+      summary: Delete cluster
+      description: Soft-deletes the cluster.
+      responses:
+        "204":
+          description: Cluster deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /organizations/{orgId}/clusters/{clusterId}/tokens:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+      - $ref: "#/components/parameters/ClusterId"
+    post:
+      tags: [Registration]
+      operationId: generateRegistrationToken
+      summary: Generate registration token
+      description: |
+        Generates a one-time registration token for the cluster agent.
+        The plaintext token is returned only in this response.
+        Any existing active token for this cluster is revoked.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GenerateTokenRequest"
+      responses:
+        "201":
+          description: Token created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenWithSecret"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: Cluster not in pending status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /organizations/{orgId}/clusters/{clusterId}/tokens/{tokenId}:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+      - $ref: "#/components/parameters/ClusterId"
+      - name: tokenId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Registration token ID
+    delete:
+      tags: [Registration]
+      operationId: revokeRegistrationToken
+      summary: Revoke registration token
+      description: Revokes an active registration token.
+      responses:
+        "204":
+          description: Token revoked
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /agent/register:
+    post:
+      tags: [Registration]
+      operationId: registerAgent
+      summary: Register cluster agent
+      security: []
+      description: |
+        Called by the cluster agent to complete registration.
+        The registration token authorizes this operation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AgentRegisterRequest"
+      responses:
+        "200":
+          description: Registration successful
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Cluster"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          description: Invalid or expired token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: Token already used or cluster not in pending status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /organizations/{orgId}/clusters/{clusterId}/heartbeat:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+      - $ref: "#/components/parameters/ClusterId"
+    post:
+      tags: [Health]
+      operationId: agentHeartbeat
+      summary: Agent heartbeat
+      description: |
+        Called periodically by the cluster agent to report health.
+        Updates cluster status and inventory.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AgentHeartbeatRequest"
+      responses:
+        "200":
+          description: Heartbeat recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Agent ID mismatch
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /organizations/{orgId}/clusters/{clusterId}/heartbeats:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+      - $ref: "#/components/parameters/ClusterId"
+    get:
+      tags: [Health]
+      operationId: getHeartbeats
+      summary: Get heartbeat history
+      description: Returns recent heartbeats for debugging connectivity issues.
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+          description: Number of heartbeats to return
+      responses:
+        "200":
+          description: Heartbeat list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HeartbeatList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Access token issued by the auth service
+
+  parameters:
+    OrgId:
+      name: orgId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: Organization ID
+    ClusterId:
+      name: clusterId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: Cluster ID
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+      description: Maximum number of items to return
+    Cursor:
+      name: cursor
+      in: query
+      schema:
+        type: string
+      description: Pagination cursor from previous response
+
+  schemas:
+    Cluster:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        organizationId:
+          type: string
+          format: uuid
+        name:
+          type: string
+        slug:
+          type: string
+        description:
+          type: string
+        status:
+          type: string
+          enum: [pending, registering, connected, disconnected, deleted]
+        kubernetesVersion:
+          type: string
+          example: "1.28.5"
+        nodeCount:
+          type: integer
+        cloudProvider:
+          type: string
+          enum: [aws, gcp, azure, on-prem, other]
+        region:
+          type: string
+        agentId:
+          type: string
+        registeredAt:
+          type: string
+          format: date-time
+        lastHeartbeatAt:
+          type: string
+          format: date-time
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+        createdAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - organizationId
+        - name
+        - slug
+        - status
+        - createdAt
+
+    ClusterList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Cluster"
+        nextCursor:
+          type: string
+      required:
+        - items
+
+    CreateClusterRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 64
+        slug:
+          type: string
+          minLength: 2
+          maxLength: 64
+          pattern: "^[a-z0-9][a-z0-9-]*[a-z0-9]$"
+        description:
+          type: string
+          maxLength: 500
+        cloudProvider:
+          type: string
+          enum: [aws, gcp, azure, on-prem, other]
+        region:
+          type: string
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+      required:
+        - name
+        - slug
+
+    UpdateClusterRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 64
+        description:
+          type: string
+          maxLength: 500
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+
+    GenerateTokenRequest:
+      type: object
+      properties:
+        expiresIn:
+          type: string
+          description: Duration like "24h", "7d"
+          default: "24h"
+
+    TokenWithSecret:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        clusterId:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [active, used, revoked, expired]
+        expiresAt:
+          type: string
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+        token:
+          type: string
+          description: Plaintext token, shown only once
+      required:
+        - id
+        - clusterId
+        - status
+        - expiresAt
+        - createdAt
+        - token
+
+    AgentRegisterRequest:
+      type: object
+      properties:
+        token:
+          type: string
+          description: Registration token from GenerateToken
+        agentId:
+          type: string
+          description: Unique agent identifier
+        kubernetesVersion:
+          type: string
+          example: "1.28.5"
+        nodeCount:
+          type: integer
+        cloudProvider:
+          type: string
+          enum: [aws, gcp, azure, on-prem, other]
+        region:
+          type: string
+      required:
+        - token
+        - agentId
+        - kubernetesVersion
+        - nodeCount
+
+    AgentHeartbeatRequest:
+      type: object
+      properties:
+        agentId:
+          type: string
+        kubernetesVersion:
+          type: string
+        nodeCount:
+          type: integer
+        apiServerHealthy:
+          type: boolean
+      required:
+        - agentId
+        - kubernetesVersion
+        - nodeCount
+        - apiServerHealthy
+
+    Heartbeat:
+      type: object
+      properties:
+        clusterId:
+          type: string
+          format: uuid
+        agentId:
+          type: string
+        kubernetesVersion:
+          type: string
+        nodeCount:
+          type: integer
+        apiServerHealthy:
+          type: boolean
+        receivedAt:
+          type: string
+          format: date-time
+      required:
+        - clusterId
+        - agentId
+        - apiServerHealthy
+        - receivedAt
+
+    HeartbeatList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Heartbeat"
+      required:
+        - items
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+        code:
+          type: string
+      required:
+        - error
+
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Authentication required
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: Insufficient permissions
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: Resource conflict
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"

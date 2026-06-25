@@ -1,0 +1,32 @@
+# Cluster agent values. Installed via the generated install command.
+image:
+  repository: ghcr.io/bdsplatform/platform/cluster-agent
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Control-plane connection (outbound only).
+controlPlane:
+  endpoint: "https://api.platform.example.com"
+  # One-time install token; consumed once then exchanged for an agent credential.
+  installToken: ""
+
+replicaCount: 2   # leader-elected HA
+
+namespace: platform-agent
+
+# Namespaces the agent is allowed to manage (workload namespaces).
+managedNamespacePrefix: "proj-"
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]

@@ -1,0 +1,57 @@
+apiVersion: v2
+name: control-plane
+description: Umbrella chart deploying all BDS Platform control-plane services.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+
+# Each service is the reusable `service` chart aliased per microservice.
+dependencies:
+  - name: service
+    alias: api-gateway
+    version: 0.1.0
+    repository: "file://../charts/service"
+  - name: service
+    alias: auth
+    version: 0.1.0
+    repository: "file://../charts/service"
+  - name: service
+    alias: tenant
+    version: 0.1.0
+    repository: "file://../charts/service"
+  - name: service
+    alias: cluster
+    version: 0.1.0
+    repository: "file://../charts/service"
+  - name: service
+    alias: provisioning
+    version: 0.1.0
+    repository: "file://../charts/service"
+  - name: service
+    alias: deployment
+    version: 0.1.0
+    repository: "file://../charts/service"
+  - name: service
+    alias: build
+    version: 0.1.0
+    repository: "file://../charts/service"
+  - name: service
+    alias: secrets
+    version: 0.1.0
+    repository: "file://../charts/service"
+  - name: service
+    alias: domain
+    version: 0.1.0
+    repository: "file://../charts/service"
+  - name: service
+    alias: observability
+    version: 0.1.0
+    repository: "file://../charts/service"
+  - name: service
+    alias: notification
+    version: 0.1.0
+    repository: "file://../charts/service"
+  - name: service
+    alias: audit
+    version: 0.1.0
+    repository: "file://../charts/service"

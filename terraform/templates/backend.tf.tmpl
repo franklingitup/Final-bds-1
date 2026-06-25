@@ -1,0 +1,9 @@
+# Backend config rendered per install session. Supports platform-managed or
+# customer-managed state. Example shows S3; GCS/AzureRM variants are analogous.
+terraform {
+  backend "s3" {
+    bucket = "{{ .StateBucket }}"
+    key    = "clusters/{{ .ClusterID }}/terraform.tfstate"
+    region = "{{ .StateRegion }}"
+  }
+}

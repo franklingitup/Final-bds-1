@@ -1,0 +1,440 @@
+openapi: 3.0.3
+info:
+  title: Project Service API
+  version: 1.0.0
+  description: |
+    Manages projects and project memberships within organizations.
+
+servers:
+  - url: http://localhost:8083/v1
+    description: Local development
+
+security:
+  - BearerAuth: []
+
+tags:
+  - name: Projects
+    description: Project CRUD operations
+  - name: Project Members
+    description: Manage project memberships
+
+paths:
+  /organizations/{orgId}/projects:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+    get:
+      tags: [Projects]
+      operationId: listProjects
+      summary: List projects
+      description: Returns a paginated list of projects in the organization.
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Project list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [Projects]
+      operationId: createProject
+      summary: Create project
+      description: Creates a new project. The caller becomes the project admin.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateProjectRequest"
+      responses:
+        "201":
+          description: Project created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /organizations/{orgId}/projects/{projectId}:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      tags: [Projects]
+      operationId: getProject
+      summary: Get project
+      description: Returns project details.
+      responses:
+        "200":
+          description: Project details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [Projects]
+      operationId: updateProject
+      summary: Update project
+      description: Updates project details. Requires project admin role.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateProjectRequest"
+      responses:
+        "200":
+          description: Project updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Projects]
+      operationId: deleteProject
+      summary: Delete project
+      description: Deletes the project and all its memberships. Requires project admin role.
+      responses:
+        "204":
+          description: Project deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /organizations/{orgId}/projects/{projectId}/members:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      tags: [Project Members]
+      operationId: listProjectMembers
+      summary: List project members
+      description: Returns a paginated list of project members.
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Member list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MemberList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      tags: [Project Members]
+      operationId: addProjectMember
+      summary: Add project member
+      description: Adds a user to the project. Requires project admin role.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AddMemberRequest"
+      responses:
+        "201":
+          description: Member added
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Member"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /organizations/{orgId}/projects/{projectId}/members/{userId}:
+    parameters:
+      - $ref: "#/components/parameters/OrgId"
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/UserId"
+    patch:
+      tags: [Project Members]
+      operationId: changeProjectMemberRole
+      summary: Change member role
+      description: Changes a member's role. Requires project admin role. The last admin cannot be demoted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChangeRoleRequest"
+      responses:
+        "200":
+          description: Role updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Member"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Project Members]
+      operationId: removeProjectMember
+      summary: Remove project member
+      description: Removes a user from the project. Requires project admin role. The last admin cannot be removed.
+      responses:
+        "204":
+          description: Member removed
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Access token issued by the auth service
+
+  parameters:
+    OrgId:
+      name: orgId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: Organization ID
+    ProjectId:
+      name: projectId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: Project ID
+    UserId:
+      name: userId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: User ID
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+      description: Maximum number of items to return
+    Cursor:
+      name: cursor
+      in: query
+      schema:
+        type: string
+      description: Pagination cursor from previous response
+
+  schemas:
+    Project:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        organizationId:
+          type: string
+          format: uuid
+        name:
+          type: string
+        slug:
+          type: string
+        description:
+          type: string
+        status:
+          type: string
+          enum: [active, archived]
+        createdAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - organizationId
+        - name
+        - slug
+        - status
+        - createdAt
+
+    ProjectList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Project"
+        nextCursor:
+          type: string
+      required:
+        - items
+
+    CreateProjectRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 64
+        slug:
+          type: string
+          minLength: 2
+          maxLength: 64
+          pattern: "^[a-z0-9][a-z0-9-]*[a-z0-9]$"
+        description:
+          type: string
+          maxLength: 500
+      required:
+        - name
+        - slug
+
+    UpdateProjectRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 64
+        description:
+          type: string
+          maxLength: 500
+
+    Member:
+      type: object
+      properties:
+        userId:
+          type: string
+          format: uuid
+        role:
+          $ref: "#/components/schemas/ProjectRole"
+        createdAt:
+          type: string
+          format: date-time
+      required:
+        - userId
+        - role
+        - createdAt
+
+    MemberList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Member"
+        nextCursor:
+          type: string
+      required:
+        - items
+
+    AddMemberRequest:
+      type: object
+      properties:
+        userId:
+          type: string
+          format: uuid
+        role:
+          $ref: "#/components/schemas/ProjectRole"
+      required:
+        - userId
+        - role
+
+    ChangeRoleRequest:
+      type: object
+      properties:
+        role:
+          $ref: "#/components/schemas/ProjectRole"
+      required:
+        - role
+
+    ProjectRole:
+      type: string
+      enum: [admin, developer, viewer]
+      description: Project membership role
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+        code:
+          type: string
+      required:
+        - error
+
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Authentication required
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: Insufficient permissions
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: Resource conflict
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
