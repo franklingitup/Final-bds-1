@@ -1,0 +1,65 @@
+{{- if .Values.metrics.prometheusRule.enabled }}
+# Alerts for the agent registration/recovery/heartbeat lifecycle. Requires the
+# Prometheus Operator PrometheusRule CRD. Metric names match
+# agents/platform-agent/internal/metrics/metrics.go.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "agent.name" . }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "agent.labels" . | nindent 4 }}
+    {{- with .Values.metrics.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: platform-agent.registration
+      rules:
+        # Sustained registration failures with no success/recovery => the agent
+        # cannot register (bad/expired/revoked token, control plane down).
+        - alert: PlatformAgentRegistrationFailing
+          expr: |
+            increase(agent_registration_failure_total[10m]) > 3
+            and increase(agent_registration_success_total[10m]) == 0
+            and increase(agent_registration_recovered_total[10m]) == 0
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Platform agent cannot register"
+            description: "Agent registration is failing repeatedly with no success or recovery for 10m."
+
+        # Heartbeats failing => control plane lost sight of the cluster.
+        - alert: PlatformAgentHeartbeatFailing
+          expr: |
+            increase(agent_heartbeat_failure_total[10m]) > 5
+            and increase(agent_heartbeat_success_total[10m]) == 0
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Platform agent heartbeats failing"
+            description: "No successful heartbeats for 10m; the cluster may be marked disconnected."
+
+        # Persisting state is failing => read-only volume / full disk. Recovery
+        # still works, but identity churn and repeated recovery will result.
+        - alert: PlatformAgentStateSaveFailing
+          expr: increase(agent_state_save_failures_total[15m]) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Platform agent cannot persist state"
+            description: "State-file saves are failing; check the writable volume mount and disk space."
+
+        # Frequent recoveries indicate flapping identity/state or a lost record.
+        - alert: PlatformAgentFrequentRecovery
+          expr: increase(agent_registration_recovered_total[1h]) > 5
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Platform agent recovering frequently"
+            description: "Agent has recovered registration more than 5 times in the last hour."
+{{- end }}

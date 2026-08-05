@@ -77,7 +77,7 @@ RETURNING created_at, updated_at, version`
 
 func (r *clusterRepo) GetByID(ctx context.Context, id string) (*Cluster, error) {
 	c, err := database.QueryOne[Cluster](ctx, r.db.Conn(ctx),
-		"SELECT * FROM clusters WHERE id = $1", id)
+		"SELECT * FROM clusters WHERE id = $1 AND status != 'deleted'", id)
 	if err != nil {
 		return nil, err
 	}
@@ -98,7 +98,7 @@ func (r *clusterRepo) GetByIDWithoutTenant(ctx context.Context, id string) (*Clu
 
 func (r *clusterRepo) GetBySlug(ctx context.Context, slug string) (*Cluster, error) {
 	c, err := database.QueryOne[Cluster](ctx, r.db.Conn(ctx),
-		"SELECT * FROM clusters WHERE slug = $1", slug)
+		"SELECT * FROM clusters WHERE slug = $1 AND status != 'deleted'", slug)
 	if err != nil {
 		return nil, err
 	}

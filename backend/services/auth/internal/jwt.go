@@ -15,6 +15,12 @@ const jwtIssuer = "bdsplatform-auth"
 // AccessClaims are the claims embedded in a short-lived access token.
 type AccessClaims struct {
 	Email string `json:"email"`
+	// SID binds the access token to the refresh-token session that produced it.
+	// The gateway uses it to reject the access token the instant that session is
+	// revoked (logout / refresh rotation), well before the token's own expiry.
+	// It is additive: tokens minted before this field existed simply omit it and
+	// remain signature-valid.
+	SID string `json:"sid,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -38,12 +44,16 @@ func NewJWTIssuer(cfg config.AuthConfig) *JWTIssuer {
 }
 
 // Issue mints an access token for the user, returning the signed token, its JTI
-// (for revocation tracking), and its lifetime in seconds.
-func (i *JWTIssuer) Issue(userID, email string) (token, jti string, expiresIn int, err error) {
+// (for revocation tracking), and its lifetime in seconds. sessionID binds the
+// token to the refresh-token session it was issued alongside so the token can be
+// revoked at the gateway when that session is revoked; pass "" for tokens with
+// no owning session.
+func (i *JWTIssuer) Issue(userID, email, sessionID string) (token, jti string, expiresIn int, err error) {
 	now := i.now()
 	jti = uuid.NewString()
 	claims := AccessClaims{
 		Email: email,
+		SID:   sessionID,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    jwtIssuer,
 			Subject:   userID,

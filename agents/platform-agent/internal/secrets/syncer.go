@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/bdsplatform/platform/agents/platform-agent/internal/controlplane"
+	"github.com/bdsplatform/platform/agents/platform-agent/internal/metrics"
 )
 
 // Config holds secrets syncer configuration.
@@ -23,6 +24,10 @@ type Config struct {
 	Namespace string
 	// AgentCredentials for authenticating with the Secrets Service.
 	AgentCredentials controlplane.AgentCredentials
+	// IsLeader gates secret synchronization on leadership. When nil (leader
+	// election disabled) every cycle proceeds; when set, a cycle is skipped
+	// while this replica is a follower.
+	IsLeader func() bool
 }
 
 // DefaultConfig returns a default configuration.
@@ -120,6 +125,13 @@ func (s *Syncer) Run(ctx context.Context) error {
 
 // sync performs a single synchronization cycle.
 func (s *Syncer) sync(ctx context.Context) {
+	// Leadership gate: followers do not sync secrets.
+	if s.cfg.IsLeader != nil && !s.cfg.IsLeader() {
+		metrics.ReconcileSkipped.Inc()
+		s.log.Debug("skipping secrets sync cycle: not leader")
+		return
+	}
+
 	s.log.Debug("starting secrets sync cycle")
 
 	// Fetch secrets from control plane.

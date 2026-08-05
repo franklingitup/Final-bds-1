@@ -3,6 +3,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -65,6 +66,7 @@ func (s *Service) Handler() fiber.Handler {
 
 func (s *Service) proxy(c *fiber.Ctx) error {
 	ctx := c.UserContext()
+	bodyBytes := c.Body()
 
 	// Build target URL.
 	path := c.Path()
@@ -80,7 +82,7 @@ func (s *Service) proxy(c *fiber.Ctx) error {
 	targetURL.RawQuery = string(c.Request().URI().QueryString())
 
 	// Create the outbound request.
-	req, err := http.NewRequestWithContext(ctx, c.Method(), targetURL.String(), c.Request().BodyStream())
+	req, err := http.NewRequestWithContext(ctx, c.Method(), targetURL.String(), bytes.NewReader(bodyBytes))
 	if err != nil {
 		return fmt.Errorf("proxy: create request: %w", err)
 	}
@@ -88,7 +90,6 @@ func (s *Service) proxy(c *fiber.Ctx) error {
 	// Forward headers.
 	c.Request().Header.VisitAll(func(key, value []byte) {
 		k := string(key)
-		// Skip hop-by-hop headers.
 		if isHopByHop(k) {
 			return
 		}
@@ -102,7 +103,6 @@ func (s *Service) proxy(c *fiber.Ctx) error {
 	req.Header.Set("X-Real-IP", c.IP())
 
 	// Make the request.
-	start := time.Now()
 	resp, err := s.client.Do(req)
 	if err != nil {
 		s.log.ErrorContext(ctx, "proxy request failed",
@@ -114,28 +114,24 @@ func (s *Service) proxy(c *fiber.Ctx) error {
 	}
 	defer resp.Body.Close()
 
-	latency := time.Since(start)
-	s.log.DebugContext(ctx, "proxy request completed",
-		slog.String("method", c.Method()),
-		slog.String("path", path),
-		slog.Int("status", resp.StatusCode),
-		slog.Duration("latency", latency),
-	)
+	// Read response body.
+	respBody, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return fmt.Errorf("proxy: read upstream body: %w", readErr)
+	}
 
-	// Copy response headers.
+	// Copy response headers, skipping Content-Length (Fiber will set it).
 	for k, values := range resp.Header {
-		if isHopByHop(k) {
+		if isHopByHop(k) || k == "Content-Length" {
 			continue
 		}
 		for _, v := range values {
-			c.Response().Header.Add(k, v)
+			c.Response().Header.Set(k, v)
 		}
 	}
 
-	// Set status and copy body.
 	c.Status(resp.StatusCode)
-	_, err = io.Copy(c.Response().BodyWriter(), resp.Body)
-	return err
+	return c.Send(respBody)
 }
 
 // hopByHop headers that should not be forwarded.

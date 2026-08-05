@@ -127,5 +127,5 @@ func (f *fakeTenantRunner) WithTenant(ctx context.Context, orgID string, fn data
 type fakeOrgMemberStore struct{}
 
 func (f *fakeOrgMemberStore) GetOrgMember(ctx context.Context, userID string) (*authz.OrgMember, error) {
-	return nil, database.ErrNotFound
+	return nil, errors.NotFound("member not found")
 }

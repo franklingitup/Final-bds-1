@@ -27,7 +27,7 @@ func newFakeOrgMemberStore() *fakeOrgMemberStore {
 func (f *fakeOrgMemberStore) GetOrgMember(ctx context.Context, userID string) (*OrgMember, error) {
 	m, ok := f.members[userID]
 	if !ok {
-		return nil, database.ErrNotFound
+		return nil, errors.NotFound("member not found")
 	}
 	return m, nil
 }
@@ -88,7 +88,7 @@ func TestAuthorizeOrgMember_SuspendedMember(t *testing.T) {
 
 func TestAuthorizeOrgMember_InsufficientRole(t *testing.T) {
 	store := newFakeOrgMemberStore()
-	store.addMember("user-1", "org-1", OrgMember, "active") // OrgMember cannot ManageClusters
+	store.addMember("user-1", "org-1", RoleMember, "active") // RoleMember cannot ManageClusters
 
 	svc := NewAuthorizationService(&fakeTenantRunner{}, store, nil)
 
@@ -164,10 +164,10 @@ func TestAuthorizeOrgMember_AllRolesMatrix(t *testing.T) {
 		{"admin can manage members", OrgAdmin, ActionManageMembers, false},
 		{"admin can read audit", OrgAdmin, ActionReadAudit, false},
 
-		// OrgMember has read access only
-		{"member cannot manage clusters", OrgMember, ActionManageClusters, true},
-		{"member can read clusters", OrgMember, ActionReadClusters, false},
-		{"member can read deployments", OrgMember, ActionReadDeployment, false},
+		// RoleMember has read access only
+		{"member cannot manage clusters", RoleMember, ActionManageClusters, true},
+		{"member can read clusters", RoleMember, ActionReadClusters, false},
+		{"member can read deployments", RoleMember, ActionReadDeployment, false},
 
 		// OrgAuditor has audit read access
 		{"auditor can read audit", OrgAuditor, ActionReadAudit, false},

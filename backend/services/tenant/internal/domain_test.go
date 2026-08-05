@@ -32,7 +32,7 @@ func TestRole_toAuthzRole(t *testing.T) {
 	cases := map[Role]authz.OrgRole{
 		RoleOwner:     authz.OrgOwner,
 		RoleAdmin:     authz.OrgAdmin,
-		RoleDeveloper: authz.OrgMember,
+		RoleDeveloper: authz.RoleMember,
 		RoleViewer:    authz.OrgAuditor,
 	}
 	for in, want := range cases {

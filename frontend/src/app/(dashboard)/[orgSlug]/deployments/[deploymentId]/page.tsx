@@ -59,7 +59,9 @@ export default function DeploymentDetailPage() {
               title="Rollback Deployment"
               description="This will rollback to the previous release. Are you sure?"
               confirmLabel="Rollback"
-              onConfirm={() => rollback.mutateAsync()}
+              onConfirm={async () => {
+                await rollback.mutateAsync(undefined);
+              }}
             />
           </div>
         }

@@ -26,10 +26,13 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
+	"github.com/google/uuid"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
@@ -38,6 +41,8 @@ import (
 	"github.com/bdsplatform/platform/agents/platform-agent/internal/controlplane"
 	"github.com/bdsplatform/platform/agents/platform-agent/internal/inventory"
 	"github.com/bdsplatform/platform/agents/platform-agent/internal/k8s"
+	"github.com/bdsplatform/platform/agents/platform-agent/internal/leaderelection"
+	"github.com/bdsplatform/platform/agents/platform-agent/internal/metrics"
 	"github.com/bdsplatform/platform/agents/platform-agent/internal/reconciler"
 	"github.com/bdsplatform/platform/agents/platform-agent/internal/secrets"
 )
@@ -73,6 +78,40 @@ func main() {
 	// Create agent.
 	a := agent.New(cfg, client, collector, log)
 
+	// Set up leader election if enabled. The elector exposes an IsLeader
+	// predicate that gates the reconciler and secrets syncer so only one
+	// replica acts at a time. When disabled, isLeaderFn stays nil and the agent
+	// behaves exactly as before (every replica reconciles).
+	var isLeaderFn func() bool
+	var elector *leaderelection.Elector
+	if cfg.LeaderElectionEnabled {
+		clientset, err := newInClusterClientset()
+		if err != nil {
+			log.Error("failed to create Kubernetes client for leader election", "error", err)
+			os.Exit(1)
+		}
+		identity := leaderIdentity(cfg, log)
+		elector = leaderelection.New(leaderelection.Config{
+			LeaseName:      cfg.LeaseName,
+			LeaseNamespace: cfg.LeaseNamespace,
+			Identity:       identity,
+			LeaseDuration:  cfg.LeaseDuration,
+			RenewDeadline:  cfg.RenewDeadline,
+			RetryPeriod:    cfg.RetryPeriod,
+		}, clientset, log)
+		isLeaderFn = elector.IsLeader
+		a.SetLeaderElector(elector)
+		log.Info("leader election enabled",
+			"lease", cfg.LeaseName,
+			"namespace", cfg.LeaseNamespace,
+			"identity", identity,
+			"lease_duration", cfg.LeaseDuration.String(),
+			"renew_deadline", cfg.RenewDeadline.String(),
+			"retry_period", cfg.RetryPeriod.String())
+	} else {
+		log.Info("leader election disabled")
+	}
+
 	// Setup worker factories. These are called AFTER registration completes
 	// to ensure valid credentials are available. This fixes the first-boot
 	// credential race condition where workers would get empty credentials.
@@ -82,7 +121,7 @@ func main() {
 		log.Info("deployment reconciler enabled",
 			"interval", cfg.ReconcileInterval,
 			"namespace", cfg.Namespace)
-		workerFactory.ReconcilerFactory = makeReconcilerFactory(cfg, client, log)
+		workerFactory.ReconcilerFactory = makeReconcilerFactory(cfg, client, log, isLeaderFn)
 	} else {
 		log.Info("deployment reconciler disabled")
 	}
@@ -91,7 +130,7 @@ func main() {
 		log.Info("secrets syncer enabled",
 			"interval", cfg.SecretsSyncInterval,
 			"namespace", cfg.Namespace)
-		workerFactory.SecretsSyncerFactory = makeSecretsSyncerFactory(cfg, client, log)
+		workerFactory.SecretsSyncerFactory = makeSecretsSyncerFactory(cfg, client, log, isLeaderFn)
 	} else {
 		log.Info("secrets syncer disabled")
 	}
@@ -101,6 +140,13 @@ func main() {
 	// Setup graceful shutdown.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Start the metrics endpoint if configured. It is defaulted on when leader
+	// election is enabled so followers expose metrics; it stays off otherwise,
+	// preserving the agent's previous no-HTTP-server behaviour.
+	if cfg.MetricsAddr != "" {
+		startMetricsServer(ctx, cfg.MetricsAddr, log)
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -124,7 +170,7 @@ func main() {
 // makeReconcilerFactory returns a factory function that creates the reconciler
 // with the provided credentials. This is called AFTER registration to ensure
 // valid credentials are available.
-func makeReconcilerFactory(cfg config.Config, client *controlplane.Client, log *slog.Logger) func(creds controlplane.AgentCredentials) (*reconciler.Reconciler, error) {
+func makeReconcilerFactory(cfg config.Config, client *controlplane.Client, log *slog.Logger, isLeader func() bool) func(creds controlplane.AgentCredentials) (*reconciler.Reconciler, error) {
 	return func(creds controlplane.AgentCredentials) (*reconciler.Reconciler, error) {
 		// Create Kubernetes client.
 		k8sConfig, err := rest.InClusterConfig()
@@ -146,6 +192,7 @@ func makeReconcilerFactory(cfg config.Config, client *controlplane.Client, log *
 			StateFile:        cfg.ReconcilerStateFile,
 			Namespace:        cfg.Namespace,
 			AgentCredentials: creds,
+			IsLeader:         isLeader,
 		}
 
 		rec := reconciler.New(
@@ -162,7 +209,7 @@ func makeReconcilerFactory(cfg config.Config, client *controlplane.Client, log *
 // makeSecretsSyncerFactory returns a factory function that creates the secrets
 // syncer with the provided credentials. This is called AFTER registration to
 // ensure valid credentials are available.
-func makeSecretsSyncerFactory(cfg config.Config, client *controlplane.Client, log *slog.Logger) func(creds controlplane.AgentCredentials) (*secrets.Syncer, error) {
+func makeSecretsSyncerFactory(cfg config.Config, client *controlplane.Client, log *slog.Logger, isLeader func() bool) func(creds controlplane.AgentCredentials) (*secrets.Syncer, error) {
 	return func(creds controlplane.AgentCredentials) (*secrets.Syncer, error) {
 		// Create Kubernetes client.
 		k8sConfig, err := rest.InClusterConfig()
@@ -184,6 +231,7 @@ func makeSecretsSyncerFactory(cfg config.Config, client *controlplane.Client, lo
 			StateFile:        cfg.SecretsSyncerStateFile,
 			Namespace:        cfg.Namespace,
 			AgentCredentials: creds,
+			IsLeader:         isLeader,
 		}
 
 		syncer := secrets.New(
@@ -195,4 +243,58 @@ func makeSecretsSyncerFactory(cfg config.Config, client *controlplane.Client, lo
 
 		return syncer, nil
 	}
+}
+
+// newInClusterClientset builds a Kubernetes clientset from the in-cluster
+// service-account config. Used for leader election (Lease access).
+func newInClusterClientset() (kubernetes.Interface, error) {
+	k8sConfig, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, err
+	}
+	return kubernetes.NewForConfig(k8sConfig)
+}
+
+// leaderIdentity resolves this replica's Lease holder identity. It prefers the
+// value already resolved by config (LEASE_IDENTITY / POD_NAME / HOSTNAME) and
+// falls back to the OS hostname, then a random ID, so every replica is unique.
+func leaderIdentity(cfg config.Config, log *slog.Logger) string {
+	if cfg.LeaseIdentity != "" {
+		return cfg.LeaseIdentity
+	}
+	if host, err := os.Hostname(); err == nil && host != "" {
+		return host
+	}
+	id := "platform-agent-" + uuid.NewString()
+	log.Warn("no stable leader identity (POD_NAME/HOSTNAME) found, using random identity", "identity", id)
+	return id
+}
+
+// startMetricsServer serves the Prometheus metrics registry on addr until ctx
+// is cancelled. It runs in the background and logs, but never aborts, the agent
+// on failure so metrics can never take down reconciliation.
+func startMetricsServer(ctx context.Context, addr string, log *slog.Logger) {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", metrics.Handler())
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	go func() {
+		log.Info("starting metrics server", "addr", addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("metrics server stopped with error", "error", err)
+		}
+	}()
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Warn("metrics server shutdown error", "error", err)
+		}
+	}()
 }

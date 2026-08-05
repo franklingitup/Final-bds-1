@@ -67,7 +67,7 @@ func Init(ctx context.Context, cfg config.Config) (ShutdownFunc, error) {
 	return tp.Shutdown, nil
 }
 
-func newExporter(ctx context.Context, cfg config.OTELConfig) (*otlptracegrpc.Exporter, error) {
+func newExporter(ctx context.Context, cfg config.OTELConfig) (sdktrace.SpanExporter, error) {
 	endpoint := cfg.Endpoint
 	if u, err := url.Parse(cfg.Endpoint); err == nil && u.Host != "" {
 		endpoint = u.Host

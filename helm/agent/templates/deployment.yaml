@@ -5,49 +5,187 @@ metadata:
   namespace: {{ .Values.namespace }}
   labels:
     {{- include "agent.labels" . | nindent 4 }}
+
 spec:
   replicas: {{ .Values.replicaCount }}
+
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "agent.name" . }}
       app.kubernetes.io/instance: {{ .Release.Name }}
+
   template:
     metadata:
       labels:
         {{- include "agent.labels" . | nindent 8 }}
+
     spec:
       serviceAccountName: {{ include "agent.name" . }}
+
+      {{- if .Values.priorityClassName }}
+      priorityClassName: {{ .Values.priorityClassName | quote }}
+      {{- end }}
+
+      {{- if .Values.spreadReplicas.enabled }}
+      affinity:
+        podAntiAffinity:
+          {{- if eq .Values.spreadReplicas.mode "hard" }}
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: {{ include "agent.name" . }}
+                  app.kubernetes.io/instance: {{ .Release.Name }}
+              topologyKey: kubernetes.io/hostname
+          {{- else }}
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: {{ include "agent.name" . }}
+                    app.kubernetes.io/instance: {{ .Release.Name }}
+                topologyKey: kubernetes.io/hostname
+          {{- end }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: {{ if eq .Values.spreadReplicas.mode "hard" }}DoNotSchedule{{ else }}ScheduleAnyway{{ end }}
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "agent.name" . }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      {{- end }}
+
       securityContext:
         runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
+
       containers:
         - name: agent
+
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
+
           env:
-            - name: CONTROL_PLANE_ENDPOINT
+            #
+            # Required by platform-agent
+            #
+            - name: CONTROL_PLANE_URL
               value: {{ .Values.controlPlane.endpoint | quote }}
-            - name: MANAGED_NAMESPACE_PREFIX
-              value: {{ .Values.managedNamespacePrefix | quote }}
-            - name: INSTALL_TOKEN
+
+            - name: AGENT_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ include "agent.name" . }}-install
                   key: token
-                  optional: true
+
+            #
+            # Optional
+            #
+            - name: NAMESPACE
+              value: {{ .Values.namespace | quote }}
+
+            - name: RECONCILER_ENABLED
+              value: "true"
+
+            - name: SECRETS_SYNCER_ENABLED
+              value: "true"
+
+            - name: HEARTBEAT_INTERVAL
+              value: "30s"
+
+            - name: RECONCILE_INTERVAL
+              value: "30s"
+
+            #
+            # Leader election (optional)
+            #
+            - name: LEADER_ELECTION_ENABLED
+              value: "true"
+
+            - name: LEASE_NAME
+              value: "platform-agent-leader"
+
+            - name: LEASE_NAMESPACE
+              value: {{ .Values.namespace | quote }}
+
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+
+            #
+            # Stable identity + writable persistent state.
+            #
+            # POD_UID (downward API metadata.uid) is a stable AgentID fallback on
+            # first boot so the agent never invents a random identity that would
+            # change on every restart. Persisted/AGENT_ID values take precedence.
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+
+            # All agent state lives under the writable volume mounted below, so
+            # the pod can run with readOnlyRootFilesystem: true. Lost state is
+            # automatically rebuilt from the control plane on restart.
+            - name: STATE_FILE
+              value: {{ printf "%s/state.json" .Values.persistence.mountPath | quote }}
+
+            - name: RECONCILER_STATE_FILE
+              value: {{ printf "%s/reconciler-state.json" .Values.persistence.mountPath | quote }}
+
+            - name: SECRETS_SYNCER_STATE_FILE
+              value: {{ printf "%s/secret-sync-state.json" .Values.persistence.mountPath | quote }}
+
+          volumeMounts:
+            - name: state
+              mountPath: {{ .Values.persistence.mountPath | quote }}
+
           ports:
             - name: http
               containerPort: 8080
+
+          {{- if .Values.startupProbe.enabled }}
+          # Until the agent is up (registered + serving), liveness must not fire.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            failureThreshold: {{ .Values.startupProbe.failureThreshold }}
+            periodSeconds: {{ .Values.startupProbe.periodSeconds }}
+          {{- end }}
+
           livenessProbe:
             httpGet:
               path: /healthz
               port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+
           readinessProbe:
             httpGet:
               path: /readyz
               port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+
+      # Writable state volume. The container root filesystem stays read-only;
+      # this is the single writable path the agent needs. Choose emptyDir for
+      # ephemeral deployments (state is rebuilt from the control plane on
+      # restart) or a PVC when you want state to survive pod recreation.
+      volumes:
+        - name: state
+          {{- if eq .Values.persistence.type "pvc" }}
+          persistentVolumeClaim:
+            claimName: {{ include "agent.name" . }}-state
+          {{- else }}
+          emptyDir:
+            sizeLimit: {{ .Values.persistence.size | quote }}
+          {{- end }}

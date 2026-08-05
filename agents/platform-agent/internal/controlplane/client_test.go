@@ -119,8 +119,16 @@ func TestClient_Heartbeat(t *testing.T) {
 				if r.Method != http.MethodPost {
 					t.Errorf("expected POST, got %s", r.Method)
 				}
-				if r.URL.Path != "/v1/organizations/org-123/clusters/cluster-123/heartbeat" {
+				// Agent API uses /v1/agent/clusters/{clusterId}/heartbeat
+				if r.URL.Path != "/v1/agent/clusters/cluster-123/heartbeat" {
 					t.Errorf("unexpected path: %s", r.URL.Path)
+				}
+				// Agent auth uses X-Cluster-ID and X-Agent-ID headers
+				if r.Header.Get("X-Cluster-ID") != "cluster-123" {
+					t.Errorf("unexpected X-Cluster-ID: %s", r.Header.Get("X-Cluster-ID"))
+				}
+				if r.Header.Get("X-Agent-ID") != "agent-123" {
+					t.Errorf("unexpected X-Agent-ID: %s", r.Header.Get("X-Agent-ID"))
 				}
 
 				var req HeartbeatRequest
@@ -128,7 +136,7 @@ func TestClient_Heartbeat(t *testing.T) {
 					t.Errorf("decode request: %v", err)
 				}
 				if req.AgentID != "agent-123" {
-					t.Errorf("unexpected agent ID: %s", req.AgentID)
+					t.Errorf("unexpected agent ID in body: %s", req.AgentID)
 				}
 
 				w.Header().Set("Content-Type", "application/json")

@@ -98,6 +98,19 @@ func (s *fakeOrgStore) GetByID(_ context.Context, id string) (*Organization, err
 	return nil, errors.NotFound("org")
 }
 
+func (s *fakeOrgStore) GetBySlug(_ context.Context, slug string) (*Organization, error) {
+	for _, o := range s.byID {
+		if o.Slug == slug {
+			return o, nil
+		}
+	}
+	return nil, errors.NotFound("org")
+}
+
+func (s *fakeOrgStore) ListByUser(_ context.Context, userID string, page database.PageRequest) (database.Page[Organization], error) {
+	return database.Page[Organization]{}, nil
+}
+
 func (s *fakeOrgStore) Update(_ context.Context, o *Organization) error {
 	if _, ok := s.byID[o.ID]; !ok {
 		return errors.NotFound("org")

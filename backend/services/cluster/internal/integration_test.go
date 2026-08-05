@@ -408,4 +408,66 @@ func TestIntegration_TokenRevocation(t *testing.T) {
 	_, _ = g.db.Pool.Exec(ctx, "DELETE FROM clusters WHERE id = $1", cluster.ID)
 }
 
+// TestIntegration_DeletedClusterNotReturned proves a soft-deleted cluster is no
+// longer returned by GetByID or List, while the row is retained in the database.
+func TestIntegration_DeletedClusterNotReturned(t *testing.T) {
+	g := setupGateway(t)
+	ctx := context.Background()
+	userID := uuid.NewString()
+	token := g.signToken(userID, "test@example.com")
+	slug := "deleted-" + uuid.NewString()[:8]
+
+	// Create cluster.
+	resp := g.request(t, "POST", "/v1/organizations/"+g.orgID+"/clusters", CreateClusterRequest{
+		Name: "To Delete",
+		Slug: slug,
+	}, token)
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("create status = %d, body = %s", resp.StatusCode, body)
+	}
+	var created ClusterView
+	json.NewDecoder(resp.Body).Decode(&created)
+	resp.Body.Close()
+
+	// Soft-delete it.
+	resp = g.request(t, "DELETE", "/v1/organizations/"+g.orgID+"/clusters/"+created.ID, nil, token)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete status = %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// GET by ID must no longer return the cluster.
+	resp = g.request(t, "GET", "/v1/organizations/"+g.orgID+"/clusters/"+created.ID, nil, token)
+	if resp.StatusCode == http.StatusOK {
+		t.Errorf("soft-deleted cluster returned by GetByID (status %d), want not found", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// LIST must not include the soft-deleted cluster.
+	resp = g.request(t, "GET", "/v1/organizations/"+g.orgID+"/clusters", nil, token)
+	var list struct {
+		Items []ClusterView `json:"items"`
+	}
+	json.NewDecoder(resp.Body).Decode(&list)
+	resp.Body.Close()
+	for _, c := range list.Items {
+		if c.ID == created.ID {
+			t.Errorf("soft-deleted cluster %s present in list", created.ID)
+		}
+	}
+
+	// Confirm the row still exists in the DB (soft, not hard delete).
+	var status string
+	if err := g.db.Pool.QueryRow(ctx, "SELECT status FROM clusters WHERE id = $1", created.ID).Scan(&status); err != nil {
+		t.Fatalf("expected soft-deleted row to persist: %v", err)
+	}
+	if status != "deleted" {
+		t.Errorf("status = %q, want deleted", status)
+	}
+
+	// Cleanup.
+	_, _ = g.db.Pool.Exec(ctx, "DELETE FROM clusters WHERE id = $1", created.ID)
+}
+
 func strPtr(s string) *string { return &s }

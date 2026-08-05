@@ -116,6 +116,12 @@ type CreateDeploymentRequest struct {
 	MemoryLimit   *string  `json:"memoryLimit,omitempty"`
 	Port          *int     `json:"port,omitempty"`
 	EnvVars       []EnvVar `json:"envVars,omitempty"`
+	// GitOps optionally binds the new deployment to an Argo CD Application. When
+	// present (and the GitOps engine is enabled) the deployment is created as a
+	// GitOps deployment: an Argo CD Application is generated from this source.
+	// Additive and optional — omitting it preserves the existing image-based
+	// deployment behaviour exactly.
+	GitOps *GitOpsSource `json:"gitops,omitempty"`
 }
 
 type UpdateDeploymentRequest struct {

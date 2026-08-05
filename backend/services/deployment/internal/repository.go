@@ -3,7 +3,6 @@ package deployment
 import (
 	"context"
 	"encoding/json"
-	"time"
 
 	"github.com/google/uuid"
 
@@ -32,6 +31,10 @@ type DeploymentStore interface {
 	GetByID(ctx context.Context, id string) (*Deployment, error)
 	List(ctx context.Context, appID string, req database.PageRequest) (database.Page[Deployment], error)
 	ListByOrg(ctx context.Context, req database.PageRequest) (database.Page[Deployment], error)
+	// ListAllActive returns every non-deleted deployment visible in the current
+	// tenant context (RLS-scoped). Used by the build consumer to match built
+	// images to the deployments that run them.
+	ListAllActive(ctx context.Context) ([]Deployment, error)
 	ListByCluster(ctx context.Context, clusterID string, req database.PageRequest) (database.Page[Deployment], error)
 	Update(ctx context.Context, d *Deployment) error
 	UpdateStatus(ctx context.Context, id, status string, readyReplicas *int, errorMsg *string) error
@@ -185,7 +188,7 @@ RETURNING created_at, updated_at, version`
 
 func (r *deploymentRepo) GetByID(ctx context.Context, id string) (*Deployment, error) {
 	d, err := database.QueryOne[Deployment](ctx, r.db.Conn(ctx),
-		"SELECT * FROM deployments WHERE id = $1", id)
+		"SELECT * FROM deployments WHERE id = $1 AND status != 'deleted'", id)
 	if err != nil {
 		return nil, err
 	}
@@ -203,10 +206,10 @@ func (r *deploymentRepo) List(ctx context.Context, appID string, req database.Pa
 	var args []any
 
 	if cur.IsZero() {
-		sql = "SELECT * FROM deployments WHERE application_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2"
+		sql = "SELECT * FROM deployments WHERE application_id = $1 AND status != 'deleted' ORDER BY created_at DESC, id DESC LIMIT $2"
 		args = []any{appID, req.Limit + 1}
 	} else {
-		sql = "SELECT * FROM deployments WHERE application_id = $1 AND (created_at, id) < ($2, $3) ORDER BY created_at DESC, id DESC LIMIT $4"
+		sql = "SELECT * FROM deployments WHERE application_id = $1 AND status != 'deleted' AND (created_at, id) < ($2, $3) ORDER BY created_at DESC, id DESC LIMIT $4"
 		args = []any{appID, cur.CreatedAt, cur.ID, req.Limit + 1}
 	}
 
@@ -228,10 +231,10 @@ func (r *deploymentRepo) ListByCluster(ctx context.Context, clusterID string, re
 	var args []any
 
 	if cur.IsZero() {
-		sql = "SELECT * FROM deployments WHERE cluster_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2"
+		sql = "SELECT * FROM deployments WHERE cluster_id = $1 AND status != 'deleted' ORDER BY created_at DESC, id DESC LIMIT $2"
 		args = []any{clusterID, req.Limit + 1}
 	} else {
-		sql = "SELECT * FROM deployments WHERE cluster_id = $1 AND (created_at, id) < ($2, $3) ORDER BY created_at DESC, id DESC LIMIT $4"
+		sql = "SELECT * FROM deployments WHERE cluster_id = $1 AND status != 'deleted' AND (created_at, id) < ($2, $3) ORDER BY created_at DESC, id DESC LIMIT $4"
 		args = []any{clusterID, cur.CreatedAt, cur.ID, req.Limit + 1}
 	}
 
@@ -310,10 +313,10 @@ func (r *deploymentRepo) ListByOrg(ctx context.Context, req database.PageRequest
 	var args []any
 
 	if cur.IsZero() {
-		sql = "SELECT * FROM deployments ORDER BY created_at DESC, id DESC LIMIT $1"
+		sql = "SELECT * FROM deployments WHERE status != 'deleted' ORDER BY created_at DESC, id DESC LIMIT $1"
 		args = []any{req.Limit + 1}
 	} else {
-		sql = "SELECT * FROM deployments WHERE (created_at, id) < ($1, $2) ORDER BY created_at DESC, id DESC LIMIT $3"
+		sql = "SELECT * FROM deployments WHERE status != 'deleted' AND (created_at, id) < ($1, $2) ORDER BY created_at DESC, id DESC LIMIT $3"
 		args = []any{cur.CreatedAt, cur.ID, req.Limit + 1}
 	}
 
@@ -322,6 +325,18 @@ func (r *deploymentRepo) ListByOrg(ctx context.Context, req database.PageRequest
 		return database.Page[Deployment]{}, err
 	}
 	return database.BuildPage(items, req.Limit, func(d Deployment) database.Cursor { return d.Cursor() }), nil
+}
+
+// ListAllActive returns all non-deleted deployments in the tenant context.
+// Callers must run this within a tenant-scoped transaction so RLS isolates the
+// org. Results are unpaginated; deployments-per-org is bounded in practice.
+func (r *deploymentRepo) ListAllActive(ctx context.Context) ([]Deployment, error) {
+	items, err := database.QueryAll[Deployment](ctx, r.db.Conn(ctx),
+		"SELECT * FROM deployments WHERE status != 'deleted' ORDER BY created_at DESC, id DESC")
+	if err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 // SoftDelete marks a deployment as deleted but keeps the record.
@@ -456,6 +471,37 @@ func (r *releaseRepo) MarkFinished(ctx context.Context, id, status string, error
 		return apperrors.NotFound("release not found")
 	}
 	return nil
+}
+
+// ----------------------------------------------------------------------------
+// Processed Event Repository (consumer idempotency / deduplication)
+// ----------------------------------------------------------------------------
+
+// ProcessedEventStore records which events a durable consumer has already
+// handled so at-least-once redelivery is idempotent.
+type ProcessedEventStore interface {
+	// MarkProcessed records (consumer, eventID) as handled. It returns true when
+	// the row was newly inserted (first delivery) and false when the event was
+	// already processed (a duplicate). The write is idempotent and must run
+	// inside the same transaction as the work it guards so both commit atomically.
+	MarkProcessed(ctx context.Context, consumer, eventID, orgID string) (bool, error)
+}
+
+type processedEventRepo struct{ db *database.DB }
+
+// NewProcessedEventStore returns a Postgres-backed ProcessedEventStore.
+func NewProcessedEventStore(db *database.DB) ProcessedEventStore { return &processedEventRepo{db: db} }
+
+func (r *processedEventRepo) MarkProcessed(ctx context.Context, consumer, eventID, orgID string) (bool, error) {
+	const sql = `
+INSERT INTO deployment_processed_events (consumer, event_id, org_id)
+VALUES ($1, $2, $3)
+ON CONFLICT (consumer, event_id) DO NOTHING`
+	tag, err := r.db.Conn(ctx).Exec(ctx, sql, consumer, eventID, orgID)
+	if err != nil {
+		return false, database.MapError(err)
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 // ----------------------------------------------------------------------------

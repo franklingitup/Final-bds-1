@@ -1,0 +1,5 @@
+-- Remove force RLS on build service tables
+ALTER TABLE git_repositories NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE builds NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE build_logs NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE build_artifacts NO FORCE ROW LEVEL SECURITY;

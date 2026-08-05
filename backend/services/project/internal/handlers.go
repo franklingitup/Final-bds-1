@@ -70,6 +70,22 @@ func (h *Handler) GetProject(c *fiber.Ctx) error {
 	return c.JSON(toProjectView(p))
 }
 
+func (h *Handler) GetProjectBySlug(c *fiber.Ctx) error {
+	org := orgID(c)
+	if org == "" {
+		return errOrgRequired
+	}
+	slug := c.Params("slug")
+	if slug == "" {
+		return apperrors.Validation("slug is required")
+	}
+	p, err := h.svc.GetProjectBySlug(c.UserContext(), org, callerIdentity(c).UserID, slug)
+	if err != nil {
+		return err
+	}
+	return c.JSON(toProjectView(p))
+}
+
 func (h *Handler) ListProjects(c *fiber.Ctx) error {
 	org := orgID(c)
 	if org == "" {

@@ -9,10 +9,16 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/adaptor"
+	"github.com/gofiber/fiber/v2/middleware/cors"
+
+	"github.com/redis/go-redis/v9"
 
 	"github.com/bdsplatform/platform/backend/libs/config"
 	libmw "github.com/bdsplatform/platform/backend/libs/middleware"
 	"github.com/bdsplatform/platform/backend/libs/logger"
+	"github.com/bdsplatform/platform/backend/libs/ratelimit"
+	"github.com/bdsplatform/platform/backend/libs/security"
 	"github.com/bdsplatform/platform/backend/libs/telemetry"
 	"github.com/bdsplatform/platform/backend/services/gateway/internal/auth"
 	gwconfig "github.com/bdsplatform/platform/backend/services/gateway/internal/config"
@@ -26,32 +32,81 @@ func main() {
 	log := logger.New(cfg)
 
 	// Initialize telemetry.
-	shutdownTelemetry, err := telemetry.Init(cfg.OTEL, cfg.ServiceName)
+	ctx := context.Background()
+	shutdownTelemetry, err := telemetry.Init(ctx, cfg)
 	if err != nil {
 		log.Warn("telemetry initialization failed", "error", err)
 	}
-	defer shutdownTelemetry()
+	defer func() {
+		if shutdownTelemetry != nil {
+			_ = shutdownTelemetry(context.Background())
+		}
+	}()
 
 	// Create token validator.
 	validator := auth.NewValidator(cfg.Auth)
 
-	// Create rate limiter with custom config.
-	rateLimiter := middleware.NewRateLimiter(middleware.RateLimiterConfig{
-		RequestsPerMinute: gwCfg.RateLimitRequestsPerMinute,
-		BurstSize:         gwCfg.RateLimitBurstSize,
-	})
-
-	// Start cleanup goroutine for rate limiter.
-	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
-		for range ticker.C {
-			rateLimiter.Cleanup(10 * time.Minute)
+	// One Redis client, shared by rate limiting and token revocation (no
+	// duplicate clients). When a Redis URL is configured both features use the
+	// distributed backend across gateway replicas; otherwise rate limiting falls
+	// back to in-process and revocation is disabled.
+	var redisClient redis.UniversalClient
+	if gwCfg.RateLimitRedisURL != "" {
+		client, rlErr := ratelimit.ParseRedisURL(gwCfg.RateLimitRedisURL)
+		if rlErr != nil {
+			log.Error("failed to parse Redis URL", "error", rlErr)
+			os.Exit(1)
 		}
-	}()
+		if pingErr := client.Ping(ctx).Err(); pingErr != nil {
+			log.Error("failed to connect to Redis", "error", pingErr)
+			os.Exit(1)
+		}
+		defer func() { _ = client.Close() }()
+		redisClient = client
+	}
 
-	// Create router with the shared rate limiter.
-	r, err := router.New(validator, rateLimiter, gwCfg.Services, log)
+	// Create the rate limiter using the shared client when present.
+	var rateLimiter middleware.Limiter
+	if redisClient != nil {
+		rateLimiter = middleware.NewRedisRateLimiter(
+			ratelimit.NewRedisLimiter(redisClient, "gateway:"),
+			gwCfg.RateLimitRequestsPerMinute,
+			gwCfg.RateLimitBurstSize,
+			log,
+		)
+		log.Info("rate limiting enabled", "backend", "redis")
+	} else {
+		rlConfig := middleware.DefaultRateLimiterConfig()
+		rlConfig.RequestsPerMinute = gwCfg.RateLimitRequestsPerMinute
+		rlConfig.BurstSize = gwCfg.RateLimitBurstSize
+		memLimiter := middleware.NewRateLimiter(rlConfig)
+
+		// Start cleanup goroutine for the in-memory limiter.
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				memLimiter.Cleanup(10 * time.Minute)
+			}
+		}()
+
+		rateLimiter = memLimiter
+		log.Info("rate limiting enabled", "backend", "memory")
+	}
+
+	// Token revocation checker over the same Redis client, reusing the shared
+	// "revoked:" convention that the auth service writes to. Nil when Redis is
+	// not configured (signature-only auth).
+	var revoker *middleware.RevocationChecker
+	if redisClient != nil {
+		revoker = middleware.NewRevocationChecker(security.NewTokenRevocationList(redisClient, "revoked:"), log)
+		log.Info("token revocation enabled", "backend", "redis")
+	} else {
+		log.Warn("REDIS_URL not set; token revocation checks disabled (signature-only auth)")
+	}
+
+	// Create router with the shared rate limiter and revocation checker.
+	r, err := router.New(validator, revoker, rateLimiter, gwCfg.Services, log)
 	if err != nil {
 		log.Error("failed to create router", "error", err)
 		os.Exit(1)
@@ -63,6 +118,15 @@ func main() {
 		DisableStartupMessage: true,
 		ErrorHandler:          libmw.ErrorHandler(),
 	})
+
+	// CORS middleware - must be first to handle preflight OPTIONS requests.
+	app.Use(cors.New(cors.Config{
+		AllowOrigins:     gwCfg.CORSAllowedOrigins,
+		AllowMethods:     "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+		AllowHeaders:     "Origin,Content-Type,Accept,Authorization,X-Request-ID,X-Correlation-ID",
+		AllowCredentials: true,
+		MaxAge:           86400, // 24 hours
+	}))
 
 	// Standard middleware chain.
 	app.Use(libmw.Recover(log))
@@ -132,8 +196,5 @@ func registerOps(app *fiber.App, serviceName string, r *router.Router) {
 		return c.JSON(fiber.Map{"service": serviceName, "version": "dev"})
 	})
 
-	app.Get("/metrics", fiber.Handler(func(c *fiber.Ctx) error {
-		// Use the standard telemetry metrics handler.
-		return c.SendString("# Gateway metrics endpoint - use Prometheus scrape")
-	}))
+	app.Get("/metrics", adaptor.HTTPHandler(telemetry.MetricsHandler()))
 }

@@ -9,6 +9,14 @@ import (
 	apperrors "github.com/bdsplatform/platform/backend/libs/errors"
 )
 
+// Sentinel errors for repository operations.
+var (
+	// ErrNotFound indicates a resource was not found.
+	ErrNotFound = errors.New("database: resource not found")
+	// ErrConcurrentModification indicates an optimistic locking conflict.
+	ErrConcurrentModification = errors.New("database: concurrent modification detected")
+)
+
 // PostgreSQL SQLSTATE codes handled by MapError.
 const (
 	sqlStateUniqueViolation     = "23505"

@@ -12,6 +12,52 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestClient_ReportDeploymentProgressWithCreds(t *testing.T) {
+	var got DeploymentProgressRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/v1/agent/deployments/dep-1/releases/rel-1/progress", r.URL.Path)
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "cluster-1", r.Header.Get("X-Cluster-ID"))
+		assert.Equal(t, "agent-1", r.Header.Get("X-Agent-ID"))
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&got))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, 10*time.Second)
+	creds := AgentCredentials{ClusterID: "cluster-1", AgentID: "agent-1"}
+	err := client.ReportDeploymentProgressWithCreds(context.Background(), creds, "dep-1", "rel-1", DeploymentProgressRequest{
+		Phase:             "RollingOut",
+		Revision:          2,
+		RolloutPercentage: 66,
+		DesiredReplicas:   3,
+		ReadyReplicas:     2,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "RollingOut", got.Phase)
+	assert.Equal(t, 66, got.RolloutPercentage)
+	assert.Equal(t, 2, got.ReadyReplicas)
+}
+
+func TestClient_ReportDeploymentProgress_ErrorNonFatal(t *testing.T) {
+	// A missing endpoint (older control plane) returns an APIError the caller
+	// treats as non-fatal.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"not found"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, 10*time.Second)
+	err := client.ReportDeploymentProgressWithCreds(context.Background(),
+		AgentCredentials{ClusterID: "c", AgentID: "a"}, "dep-1", "rel-1", DeploymentProgressRequest{Phase: "Healthy"})
+	require.Error(t, err)
+	var apiErr *APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, http.StatusNotFound, apiErr.StatusCode)
+}
+
 func TestClient_GetDesiredDeployments(t *testing.T) {
 	desiredDeployments := []DesiredDeployment{
 		{
@@ -35,18 +81,22 @@ func TestClient_GetDesiredDeployments(t *testing.T) {
 	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "/v1/organizations/org-123/clusters/cluster-456/deployments", r.URL.Path)
-		assert.Equal(t, "Bearer test-token", r.Header.Get("Authorization"))
+		// Agent API uses /v1/agent/clusters/{clusterId}/desired-state
+		assert.Equal(t, "/v1/agent/clusters/cluster-456/desired-state", r.URL.Path)
+		// Agent auth uses X-Cluster-ID and X-Agent-ID headers
+		assert.Equal(t, "cluster-456", r.Header.Get("X-Cluster-ID"))
+		assert.Equal(t, "test-token", r.Header.Get("X-Agent-ID"))
 		assert.Equal(t, http.MethodGet, r.Method)
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(DesiredDeploymentsResponse{Items: desiredDeployments})
+		json.NewEncoder(w).Encode(DesiredStateResponse{Items: desiredDeployments})
 	}))
 	defer server.Close()
 
 	client := NewClient(server.URL, 10*time.Second)
 	ctx := context.Background()
 
+	// GetDesiredDeployments is deprecated but wraps GetDesiredState with legacy args
 	deployments, err := client.GetDesiredDeployments(ctx, "org-123", "cluster-456", "test-token")
 
 	require.NoError(t, err)
@@ -81,8 +131,12 @@ func TestClient_ReportDeploymentStatus_Started(t *testing.T) {
 	var receivedRequest DeploymentStatusRequest
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "/v1/organizations/org-123/deployments/dep-456/releases/rel-789/status", r.URL.Path)
-		assert.Equal(t, "Bearer test-token", r.Header.Get("Authorization"))
+		// Agent API uses /v1/agent/deployments/{deploymentId}/releases/{releaseId}/status
+		assert.Equal(t, "/v1/agent/deployments/dep-456/releases/rel-789/status", r.URL.Path)
+		// Agent auth uses X-Cluster-ID and X-Agent-ID headers
+		// Legacy ReportDeploymentStatus uses orgID as clusterID and accessToken as agentID
+		assert.Equal(t, "org-123", r.Header.Get("X-Cluster-ID"))
+		assert.Equal(t, "test-token", r.Header.Get("X-Agent-ID"))
 		assert.Equal(t, http.MethodPost, r.Method)
 		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
 

@@ -143,9 +143,26 @@ class ApiClient {
       (headers as Record<string, string>)["Authorization"] = `Bearer ${this.accessToken}`;
     }
 
+    // DEBUG: Log request details
+    console.log("[API_DEBUG] Request:", {
+      url,
+      method: fetchOptions.method || "GET",
+      bodyLength: fetchOptions.body ? (fetchOptions.body as string).length : 0,
+    });
+
     const response = await fetch(url, {
       ...fetchOptions,
       headers,
+    });
+
+    // DEBUG: Log response details
+    console.log("[API_DEBUG] Response:", {
+      url,
+      status: response.status,
+      statusText: response.statusText,
+      ok: response.ok,
+      contentType: response.headers.get("content-type"),
+      contentLength: response.headers.get("content-length"),
     });
 
     if (!response.ok) {
@@ -192,7 +209,27 @@ class ApiClient {
 
     const contentType = response.headers.get("content-type");
     if (contentType?.includes("application/json")) {
-      return response.json();
+      // DEBUG: Clone response to read body for logging without consuming it
+      const clonedResponse = response.clone();
+      const rawText = await clonedResponse.text();
+      console.log("[API_DEBUG] Response body (raw text):", {
+        length: rawText.length,
+        preview: rawText.substring(0, 500),
+        isEmpty: rawText.length === 0,
+      });
+
+      if (rawText.length === 0) {
+        console.error("[API_DEBUG] EMPTY RESPONSE BODY - this will cause json() to fail!");
+        // Return empty object to avoid SyntaxError
+        return {} as T;
+      }
+
+      try {
+        return await response.json();
+      } catch (jsonError) {
+        console.error("[API_DEBUG] JSON parse error:", jsonError);
+        throw jsonError;
+      }
     }
     return {} as T;
   }

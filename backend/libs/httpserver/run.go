@@ -2,7 +2,6 @@ package httpserver
 
 import (
 	"context"
-	"errors"
 	"os/signal"
 	"syscall"
 	"time"
@@ -45,7 +44,7 @@ func Run(cfg config.Config, register func(app *fiber.App)) error {
 	serveErr := make(chan error, 1)
 	go func() {
 		log.Info("server listening", "addr", cfg.HTTPAddr, "service", cfg.ServiceName)
-		if err := app.Listen(cfg.HTTPAddr); err != nil && !errors.Is(err, fiber.ErrGracefulTimeout) {
+		if err := app.Listen(cfg.HTTPAddr); err != nil {
 			serveErr <- err
 		}
 	}()

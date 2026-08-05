@@ -13,6 +13,7 @@ const (
 	EventClusterCreated               = "cluster.created"
 	EventRegistrationTokenCreated     = "cluster.registration.token.created"
 	EventClusterRegistered            = "cluster.registered"
+	EventClusterRecovered             = "cluster.recovered"
 	EventClusterHeartbeatReceived     = "cluster.heartbeat.received"
 	EventClusterDisconnected          = "cluster.disconnected"
 	EventClusterDeleted               = "cluster.deleted"
@@ -46,6 +47,18 @@ type clusterRegisteredPayload struct {
 	NodeCount         int    `json:"nodeCount"`
 	CloudProvider     string `json:"cloudProvider,omitempty"`
 	Region            string `json:"region,omitempty"`
+}
+
+// clusterRecoveredPayload is emitted when an agent re-establishes its
+// registration against an already-registered cluster using its installation
+// token (idempotent registration or the /agent/recover endpoint). It records
+// both the authoritative AgentID and the identity the agent presented, which
+// may differ when the agent lost local state and generated a new one.
+type clusterRecoveredPayload struct {
+	ClusterID        string `json:"clusterId"`
+	AgentID          string `json:"agentId"`
+	RequestedAgentID string `json:"requestedAgentId,omitempty"`
+	Source           string `json:"source"` // "register" | "recover"
 }
 
 type heartbeatReceivedPayload struct {

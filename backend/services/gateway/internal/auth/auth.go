@@ -24,12 +24,14 @@ const (
 
 // Identity represents an authenticated caller extracted from a token.
 type Identity struct {
-	Type     TokenType
-	UserID   string
-	Email    string
-	OrgID    string   // Organization scope (for service accounts)
-	Scopes   []string // Permission scopes (for service accounts)
-	IssuedAt int64
+	Type      TokenType
+	UserID    string
+	Email     string
+	OrgID     string   // Organization scope (for service accounts)
+	Scopes    []string // Permission scopes (for service accounts)
+	IssuedAt  int64
+	JTI       string // Token ID (RFC 7519 "jti"); used for revocation checks.
+	SessionID string // Owning refresh session ("sid"); empty for service accounts.
 }
 
 // HasScope checks if the identity has a specific permission scope.
@@ -45,6 +47,9 @@ func (i Identity) HasScope(scope string) bool {
 // accessClaims mirrors the claims minted by the auth service for user tokens.
 type accessClaims struct {
 	Email string `json:"email"`
+	// SID is the owning refresh session; the gateway checks it against the
+	// revocation store so logout/refresh invalidate this token before expiry.
+	SID string `json:"sid,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -81,10 +86,12 @@ func (v *Validator) ValidateUserToken(token string) (Identity, error) {
 	}
 
 	return Identity{
-		Type:     TokenTypeUser,
-		UserID:   claims.Subject,
-		Email:    claims.Email,
-		IssuedAt: issuedAt,
+		Type:      TokenTypeUser,
+		UserID:    claims.Subject,
+		Email:     claims.Email,
+		IssuedAt:  issuedAt,
+		JTI:       claims.ID,
+		SessionID: claims.SID,
 	}, nil
 }
 
@@ -109,6 +116,7 @@ func (v *Validator) ValidateServiceAccountToken(token string) (Identity, error) 
 		OrgID:    claims.OrgID,
 		Scopes:   claims.Scopes,
 		IssuedAt: issuedAt,
+		JTI:      claims.ID,
 	}, nil
 }
 

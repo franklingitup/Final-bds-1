@@ -52,7 +52,7 @@ func (r Role) toAuthzRole() authz.OrgRole {
 	case RoleAdmin:
 		return authz.OrgAdmin
 	case RoleDeveloper:
-		return authz.OrgMember
+		return authz.RoleMember
 	default:
 		return authz.OrgAuditor
 	}

@@ -341,6 +341,18 @@ func (s *Service) RevokeRegistrationToken(ctx context.Context, orgID, userID, cl
 
 // RegisterAgent is called by the cluster agent to complete registration.
 // This is a capability-based endpoint: the token itself authorizes the operation.
+//
+// Registration is idempotent (see docs/adr/0007-agent-registration-recovery.md):
+//   - Unknown token                     -> 401 (errInvalidToken)
+//   - Revoked token                     -> 401 (errTokenRevoked)
+//   - Active, expired token             -> 401 (errTokenExpired)
+//   - Active, unexpired token           -> register the cluster (fresh path)
+//   - Already-used token + live cluster -> return existing metadata (200)
+//
+// The already-used arm is what lets a restarted agent that lost its local state
+// recover without a new installation token, and never fails on a duplicate
+// registration. A used token stays valid for recovery until it is explicitly
+// revoked, decoupling recovery from the short bootstrap TTL.
 func (s *Service) RegisterAgent(ctx context.Context, req AgentRegisterRequest) (*Cluster, error) {
 	if req.Token == "" || req.AgentID == "" {
 		return nil, apperrors.Validation("token and agentId are required")
@@ -353,17 +365,23 @@ func (s *Service) RegisterAgent(ctx context.Context, req AgentRegisterRequest) (
 	token, err := s.tokens.GetByHash(ctx, tokenHash)
 	if err != nil {
 		if database.IsNotFound(err) {
+			s.log.WarnContext(ctx, "agent registration rejected: unknown token",
+				"agent_id", req.AgentID)
 			return nil, errInvalidToken
 		}
 		return nil, err
 	}
 
-	// Validate token status.
+	// Validate token status. Revocation is the hard kill-switch and always wins.
 	switch token.Status {
-	case TokenStatusUsed:
-		return nil, errTokenUsed
 	case TokenStatusRevoked:
 		return nil, errTokenRevoked
+	case TokenStatusUsed:
+		// Idempotent recovery arm: the token was already consumed. Return the
+		// existing cluster (HTTP 200) so the agent can rebuild local state.
+		// Intentionally not gated on ExpiresAt: a used token remains a valid
+		// recovery credential for its cluster until revoked.
+		return s.recoverRegisteredCluster(ctx, token, req.AgentID, "register")
 	case TokenStatusExpired:
 		return nil, errTokenExpired
 	}
@@ -429,10 +447,107 @@ func (s *Service) RegisterAgent(ctx context.Context, req AgentRegisterRequest) (
 		return nil, err
 	}
 
+	s.log.InfoContext(ctx, "agent registered",
+		"cluster_id", c.ID, "org_id", c.OrgID, "agent_id", req.AgentID)
+
 	// Return the cluster directly from the registration transaction.
 	// NOTE: The previous implementation called GetCluster which requires user
 	// authorization. Agents don't have user credentials, so we return the
 	// cluster data directly from the transaction instead.
+	return c, nil
+}
+
+// RecoverCluster returns the cluster bound to an installation token so an agent
+// that lost its local state can rebuild it without a fresh token. It is served
+// by GET /v1/agent/recover and authenticated solely by possession of the
+// installation token (which maps to exactly one cluster).
+//
+// Active and already-used tokens are both accepted (both bind to a cluster);
+// revoked and expired-active tokens are rejected. The requesting AgentID is
+// advisory (used for audit only) — the authoritative, stable AgentID is always
+// taken from the cluster record so identity never changes on recovery.
+func (s *Service) RecoverCluster(ctx context.Context, plainToken, requestAgentID string) (*Cluster, error) {
+	if plainToken == "" {
+		return nil, errInvalidToken
+	}
+
+	token, err := s.tokens.GetByHash(ctx, hashToken(plainToken))
+	if err != nil {
+		if database.IsNotFound(err) {
+			return nil, errInvalidToken
+		}
+		return nil, err
+	}
+
+	switch token.Status {
+	case TokenStatusRevoked:
+		return nil, errTokenRevoked
+	case TokenStatusUsed:
+		// A consumed token stays valid for recovery until revoked.
+		return s.recoverRegisteredCluster(ctx, token, requestAgentID, "recover")
+	case TokenStatusExpired:
+		return nil, errTokenExpired
+	}
+	if s.now().After(token.ExpiresAt) {
+		return nil, errTokenExpired
+	}
+	// Active, unexpired token: only meaningful to recover once the cluster has
+	// actually registered; recoverRegisteredCluster returns errClusterNotFound
+	// otherwise so the agent falls back to a fresh registration.
+	return s.recoverRegisteredCluster(ctx, token, requestAgentID, "recover")
+}
+
+// recoverRegisteredCluster loads the cluster a token is bound to and returns its
+// current metadata without mutating the stored agent identity. This is the
+// shared, idempotent core of both RegisterAgent (used-token arm) and
+// RecoverCluster. It never overwrites agent_id, keeping AgentID/ClusterID stable
+// across agent restarts and local-state loss.
+func (s *Service) recoverRegisteredCluster(ctx context.Context, token *RegistrationToken, requestAgentID, source string) (*Cluster, error) {
+	// Cross-tenant read (bypasses RLS): we authorize by token possession, not by
+	// an org-scoped user identity.
+	c, err := s.clusters.GetByIDWithoutTenant(ctx, token.ClusterID)
+	if err != nil {
+		if database.IsNotFound(err) {
+			return nil, errClusterNotFound
+		}
+		return nil, err
+	}
+	if c.Status == StatusDeleted {
+		return nil, errClusterNotFound
+	}
+
+	// The authoritative, stable identity is what the control plane recorded.
+	stableAgentID := deref(c.AgentID)
+	if stableAgentID == "" {
+		stableAgentID = deref(token.UsedByAgent)
+	}
+	if stableAgentID == "" {
+		// Token bound to a cluster that has not completed registration yet;
+		// there is nothing to recover. The caller should register fresh.
+		return nil, errClusterNotFound
+	}
+
+	// Best-effort audit of the recovery. It must never cause recovery to fail —
+	// the registration/recovery contract is "never fail when the cluster
+	// already exists".
+	auditErr := s.tenant.WithTenant(ctx, c.OrgID, func(ctx context.Context) error {
+		return s.enqueue(ctx, EventClusterRecovered, c.OrgID, clusterRecoveredPayload{
+			ClusterID:        c.ID,
+			AgentID:          stableAgentID,
+			RequestedAgentID: requestAgentID,
+			Source:           source,
+		}, events.WithActor(events.Actor{Type: "agent", ID: stableAgentID}),
+			events.WithResource(events.Resource{Type: "cluster", ID: c.ID}))
+	})
+	if auditErr != nil {
+		s.log.WarnContext(ctx, "failed to audit cluster recovery",
+			"cluster_id", c.ID, "error", auditErr)
+	}
+
+	s.log.InfoContext(ctx, "agent registration recovered from existing cluster",
+		"cluster_id", c.ID, "org_id", c.OrgID, "agent_id", stableAgentID,
+		"requested_agent_id", requestAgentID, "source", source)
+
 	return c, nil
 }
 

@@ -3,6 +3,7 @@ package secrets
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"testing"
 	"time"
@@ -22,6 +23,7 @@ var (
 
 type fakeSecretStore struct {
 	secrets map[string]*Secret
+	counter int
 }
 
 func newFakeSecretStore() *fakeSecretStore {
@@ -29,7 +31,8 @@ func newFakeSecretStore() *fakeSecretStore {
 }
 
 func (f *fakeSecretStore) Create(ctx context.Context, s *Secret) error {
-	s.ID = "secret-" + time.Now().Format("150405")
+	f.counter++
+	s.ID = fmt.Sprintf("secret-%s-%d", time.Now().Format("150405"), f.counter)
 	s.Version = 1
 	s.CreatedAt = time.Now()
 	s.UpdatedAt = time.Now()
@@ -40,7 +43,7 @@ func (f *fakeSecretStore) Create(ctx context.Context, s *Secret) error {
 func (f *fakeSecretStore) GetByID(ctx context.Context, id string) (*Secret, error) {
 	s, ok := f.secrets[id]
 	if !ok || s.DeletedAt != nil {
-		return nil, database.ErrNotFound
+		return nil, apperrors.NotFound("secret not found")
 	}
 	return s, nil
 }
@@ -51,7 +54,7 @@ func (f *fakeSecretStore) GetByName(ctx context.Context, projectID, name string)
 			return s, nil
 		}
 	}
-	return nil, database.ErrNotFound
+	return nil, apperrors.NotFound("secret not found")
 }
 
 func (f *fakeSecretStore) List(ctx context.Context, projectID string, page database.PageRequest) (database.Page[Secret], error) {
@@ -66,7 +69,7 @@ func (f *fakeSecretStore) List(ctx context.Context, projectID string, page datab
 
 func (f *fakeSecretStore) Update(ctx context.Context, s *Secret) error {
 	if _, ok := f.secrets[s.ID]; !ok {
-		return database.ErrNotFound
+		return apperrors.NotFound("secret not found")
 	}
 	s.Version++
 	s.UpdatedAt = time.Now()
@@ -77,7 +80,7 @@ func (f *fakeSecretStore) Update(ctx context.Context, s *Secret) error {
 func (f *fakeSecretStore) Delete(ctx context.Context, id string) error {
 	s, ok := f.secrets[id]
 	if !ok || s.DeletedAt != nil {
-		return database.ErrNotFound
+		return apperrors.NotFound("secret not found")
 	}
 	now := time.Now()
 	s.DeletedAt = &now
@@ -117,9 +120,17 @@ func (f *fakeOutbox) Enqueue(ctx context.Context, env events.Envelope) error {
 	return nil
 }
 
+func (f *fakeOutbox) FetchUnpublished(ctx context.Context, limit int) ([]events.OutboxRecord, error) {
+	return nil, nil
+}
+
+func (f *fakeOutbox) MarkPublished(ctx context.Context, ids []string) error {
+	return nil
+}
+
 type fakeTenantRunner struct{}
 
-func (f *fakeTenantRunner) WithTenant(ctx context.Context, orgID string, fn func(ctx context.Context) error) error {
+func (f *fakeTenantRunner) WithTenant(ctx context.Context, orgID string, fn database.TxFunc) error {
 	return fn(ctx)
 }
 
@@ -129,7 +140,7 @@ type fakeMemberLookup struct {
 
 func (f *fakeMemberLookup) GetByUser(ctx context.Context, projectID, userID string) (authz.ProjectRole, error) {
 	if f.role == "" {
-		return "", database.ErrNotFound
+		return "", apperrors.NotFound("member not found")
 	}
 	return f.role, nil
 }
@@ -258,22 +269,27 @@ func TestService_GetSecret(t *testing.T) {
 	key, _ := GenerateMasterKey()
 	enc, _ := NewEncryptor(key)
 	store := newFakeSecretStore()
+	outbox := &fakeOutbox{}
 
+	// Use developer role which can both create and read secrets.
 	svc := NewService(Deps{
 		Secrets:    store,
 		Encryptor:  enc,
-		Outbox:     &fakeOutbox{},
+		Outbox:     outbox,
 		Tenant:     &fakeTenantRunner{},
-		Members:    &fakeMemberLookup{role: authz.ProjectViewer},
+		Members:    &fakeMemberLookup{role: authz.ProjectDeveloper},
 		Authorizer: authz.NewPolicyAuthorizer(),
 		Logger:     slog.Default(),
 	})
 
 	// Create a secret first.
-	created, _ := svc.CreateSecret(context.Background(), testOrgID, testUserID, testProjectID, CreateSecretRequest{
+	created, err := svc.CreateSecret(context.Background(), testOrgID, testUserID, testProjectID, CreateSecretRequest{
 		Name:  "TEST_SECRET",
 		Value: "test value",
 	})
+	if err != nil {
+		t.Fatalf("CreateSecret failed: %v", err)
+	}
 
 	// Get the secret.
 	secret, err := svc.GetSecret(context.Background(), testOrgID, testUserID, testProjectID, created.ID)

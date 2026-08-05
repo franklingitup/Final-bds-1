@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/bdsplatform/platform/backend/libs/authz"
 	"github.com/bdsplatform/platform/backend/libs/database"
 	apperrors "github.com/bdsplatform/platform/backend/libs/errors"
 	"github.com/bdsplatform/platform/backend/libs/events"
@@ -24,6 +25,18 @@ type fakeRunner struct{ lastOrg string }
 func (r *fakeRunner) WithTenant(ctx context.Context, orgID string, fn database.TxFunc) error {
 	r.lastOrg = orgID
 	return fn(ctx)
+}
+
+// fakeOrgMemberStore always returns an active member with the given role.
+type fakeOrgMemberStore struct{}
+
+func (f *fakeOrgMemberStore) GetOrgMember(ctx context.Context, userID string) (*authz.OrgMember, error) {
+	return &authz.OrgMember{
+		OrgID:  "any",
+		UserID: userID,
+		Role:   authz.OrgOwner,
+		Status: "active",
+	}, nil
 }
 
 // fakeStore is an in-memory AuditLogStore that mimics the idempotent insert and
@@ -88,7 +101,7 @@ type testEnv struct {
 func newTestEnv() *testEnv {
 	store := newFakeStore()
 	runner := &fakeRunner{}
-	svc := NewService(Deps{Store: store, Tenant: runner})
+	svc := NewService(Deps{Store: store, Tenant: runner, OrgMembers: &fakeOrgMemberStore{}})
 	return &testEnv{svc: svc, store: store, runner: runner}
 }
 
@@ -180,13 +193,14 @@ func TestListLogs_FiltersByDomain(t *testing.T) {
 	e := newTestEnv()
 	ctx := context.Background()
 	org := uuid.NewString()
+	user := uuid.NewString()
 	for _, et := range []string{"tenant.organization.created", "auth.user.created", "tenant.member.invited"} {
 		if _, err := e.svc.RecordEvent(ctx, mustEnvelope(t, et, org, "a", "r", "1")); err != nil {
 			t.Fatalf("seed %s: %v", et, err)
 		}
 	}
 
-	page, err := e.svc.ListLogs(ctx, org, AuditFilter{Domain: "tenant"}, database.PageRequest{})
+	page, err := e.svc.ListLogs(ctx, org, user, AuditFilter{Domain: "tenant"}, database.PageRequest{})
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}

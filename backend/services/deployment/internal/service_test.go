@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/bdsplatform/platform/backend/libs/authz"
 	"github.com/bdsplatform/platform/backend/libs/database"
 	apperrors "github.com/bdsplatform/platform/backend/libs/errors"
 	"github.com/bdsplatform/platform/backend/libs/events"
@@ -173,6 +174,32 @@ func (f *fakeDeploymentStore) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
+func (f *fakeDeploymentStore) ListByOrg(ctx context.Context, req database.PageRequest) (database.Page[Deployment], error) {
+	var items []Deployment
+	for _, d := range f.deps {
+		items = append(items, *d)
+	}
+	return database.Page[Deployment]{Items: items}, nil
+}
+
+func (f *fakeDeploymentStore) SoftDelete(ctx context.Context, id string) error {
+	if _, ok := f.deps[id]; !ok {
+		return apperrors.NotFound("deployment not found")
+	}
+	f.deps[id].Status = "deleted"
+	return nil
+}
+
+func (f *fakeDeploymentStore) ListAllActive(ctx context.Context) ([]Deployment, error) {
+	var items []Deployment
+	for _, d := range f.deps {
+		if d.Status != "deleted" {
+			items = append(items, *d)
+		}
+	}
+	return items, nil
+}
+
 // ----------------------------------------------------------------------------
 
 type fakeReleaseStore struct {
@@ -285,15 +312,34 @@ type fakeOutbox struct {
 	events []*events.Envelope
 }
 
-func (f *fakeOutbox) Enqueue(ctx context.Context, e *events.Envelope) error {
-	f.events = append(f.events, e)
+// Enqueue matches events.Outbox (value receiver of Envelope). A copy is captured
+// so callers cannot mutate the recorded event afterwards.
+func (f *fakeOutbox) Enqueue(ctx context.Context, e events.Envelope) error {
+	captured := e
+	f.events = append(f.events, &captured)
 	return nil
 }
+
+func (f *fakeOutbox) FetchUnpublished(context.Context, int) ([]events.OutboxRecord, error) {
+	return nil, nil
+}
+
+func (f *fakeOutbox) MarkPublished(context.Context, []string) error { return nil }
 
 type fakeTenant struct{}
 
 func (f *fakeTenant) WithTenant(ctx context.Context, orgID string, fn database.TxFunc) error {
 	return fn(ctx)
+}
+
+// fakeOrgMemberStoreAllow treats every caller as an active org owner so that
+// service-layer org authorization passes in these unit tests. Negative
+// authorization cases are covered in service_authz_test.go with a non-member
+// store.
+type fakeOrgMemberStoreAllow struct{}
+
+func (fakeOrgMemberStoreAllow) GetOrgMember(_ context.Context, userID string) (*authz.OrgMember, error) {
+	return &authz.OrgMember{UserID: userID, Role: authz.OrgOwner, Status: "active"}, nil
 }
 
 // ----------------------------------------------------------------------------
@@ -310,6 +356,7 @@ func newTestService() (*Service, *fakeApplicationStore, *fakeDeploymentStore, *f
 		Applications: apps,
 		Deployments:  deps,
 		Releases:     rels,
+		OrgMembers:   fakeOrgMemberStoreAllow{},
 		Outbox:       outbox,
 		Tenant:       &fakeTenant{},
 	})
@@ -538,13 +585,13 @@ func TestMarkDeploymentLifecycle(t *testing.T) {
 	require.NoError(t, err)
 
 	// Mark started.
-	err = svc.MarkDeploymentStarted(ctx, orgID, dep.ID, rel.ID)
+	err = svc.MarkDeploymentStarted(ctx, orgID, userID, dep.ID, rel.ID)
 	require.NoError(t, err)
 	assert.Equal(t, StatusRunning, deps.deps[dep.ID].Status)
 	assert.Equal(t, ReleaseStatusDeploying, rels.releases[rel.ID].Status)
 
 	// Mark succeeded.
-	err = svc.MarkDeploymentSucceeded(ctx, orgID, dep.ID, rel.ID, 2)
+	err = svc.MarkDeploymentSucceeded(ctx, orgID, userID, dep.ID, rel.ID, 2)
 	require.NoError(t, err)
 	assert.Equal(t, StatusSucceeded, deps.deps[dep.ID].Status)
 	assert.Equal(t, ReleaseStatusSucceeded, rels.releases[rel.ID].Status)
@@ -578,7 +625,7 @@ func TestMarkDeploymentFailed(t *testing.T) {
 	require.NoError(t, err)
 
 	// Mark failed.
-	err = svc.MarkDeploymentFailed(ctx, orgID, dep.ID, rel.ID, "image pull failed")
+	err = svc.MarkDeploymentFailed(ctx, orgID, userID, dep.ID, rel.ID, "image pull failed")
 	require.NoError(t, err)
 	assert.Equal(t, StatusFailed, deps.deps[dep.ID].Status)
 	assert.Equal(t, ReleaseStatusFailed, rels.releases[rel.ID].Status)

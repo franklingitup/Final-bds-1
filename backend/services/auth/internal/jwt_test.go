@@ -17,7 +17,7 @@ func testAuthConfig() config.AuthConfig {
 
 func TestJWTIssueAndVerify(t *testing.T) {
 	issuer := NewJWTIssuer(testAuthConfig())
-	token, jti, expiresIn, err := issuer.Issue("user-1", "a@b.com")
+	token, jti, expiresIn, err := issuer.Issue("user-1", "a@b.com", "sess-1")
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -38,11 +38,14 @@ func TestJWTIssueAndVerify(t *testing.T) {
 	if claims.ID != jti {
 		t.Errorf("jti mismatch: %s != %s", claims.ID, jti)
 	}
+	if claims.SID != "sess-1" {
+		t.Errorf("sid mismatch: got %q want %q", claims.SID, "sess-1")
+	}
 }
 
 func TestJWTVerify_WrongKey(t *testing.T) {
 	issuer := NewJWTIssuer(testAuthConfig())
-	token, _, _, _ := issuer.Issue("user-1", "a@b.com")
+	token, _, _, _ := issuer.Issue("user-1", "a@b.com", "sess-1")
 
 	other := NewJWTIssuer(config.AuthConfig{JWTSigningKey: "different-key", AccessTTL: time.Minute})
 	if _, err := other.Verify(token); err == nil {
@@ -53,7 +56,7 @@ func TestJWTVerify_WrongKey(t *testing.T) {
 func TestJWTVerify_Expired(t *testing.T) {
 	issuer := NewJWTIssuer(testAuthConfig())
 	issuer.now = func() time.Time { return time.Now().Add(-time.Hour) } // issue in the past
-	token, _, _, _ := issuer.Issue("user-1", "a@b.com")
+	token, _, _, _ := issuer.Issue("user-1", "a@b.com", "sess-1")
 
 	if _, err := issuer.Verify(token); err == nil {
 		t.Error("expected expired token to fail verification")

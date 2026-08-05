@@ -13,7 +13,13 @@ import (
 
 	"github.com/bdsplatform/platform/backend/libs/database"
 	apperrors "github.com/bdsplatform/platform/backend/libs/errors"
+	"github.com/bdsplatform/platform/backend/libs/middleware"
 )
+
+// newTestApp creates a Fiber app with the standard error handler.
+func newTestApp() *fiber.App {
+	return fiber.New(fiber.Config{ErrorHandler: middleware.ErrorHandler()})
+}
 
 // fakeDesiredStateStore implements DesiredStateStore for testing.
 type fakeDesiredStateStore struct {
@@ -58,7 +64,7 @@ func (f *fakeClusterValidator) ValidateCluster(ctx context.Context, clusterID, a
 }
 
 func TestAgentAuthMiddleware_MissingHeaders(t *testing.T) {
-	app := fiber.New()
+	app := newTestApp()
 	validator := &fakeClusterValidator{orgID: "org-123"}
 	app.Use(AgentAuthMiddleware(validator))
 	app.Get("/test", func(c *fiber.Ctx) error {
@@ -99,8 +105,8 @@ func TestAgentAuthMiddleware_MissingHeaders(t *testing.T) {
 }
 
 func TestAgentAuthMiddleware_ValidationError(t *testing.T) {
-	app := fiber.New()
-	validator := &fakeClusterValidator{err: &testError{code: http.StatusUnauthorized, msg: "invalid credentials"}}
+	app := newTestApp()
+	validator := &fakeClusterValidator{err: apperrors.Unauthorized("invalid credentials")}
 	app.Use(AgentAuthMiddleware(validator))
 	app.Get("/test", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"status": "ok"})
@@ -120,7 +126,7 @@ func TestAgentAuthMiddleware_ValidationError(t *testing.T) {
 }
 
 func TestAgentAuthMiddleware_SetsContext(t *testing.T) {
-	app := fiber.New()
+	app := newTestApp()
 	validator := &fakeClusterValidator{orgID: "org-456"}
 	app.Use(AgentAuthMiddleware(validator))
 	app.Get("/test", func(c *fiber.Ctx) error {
@@ -193,7 +199,7 @@ func TestAgentHandler_GetDesiredState(t *testing.T) {
 	})
 	validator := &fakeClusterValidator{orgID: "org-123"}
 
-	app := fiber.New()
+	app := newTestApp()
 	agent := app.Group("/v1/agent", AgentAuthMiddleware(validator))
 	agent.Get("/clusters/:clusterId/desired-state", handler.GetDesiredState)
 
@@ -266,7 +272,7 @@ func TestAgentHandler_GetDesiredState_ClusterMismatch(t *testing.T) {
 	})
 	validator := &fakeClusterValidator{orgID: "org-123"}
 
-	app := fiber.New()
+	app := newTestApp()
 	agent := app.Group("/v1/agent", AgentAuthMiddleware(validator))
 	agent.Get("/clusters/:clusterId/desired-state", handler.GetDesiredState)
 
@@ -292,7 +298,7 @@ func TestAgentHandler_UpdateDeploymentStatus(t *testing.T) {
 	}
 	deploymentStore := &fakeDeploymentStoreForAgent{
 		deployments: map[string]*Deployment{
-			"dep-1": {ID: "dep-1", OrgID: "org-123", ClusterID: "cluster-123"},
+			"dep-1": {TenantModel: database.TenantModel{Model: database.Model{ID: "dep-1"}, OrgID: "org-123"}, ClusterID: "cluster-123"},
 		},
 	}
 	store := &fakeDesiredStateStore{}
@@ -304,7 +310,7 @@ func TestAgentHandler_UpdateDeploymentStatus(t *testing.T) {
 	})
 	validator := &fakeClusterValidator{orgID: "org-123"}
 
-	app := fiber.New()
+	app := newTestApp()
 	agent := app.Group("/v1/agent", AgentAuthMiddleware(validator))
 	agent.Post("/deployments/:deploymentId/releases/:releaseId/status", func(c *fiber.Ctx) error {
 		return handler.UpdateDeploymentStatus(c, releaseStore, deploymentStore)
@@ -340,7 +346,7 @@ func TestAgentHandler_UpdateDeploymentStatus_Invalid(t *testing.T) {
 	}
 	deploymentStore := &fakeDeploymentStoreForAgent{
 		deployments: map[string]*Deployment{
-			"dep-1": {ID: "dep-1", OrgID: "org-123", ClusterID: "cluster-123"},
+			"dep-1": {TenantModel: database.TenantModel{Model: database.Model{ID: "dep-1"}, OrgID: "org-123"}, ClusterID: "cluster-123"},
 		},
 	}
 	store := &fakeDesiredStateStore{}
@@ -352,7 +358,7 @@ func TestAgentHandler_UpdateDeploymentStatus_Invalid(t *testing.T) {
 	})
 	validator := &fakeClusterValidator{orgID: "org-123"}
 
-	app := fiber.New()
+	app := newTestApp()
 	agent := app.Group("/v1/agent", AgentAuthMiddleware(validator))
 	agent.Post("/deployments/:deploymentId/releases/:releaseId/status", func(c *fiber.Ctx) error {
 		return handler.UpdateDeploymentStatus(c, releaseStore, deploymentStore)
@@ -368,8 +374,8 @@ func TestAgentHandler_UpdateDeploymentStatus_Invalid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("got status %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Errorf("got status %d, want %d", resp.StatusCode, http.StatusUnprocessableEntity)
 	}
 }
 
@@ -389,7 +395,7 @@ func TestAgentHandler_UpdateDeploymentStatus_DeploymentNotFound(t *testing.T) {
 	})
 	validator := &fakeClusterValidator{orgID: "org-123"}
 
-	app := fiber.New()
+	app := newTestApp()
 	agent := app.Group("/v1/agent", AgentAuthMiddleware(validator))
 	agent.Post("/deployments/:deploymentId/releases/:releaseId/status", func(c *fiber.Ctx) error {
 		return handler.UpdateDeploymentStatus(c, releaseStore, deploymentStore)
@@ -419,7 +425,7 @@ func TestAgentHandler_UpdateDeploymentStatus_ClusterMismatch(t *testing.T) {
 	}
 	deploymentStore := &fakeDeploymentStoreForAgent{
 		deployments: map[string]*Deployment{
-			"dep-1": {ID: "dep-1", OrgID: "org-123", ClusterID: "other-cluster"}, // DIFFERENT CLUSTER
+			"dep-1": {TenantModel: database.TenantModel{Model: database.Model{ID: "dep-1"}, OrgID: "org-123"}, ClusterID: "other-cluster"}, // DIFFERENT CLUSTER
 		},
 	}
 	store := &fakeDesiredStateStore{}
@@ -431,7 +437,7 @@ func TestAgentHandler_UpdateDeploymentStatus_ClusterMismatch(t *testing.T) {
 	})
 	validator := &fakeClusterValidator{orgID: "org-123"}
 
-	app := fiber.New()
+	app := newTestApp()
 	agent := app.Group("/v1/agent", AgentAuthMiddleware(validator))
 	agent.Post("/deployments/:deploymentId/releases/:releaseId/status", func(c *fiber.Ctx) error {
 		return handler.UpdateDeploymentStatus(c, releaseStore, deploymentStore)
@@ -462,7 +468,7 @@ func TestAgentHandler_UpdateDeploymentStatus_OrgMismatch(t *testing.T) {
 	}
 	deploymentStore := &fakeDeploymentStoreForAgent{
 		deployments: map[string]*Deployment{
-			"dep-1": {ID: "dep-1", OrgID: "org-999", ClusterID: "cluster-123"}, // DIFFERENT ORG
+			"dep-1": {TenantModel: database.TenantModel{Model: database.Model{ID: "dep-1"}, OrgID: "org-999"}, ClusterID: "cluster-123"}, // DIFFERENT ORG
 		},
 	}
 	store := &fakeDesiredStateStore{}
@@ -474,7 +480,7 @@ func TestAgentHandler_UpdateDeploymentStatus_OrgMismatch(t *testing.T) {
 	})
 	validator := &fakeClusterValidator{orgID: "org-123"} // Agent authenticated as org-123
 
-	app := fiber.New()
+	app := newTestApp()
 	agent := app.Group("/v1/agent", AgentAuthMiddleware(validator))
 	agent.Post("/deployments/:deploymentId/releases/:releaseId/status", func(c *fiber.Ctx) error {
 		return handler.UpdateDeploymentStatus(c, releaseStore, deploymentStore)
@@ -505,7 +511,7 @@ func TestAgentHandler_UpdateDeploymentStatus_ReleaseDeploymentMismatch(t *testin
 	}
 	deploymentStore := &fakeDeploymentStoreForAgent{
 		deployments: map[string]*Deployment{
-			"dep-1": {ID: "dep-1", OrgID: "org-123", ClusterID: "cluster-123"},
+			"dep-1": {TenantModel: database.TenantModel{Model: database.Model{ID: "dep-1"}, OrgID: "org-123"}, ClusterID: "cluster-123"},
 		},
 	}
 	store := &fakeDesiredStateStore{}
@@ -517,7 +523,7 @@ func TestAgentHandler_UpdateDeploymentStatus_ReleaseDeploymentMismatch(t *testin
 	})
 	validator := &fakeClusterValidator{orgID: "org-123"}
 
-	app := fiber.New()
+	app := newTestApp()
 	agent := app.Group("/v1/agent", AgentAuthMiddleware(validator))
 	agent.Post("/deployments/:deploymentId/releases/:releaseId/status", func(c *fiber.Ctx) error {
 		return handler.UpdateDeploymentStatus(c, releaseStore, deploymentStore)
@@ -544,7 +550,7 @@ func TestAgentHandler_UpdateDeploymentStatus_ReleaseNotFound(t *testing.T) {
 	releaseStore := &fakeReleaseStoreForAgent{releases: map[string]*Release{}}
 	deploymentStore := &fakeDeploymentStoreForAgent{
 		deployments: map[string]*Deployment{
-			"dep-1": {ID: "dep-1", OrgID: "org-123", ClusterID: "cluster-123"},
+			"dep-1": {TenantModel: database.TenantModel{Model: database.Model{ID: "dep-1"}, OrgID: "org-123"}, ClusterID: "cluster-123"},
 		},
 	}
 	store := &fakeDesiredStateStore{}
@@ -556,7 +562,7 @@ func TestAgentHandler_UpdateDeploymentStatus_ReleaseNotFound(t *testing.T) {
 	})
 	validator := &fakeClusterValidator{orgID: "org-123"}
 
-	app := fiber.New()
+	app := newTestApp()
 	agent := app.Group("/v1/agent", AgentAuthMiddleware(validator))
 	agent.Post("/deployments/:deploymentId/releases/:releaseId/status", func(c *fiber.Ctx) error {
 		return handler.UpdateDeploymentStatus(c, releaseStore, deploymentStore)
@@ -574,6 +580,63 @@ func TestAgentHandler_UpdateDeploymentStatus_ReleaseNotFound(t *testing.T) {
 	}
 	if resp.StatusCode != http.StatusForbidden {
 		t.Errorf("got status %d, want %d (release not found)", resp.StatusCode, http.StatusForbidden)
+	}
+}
+
+// TestAgentHandler_UpdateDeploymentStatus_EmitsEvent verifies that an
+// agent-reported status transition emits the corresponding deployment domain
+// event to the outbox, so the audit service records agent-driven transitions
+// identically to user-driven ones (production-readiness fix for the agent path
+// previously bypassing event emission).
+func TestAgentHandler_UpdateDeploymentStatus_EmitsEvent(t *testing.T) {
+	releaseStore := &fakeReleaseStoreForAgent{
+		releases: map[string]*Release{
+			"rel-1": {ID: "rel-1", OrgID: "org-123", DeploymentID: "dep-1", Revision: 1, Image: "nginx:latest"},
+		},
+	}
+	deploymentStore := &fakeDeploymentStoreForAgent{
+		deployments: map[string]*Deployment{
+			"dep-1": {TenantModel: database.TenantModel{Model: database.Model{ID: "dep-1"}, OrgID: "org-123"}, ClusterID: "cluster-123"},
+		},
+	}
+	store := &fakeDesiredStateStore{}
+	tenant := &fakeTenantQuerier{allowedOrgs: map[string]bool{"org-123": true}}
+	outbox := &fakeOutbox{}
+	handler := NewAgentHandler(AgentHandlerDeps{
+		DesiredState: store,
+		Tenant:       tenant,
+		Outbox:       outbox,
+		Logger:       slog.Default(),
+	})
+	validator := &fakeClusterValidator{orgID: "org-123"}
+
+	app := newTestApp()
+	agent := app.Group("/v1/agent", AgentAuthMiddleware(validator))
+	agent.Post("/deployments/:deploymentId/releases/:releaseId/status", func(c *fiber.Ctx) error {
+		return handler.UpdateDeploymentStatus(c, releaseStore, deploymentStore)
+	})
+
+	body := `{"status": "succeeded", "readyReplicas": 3}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/agent/deployments/dep-1/releases/rel-1/status", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Cluster-ID", "cluster-123")
+	req.Header.Set("X-Agent-ID", "agent-123")
+
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got status %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if len(outbox.events) != 1 {
+		t.Fatalf("expected 1 emitted event, got %d", len(outbox.events))
+	}
+	if outbox.events[0].Type != EventDeploymentSucceeded {
+		t.Errorf("event type = %q, want %q", outbox.events[0].Type, EventDeploymentSucceeded)
+	}
+	if outbox.events[0].Actor.Type != "agent" {
+		t.Errorf("actor type = %q, want %q", outbox.events[0].Actor.Type, "agent")
 	}
 }
 
@@ -669,5 +732,13 @@ func (f *fakeDeploymentStoreForAgent) ListByCluster(ctx context.Context, cluster
 	return database.Page[Deployment]{}, nil
 }
 
+func (f *fakeDeploymentStoreForAgent) ListByOrg(ctx context.Context, req database.PageRequest) (database.Page[Deployment], error) {
+	return database.Page[Deployment]{}, nil
+}
+
+func (f *fakeDeploymentStoreForAgent) SoftDelete(ctx context.Context, id string) error { return nil }
 func (f *fakeDeploymentStoreForAgent) Update(ctx context.Context, d *Deployment) error { return nil }
 func (f *fakeDeploymentStoreForAgent) Delete(ctx context.Context, id string) error     { return nil }
+func (f *fakeDeploymentStoreForAgent) ListAllActive(ctx context.Context) ([]Deployment, error) {
+	return nil, nil
+}

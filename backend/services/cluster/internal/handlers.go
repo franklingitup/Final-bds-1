@@ -1,6 +1,8 @@
 package cluster
 
 import (
+	"strings"
+
 	"github.com/gofiber/fiber/v2"
 
 	"github.com/bdsplatform/platform/backend/libs/database"
@@ -156,6 +158,26 @@ func (h *Handler) RegisterAgent(c *fiber.Ctx) error {
 		return err
 	}
 	cluster, err := h.svc.RegisterAgent(c.UserContext(), req)
+	if err != nil {
+		return err
+	}
+	return c.JSON(toClusterView(cluster))
+}
+
+// RecoverAgent handles GET /v1/agent/recover. It is capability-based: the
+// installation token is presented via the X-Registration-Token header (or an
+// Authorization: Bearer header) and maps to exactly one cluster. Tokens are
+// never accepted from the query string to keep them out of access logs.
+func (h *Handler) RecoverAgent(c *fiber.Ctx) error {
+	token := c.Get("X-Registration-Token")
+	if token == "" {
+		if auth := c.Get("Authorization"); len(auth) > 7 && strings.EqualFold(auth[:7], "Bearer ") {
+			token = strings.TrimSpace(auth[7:])
+		}
+	}
+	agentID := c.Get("X-Agent-ID")
+
+	cluster, err := h.svc.RecoverCluster(c.UserContext(), token, agentID)
 	if err != nil {
 		return err
 	}

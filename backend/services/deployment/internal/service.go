@@ -18,6 +18,14 @@ import (
 
 var slugPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$`)
 
+// ArgoRegistrar binds a deployment to an Argo CD Application. It is satisfied by
+// *ArgoService and injected optionally so CreateDeployment can generate the
+// Application when a GitOps source is supplied, without the core service
+// depending on the GitOps engine.
+type ArgoRegistrar interface {
+	RegisterApplication(ctx context.Context, orgID, userID, deploymentID string, src GitOpsSource) (*ArgoApplication, error)
+}
+
 // Deps holds service dependencies.
 type Deps struct {
 	Applications ApplicationStore
@@ -26,8 +34,11 @@ type Deps struct {
 	OrgMembers   authz.OrgMemberStore // For org membership authorization
 	Outbox       events.Outbox
 	Tenant       TenantRunner
-	Logger       *slog.Logger
-	Now          func() time.Time
+	// Argo, when set, enables GitOps: CreateDeployment registers an Argo CD
+	// Application when the request carries a GitOps source. Optional.
+	Argo   ArgoRegistrar
+	Logger *slog.Logger
+	Now    func() time.Time
 }
 
 // Service implements deployment domain logic.
@@ -38,6 +49,7 @@ type Service struct {
 	orgMembers authz.OrgMemberStore
 	outbox     events.Outbox
 	tenant     TenantRunner
+	argo       ArgoRegistrar
 	authSvc    *authz.AuthorizationService
 	log        *slog.Logger
 	now        func() time.Time
@@ -58,11 +70,18 @@ func NewService(d Deps) *Service {
 		orgMembers: d.OrgMembers,
 		outbox:     d.Outbox,
 		tenant:     d.Tenant,
+		argo:       d.Argo,
 		authSvc:    authz.NewAuthorizationService(d.Tenant, d.OrgMembers, nil),
 		log:        d.Logger,
 		now:        d.Now,
 	}
 }
+
+// SetArgoRegistrar wires the GitOps registrar after construction. This resolves
+// the initialization cycle where the ArgoService depends on service stores and
+// the service optionally depends on the ArgoService. Safe to call once at
+// startup before serving traffic.
+func (s *Service) SetArgoRegistrar(a ArgoRegistrar) { s.argo = a }
 
 // ----------------------------------------------------------------------------
 // Applications
@@ -318,6 +337,19 @@ func (s *Service) CreateDeployment(ctx context.Context, orgID, userID string, re
 	if err != nil {
 		return nil, nil, err
 	}
+
+	// GitOps binding (optional, additive). When a source is supplied and the
+	// GitOps engine is enabled, generate the Argo CD Application for the new
+	// deployment. Registration failures are logged but do not fail the create:
+	// the deployment already exists and the binding can be (re)created via the
+	// dedicated /gitops endpoint.
+	if req.GitOps != nil && s.argo != nil {
+		if _, aerr := s.argo.RegisterApplication(ctx, orgID, userID, dep.ID, *req.GitOps); aerr != nil {
+			s.log.WarnContext(ctx, "gitops application registration failed for new deployment",
+				"deployment_id", dep.ID, "error", aerr)
+		}
+	}
+
 	return dep, rel, nil
 }
 

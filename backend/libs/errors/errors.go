@@ -20,6 +20,7 @@ const (
 	CodeForbidden        Code = "FORBIDDEN"
 	CodeNotFound         Code = "NOT_FOUND"
 	CodeValidationFailed Code = "VALIDATION_FAILED"
+	CodeValidation       Code = "VALIDATION_FAILED" // Alias for CodeValidationFailed
 	CodeConflict         Code = "CONFLICT"
 	CodeRateLimited      Code = "RATE_LIMITED"
 	CodeInternal         Code = "INTERNAL"
@@ -146,8 +147,10 @@ func (e *Error) Envelope(requestID string) Envelope {
 // Convenience constructors for common cases.
 
 func Unauthenticated(message string) *Error { return New(CodeUnauthenticated, message) }
+func Unauthorized(message string) *Error    { return New(CodeUnauthenticated, message) } // Alias for Unauthenticated
 func Forbidden(message string) *Error       { return New(CodeForbidden, message) }
 func NotFound(message string) *Error        { return New(CodeNotFound, message) }
 func Validation(message string) *Error      { return New(CodeValidationFailed, message) }
 func Conflict(message string) *Error        { return New(CodeConflict, message) }
+func RateLimited(message string) *Error     { return New(CodeRateLimited, message) }
 func Internal(message string) *Error        { return New(CodeInternal, message) }

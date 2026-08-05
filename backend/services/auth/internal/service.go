@@ -46,9 +46,13 @@ type Deps struct {
 	Outbox events.Outbox
 	// Notifier delivers one-time tokens over a secure channel (optional).
 	Notifier Notifier
-	Auth     config.AuthConfig
-	Logger   *slog.Logger
-	Now      func() time.Time
+	// Revoker records revoked sessions in the shared (Redis) revocation store so
+	// the gateway rejects their access tokens before expiry. Optional; when nil
+	// only the database session state is updated.
+	Revoker TokenRevoker
+	Auth    config.AuthConfig
+	Logger  *slog.Logger
+	Now     func() time.Time
 }
 
 // Service implements the auth domain logic.
@@ -65,6 +69,7 @@ type Service struct {
 	outbox          events.Outbox
 	authSvc         *authz.AuthorizationService
 	notifier        Notifier
+	revoker         TokenRevoker
 	cfg             config.AuthConfig
 	log             *slog.Logger
 	now             func() time.Time
@@ -98,6 +103,7 @@ func NewService(d Deps) *Service {
 		outbox:          d.Outbox,
 		authSvc:         authSvc,
 		notifier:        d.Notifier,
+		revoker:         d.Revoker,
 		cfg:             d.Auth,
 		log:             d.Logger,
 		now:             d.Now,
@@ -323,6 +329,9 @@ func (s *Service) Refresh(ctx context.Context, req RefreshRequest, meta RequestM
 	if err != nil {
 		return nil, err
 	}
+	// Rotation is a revocation: the old session's access token must stop working
+	// at the gateway immediately, not only when its refresh token is reused.
+	s.revokeSessionInCache(ctx, session.ID)
 	return pair, nil
 }
 
@@ -339,23 +348,49 @@ func (s *Service) Logout(ctx context.Context, req LogoutRequest) error {
 		}
 		return err
 	}
-	return s.tx.Tx(ctx, func(ctx context.Context) error {
+	if err := s.tx.Tx(ctx, func(ctx context.Context) error {
 		if err := s.sessions.Revoke(ctx, session.ID, nil); err != nil {
 			return err
 		}
 		return s.enqueue(ctx, EventTokenRevoked, systemOrg, tokenRevokedPayload{
 			UserID: session.UserID, SessionID: session.ID,
 		}, events.WithActor(events.Actor{Type: "user", ID: session.UserID}))
-	})
+	}); err != nil {
+		return err
+	}
+	// Kill the access token bound to this session at the gateway now; the DB
+	// revocation above only stops future refreshes.
+	s.revokeSessionInCache(ctx, session.ID)
+	return nil
+}
+
+// revokeSessionInCache best-effort records a session as revoked in the shared
+// revocation store (Redis) so the API gateway rejects any access token bound to
+// it (via the "sid" claim) before the token's natural expiry. The TTL matches
+// the access-token lifetime: once no unexpired access token can carry this sid,
+// the marker is no longer needed and Redis reclaims it.
+//
+// The database session state is the durable source of truth for refresh-token
+// validation; this cache write is therefore best-effort. A failure (or absent
+// revoker) is logged and swallowed so logout/refresh still succeed - the cost is
+// that the already-issued access token survives until its short expiry.
+func (s *Service) revokeSessionInCache(ctx context.Context, sessionID string) {
+	if s.revoker == nil || sessionID == "" {
+		return
+	}
+	expiresAt := s.now().Add(s.cfg.AccessTTL)
+	if err := s.revoker.Revoke(ctx, sessionID, expiresAt); err != nil {
+		s.log.WarnContext(ctx, "failed to record session revocation in cache",
+			slog.String("session_id", sessionID),
+			slog.String("reason", "revocation_store_error"),
+			slog.String("error", err.Error()),
+		)
+	}
 }
 
 // issueTokenPair mints an access token and a new refresh-token session. It must
 // run inside a transaction so the session row commits with the caller's work.
 func (s *Service) issueTokenPair(ctx context.Context, u *User, includeUser bool, meta RequestMeta) (*TokenPair, error) {
-	access, _, expiresIn, err := s.jwt.Issue(u.ID, u.Email)
-	if err != nil {
-		return nil, err
-	}
 	refreshPlain, err := generateSecret(32)
 	if err != nil {
 		return nil, err
@@ -367,7 +402,14 @@ func (s *Service) issueTokenPair(ctx context.Context, u *User, includeUser bool,
 		UserAgent: optionalString(meta.UserAgent),
 		IP:        optionalString(meta.IP),
 	}
+	// Persist the session first so its DB-generated ID can be embedded in the
+	// access token (the "sid" claim). Binding the two lets revoking the session
+	// immediately invalidate the access token at the gateway.
 	if err := s.sessions.Create(ctx, session); err != nil {
+		return nil, err
+	}
+	access, _, expiresIn, err := s.jwt.Issue(u.ID, u.Email, session.ID)
+	if err != nil {
 		return nil, err
 	}
 	pair := &TokenPair{AccessToken: access, RefreshToken: refreshPlain, ExpiresIn: expiresIn}

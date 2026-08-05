@@ -1,0 +1,22 @@
+{{- if eq .Values.persistence.type "pvc" }}
+# Persistent state for the agent. Only created when persistence.type == "pvc".
+# ReadWriteOnce means a single pod may mount it, so pair this with
+# replicaCount: 1. For HA (leader-elected) deployments prefer type: emptyDir and
+# rely on control-plane recovery to rebuild state.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "agent.name" . }}-state
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "agent.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if .Values.persistence.storageClass }}
+  storageClassName: {{ .Values.persistence.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size | quote }}
+{{- end }}

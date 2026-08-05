@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"time"
 
 	"github.com/bdsplatform/platform/backend/libs/database"
 	apperrors "github.com/bdsplatform/platform/backend/libs/errors"
@@ -38,6 +39,21 @@ type SessionStore interface {
 	GetByHash(ctx context.Context, hash string) (*RefreshToken, error)
 	Revoke(ctx context.Context, id string, replacedBy *string) error
 	RevokeAllForUser(ctx context.Context, userID string) error
+}
+
+// TokenRevoker records a revoked token or session in a fast, shared store
+// (Redis) keyed by an opaque ID, with a TTL derived from expiresAt. The API
+// gateway consults the same store after signature validation, so a revocation
+// written here takes effect across every gateway replica before the token's
+// natural expiry.
+//
+// *security.TokenRevocationList satisfies it. It is optional: when the auth
+// service has no Redis configured the revoker is nil and the database session
+// state (refresh_tokens.revoked_at) remains the durable source of truth for
+// refresh/logout. Access-token cut-off before expiry then relies on Redis being
+// present, which is the intended production configuration.
+type TokenRevoker interface {
+	Revoke(ctx context.Context, tokenID string, expiresAt time.Time) error
 }
 
 // OneTimeTokenStore persists email-verification and password-reset tokens.

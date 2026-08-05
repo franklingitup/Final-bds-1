@@ -18,10 +18,13 @@ type Config struct {
 	ProjectService proxy.ServiceConfig
 	AuditService   proxy.ServiceConfig
 
-	// Future services.
-	ClusterService    proxy.ServiceConfig
-	DeploymentService proxy.ServiceConfig
-	SecretsService    proxy.ServiceConfig
+	// Infrastructure services.
+	ClusterService       proxy.ServiceConfig
+	DeploymentService    proxy.ServiceConfig
+	SecretsService       proxy.ServiceConfig
+	DomainService        proxy.ServiceConfig
+	NotificationService  proxy.ServiceConfig
+	ProvisioningService  proxy.ServiceConfig
 }
 
 // DefaultConfig returns configuration for local development.
@@ -55,21 +58,38 @@ func DefaultConfig() Config {
 			Name:    "secrets",
 			BaseURL: "http://localhost:8087",
 		},
+		DomainService: proxy.ServiceConfig{
+			Name:    "domain",
+			BaseURL: "http://localhost:8088",
+		},
+		NotificationService: proxy.ServiceConfig{
+			Name:    "notification",
+			BaseURL: "http://localhost:8089",
+		},
+		ProvisioningService: proxy.ServiceConfig{
+			Name:    "provisioning",
+			BaseURL: "http://localhost:8090",
+		},
 	}
 }
 
 // Router manages all gateway routes.
 type Router struct {
 	validator   *auth.Validator
-	rateLimiter *middleware.RateLimiter
+	revoker     *middleware.RevocationChecker
+	rateLimiter middleware.Limiter
 	services    map[string]*proxy.Service
 	log         *slog.Logger
 }
 
-// New creates a new router with the given configuration.
-func New(validator *auth.Validator, rateLimiter *middleware.RateLimiter, cfg Config, log *slog.Logger) (*Router, error) {
+// New creates a new router with the given configuration. The revoker may be nil
+// to disable token-revocation checks (signature-only auth). The rateLimiter may
+// be any middleware.Limiter (in-memory or Redis-backed) or nil to disable rate
+// limiting.
+func New(validator *auth.Validator, revoker *middleware.RevocationChecker, rateLimiter middleware.Limiter, cfg Config, log *slog.Logger) (*Router, error) {
 	r := &Router{
 		validator:   validator,
+		revoker:     revoker,
 		rateLimiter: rateLimiter,
 		services:    make(map[string]*proxy.Service),
 		log:         log,
@@ -84,6 +104,9 @@ func New(validator *auth.Validator, rateLimiter *middleware.RateLimiter, cfg Con
 		cfg.ClusterService,
 		cfg.DeploymentService,
 		cfg.SecretsService,
+		cfg.DomainService,
+		cfg.NotificationService,
+		cfg.ProvisioningService,
 	}
 
 	for _, svcCfg := range serviceConfigs {
@@ -105,7 +128,9 @@ func New(validator *auth.Validator, rateLimiter *middleware.RateLimiter, cfg Con
 func (r *Router) Register(app *fiber.App) {
 	// Global middleware.
 	app.Use(middleware.RequestID())
-	app.Use(r.rateLimiter.Middleware())
+	if r.rateLimiter != nil {
+		app.Use(r.rateLimiter.Middleware())
+	}
 
 	// API version group.
 	v1 := app.Group("/v1")
@@ -117,7 +142,7 @@ func (r *Router) Register(app *fiber.App) {
 	r.registerAgentRoutes(v1)
 
 	// Authenticated routes.
-	authenticated := v1.Group("", middleware.Authentication(r.validator))
+	authenticated := v1.Group("", middleware.Authentication(r.validator, r.revoker))
 
 	// Tenant routes.
 	r.registerTenantRoutes(authenticated)
@@ -131,10 +156,13 @@ func (r *Router) Register(app *fiber.App) {
 	// Audit routes.
 	r.registerAuditRoutes(orgs)
 
-	// Cluster, Deployment, Secrets routes.
+	// Cluster, Deployment, Secrets, Domain, Notification, Provisioning routes.
 	r.registerClusterRoutes(orgs)
 	r.registerDeploymentRoutes(orgs)
 	r.registerSecretsRoutes(orgs)
+	r.registerDomainRoutes(v1, orgs)
+	r.registerNotificationRoutes(orgs)
+	r.registerProvisioningRoutes(v1, orgs)
 }
 
 // registerAuthRoutes mounts auth service routes.
@@ -151,11 +179,12 @@ func (r *Router) registerAuthRoutes(g fiber.Router) {
 	auth.Post("/refresh", svc.Handler())
 	auth.Post("/verify-email", svc.Handler())
 	auth.Post("/resend-verification", svc.Handler())
-	auth.Post("/password-reset", svc.Handler())
+	// Backend route is /password-reset/request (auth/internal/routes.go).
+	auth.Post("/password-reset/request", svc.Handler())
 	auth.Post("/password-reset/confirm", svc.Handler())
 
 	// Authenticated auth endpoints.
-	authProtected := auth.Group("", middleware.Authentication(r.validator))
+	authProtected := auth.Group("", middleware.Authentication(r.validator, r.revoker))
 	authProtected.Post("/logout", svc.Handler())
 	authProtected.Get("/me", svc.Handler())
 	authProtected.Post("/mfa/setup", svc.Handler())
@@ -164,20 +193,22 @@ func (r *Router) registerAuthRoutes(g fiber.Router) {
 
 	// Service account management (org-scoped).
 	serviceAccounts := g.Group("/organizations/:orgId/service-accounts",
-		middleware.Authentication(r.validator),
+		middleware.Authentication(r.validator, r.revoker),
 		middleware.OrgScope(),
 	)
 	serviceAccounts.Post("", svc.Handler())
 	serviceAccounts.Get("", svc.Handler())
-	serviceAccounts.Get("/:accountId", svc.Handler())
 	serviceAccounts.Delete("/:accountId", svc.Handler())
+	// API token creation is nested under a service account to match the auth
+	// backend route POST /v1/organizations/:orgId/service-accounts/:id/tokens.
+	serviceAccounts.Post("/:accountId/tokens", svc.Handler())
 
-	// API tokens (org-scoped).
+	// API tokens (org-scoped): list and revoke. Creation lives under the owning
+	// service account above; the backend has no flat POST /api-tokens route.
 	apiTokens := g.Group("/organizations/:orgId/api-tokens",
-		middleware.Authentication(r.validator),
+		middleware.Authentication(r.validator, r.revoker),
 		middleware.OrgScope(),
 	)
-	apiTokens.Post("", svc.Handler())
 	apiTokens.Get("", svc.Handler())
 	apiTokens.Delete("/:tokenId", svc.Handler())
 }
@@ -225,6 +256,8 @@ func (r *Router) registerProjectRoutes(orgs fiber.Router) {
 	projects := orgs.Group("/projects")
 	projects.Post("", svc.Handler())
 	projects.Get("", svc.Handler())
+	// Lookup by slug must be registered before the :projectId param route.
+	projects.Get("/by-slug/:slug", svc.Handler())
 	projects.Get("/:projectId", middleware.ProjectScope(), svc.Handler())
 	projects.Patch("/:projectId", middleware.ProjectScope(), svc.Handler())
 	projects.Delete("/:projectId", middleware.ProjectScope(), svc.Handler())
@@ -255,6 +288,9 @@ func (r *Router) registerAgentRoutes(v1 fiber.Router) {
 	// Agent registration (cluster service, capability-based via registration token).
 	if svc, ok := r.services["cluster"]; ok {
 		v1.Post("/agent/register", svc.Handler())
+		// Agent recovery (cluster service, capability-based via installation token
+		// header). Lets an agent rebuild lost local state without re-issuing a token.
+		v1.Get("/agent/recover", svc.Handler())
 		// Agent heartbeat (cluster service, credential-based via X-Cluster-ID/X-Agent-ID).
 		// This endpoint allows agents to send heartbeats without user JWT.
 		v1.Post("/agent/clusters/:clusterId/heartbeat", svc.Handler())
@@ -358,6 +394,134 @@ func (r *Router) registerSecretsRoutes(orgs fiber.Router) {
 	secrets.Get("/:secretId", svc.Handler())
 	secrets.Patch("/:secretId", svc.Handler())
 	secrets.Delete("/:secretId", svc.Handler())
+}
+
+// registerDomainRoutes mounts domain service routes.
+func (r *Router) registerDomainRoutes(v1, orgs fiber.Router) {
+	svc, ok := r.services["domain"]
+	if !ok {
+		return
+	}
+
+	// Domain management within an organization.
+	domains := orgs.Group("/domains")
+	domains.Post("", svc.Handler())
+	domains.Get("", svc.Handler())
+	domains.Get("/:domainId", svc.Handler())
+	domains.Patch("/:domainId", svc.Handler())
+	domains.Delete("/:domainId", svc.Handler())
+
+	// Domain verification.
+	domains.Post("/:domainId/verify", svc.Handler())
+
+	// TLS certificates.
+	domains.Post("/:domainId/certificate", svc.Handler())
+	domains.Get("/:domainId/certificate", svc.Handler())
+
+	// Ingress management.
+	domains.Post("/:domainId/ingress", svc.Handler())
+	domains.Get("/:domainId/ingress", svc.Handler())
+
+	// Domain events.
+	domains.Get("/:domainId/events", svc.Handler())
+
+	// Domains by deployment.
+	orgs.Get("/deployments/:deploymentId/domains", svc.Handler())
+
+	// Agent endpoints for ingress sync (no user auth, credential-based).
+	agent := v1.Group("/agent")
+	agent.Get("/clusters/:clusterId/ingresses", svc.Handler())
+	agent.Post("/ingresses/:ingressId/sync", svc.Handler())
+
+	// ACME HTTP-01 challenge (public, no auth - accessed by Let's Encrypt).
+	v1.Get("/.well-known/acme-challenge/:token", svc.Handler())
+}
+
+// registerNotificationRoutes mounts notification service routes.
+func (r *Router) registerNotificationRoutes(orgs fiber.Router) {
+	svc, ok := r.services["notification"]
+	if !ok {
+		return
+	}
+
+	// Notification channels.
+	channels := orgs.Group("/channels")
+	channels.Post("", svc.Handler())
+	channels.Get("", svc.Handler())
+	channels.Get("/:channelId", svc.Handler())
+	channels.Patch("/:channelId", svc.Handler())
+	channels.Delete("/:channelId", svc.Handler())
+	channels.Post("/:channelId/test", svc.Handler())
+
+	// User preferences.
+	prefs := orgs.Group("/preferences")
+	prefs.Get("", svc.Handler())
+	prefs.Put("", svc.Handler())
+
+	// Notifications.
+	notifs := orgs.Group("/notifications")
+	notifs.Post("", svc.Handler())
+	notifs.Get("", svc.Handler())
+	notifs.Get("/:notificationId", svc.Handler())
+
+	// Webhooks.
+	webhooks := orgs.Group("/webhooks")
+	webhooks.Post("", svc.Handler())
+	webhooks.Get("", svc.Handler())
+	webhooks.Delete("/:webhookId", svc.Handler())
+
+	// Dead letter queue.
+	dlq := orgs.Group("/dlq")
+	dlq.Get("", svc.Handler())
+	dlq.Post("/replay", svc.Handler())
+	dlq.Post("/discard", svc.Handler())
+}
+
+// registerProvisioningRoutes mounts provisioning service routes.
+func (r *Router) registerProvisioningRoutes(v1, orgs fiber.Router) {
+	svc, ok := r.services["provisioning"]
+	if !ok {
+		return
+	}
+
+	// Public bootstrap endpoints (token-based auth).
+	bootstrap := v1.Group("/bootstrap")
+	bootstrap.Get("/:token/manifest.yaml", svc.Handler())
+	bootstrap.Post("/:token/agent", svc.Handler())
+
+	// Session step updates (token-based auth).
+	sessions := v1.Group("/sessions")
+	sessions.Post("/:sessionToken/steps/:stepNumber", svc.Handler())
+
+	// Cloud credentials.
+	creds := orgs.Group("/credentials")
+	creds.Post("", svc.Handler())
+	creds.Get("", svc.Handler())
+	creds.Post("/:credentialId/validate", svc.Handler())
+	creds.Delete("/:credentialId", svc.Handler())
+
+	// Cluster templates.
+	templates := orgs.Group("/templates")
+	templates.Get("", svc.Handler())
+
+	// Provisioning requests.
+	prov := orgs.Group("/provisioning")
+	prov.Post("", svc.Handler())
+	prov.Get("", svc.Handler())
+	prov.Get("/:requestId", svc.Handler())
+	prov.Post("/:requestId/terraform", svc.Handler())
+	prov.Post("/:requestId/start", svc.Handler())
+	prov.Get("/:requestId/events", svc.Handler())
+
+	// Install sessions.
+	installSessions := orgs.Group("/sessions")
+	installSessions.Get("/:sessionId", svc.Handler())
+
+	// Provider info.
+	providers := orgs.Group("/providers")
+	providers.Get("/:provider/regions", svc.Handler())
+	providers.Get("/:provider/machine-types", svc.Handler())
+	providers.Get("/:provider/kubernetes-versions", svc.Handler())
 }
 
 // Services returns the map of registered backend services.

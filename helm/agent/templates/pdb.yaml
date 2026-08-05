@@ -1,0 +1,18 @@
+{{- if and .Values.podDisruptionBudget.enabled (gt (int .Values.replicaCount) 1) }}
+# Keeps a leader-capable replica running through voluntary disruptions
+# (node drains, rolling upgrades). Only rendered for multi-replica (HA)
+# deployments; a single-replica agent cannot satisfy a PDB and would block drains.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "agent.name" . }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "agent.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "agent.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}

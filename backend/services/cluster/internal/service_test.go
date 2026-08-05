@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/bdsplatform/platform/backend/libs/authz"
 	"github.com/bdsplatform/platform/backend/libs/database"
 	apperrors "github.com/bdsplatform/platform/backend/libs/errors"
 	"github.com/bdsplatform/platform/backend/libs/events"
@@ -22,22 +23,42 @@ type fakeRunner struct{}
 
 func (fakeRunner) WithTenant(ctx context.Context, _ string, fn database.TxFunc) error { return fn(ctx) }
 
-type fakeOutbox struct {
-	mu     sync.Mutex
-	events []events.Event
+// fakeOrgMemberStore always returns an active member with owner role.
+type fakeOrgMemberStore struct{}
+
+func (f *fakeOrgMemberStore) GetOrgMember(ctx context.Context, userID string) (*authz.OrgMember, error) {
+	return &authz.OrgMember{
+		OrgID:  "any",
+		UserID: userID,
+		Role:   authz.OrgOwner,
+		Status: "active",
+	}, nil
 }
 
-func (f *fakeOutbox) Enqueue(_ context.Context, e events.Event) error {
+type fakeOutbox struct {
+	mu     sync.Mutex
+	events []events.Envelope
+}
+
+func (f *fakeOutbox) Enqueue(_ context.Context, e events.Envelope) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.events = append(f.events, e)
 	return nil
 }
 
-func (f *fakeOutbox) list() []events.Event {
+func (f *fakeOutbox) FetchUnpublished(_ context.Context, limit int) ([]events.OutboxRecord, error) {
+	return nil, nil
+}
+
+func (f *fakeOutbox) MarkPublished(_ context.Context, ids []string) error {
+	return nil
+}
+
+func (f *fakeOutbox) list() []events.Envelope {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	cp := make([]events.Event, len(f.events))
+	cp := make([]events.Envelope, len(f.events))
 	copy(cp, f.events)
 	return cp
 }
@@ -292,7 +313,7 @@ func (f *fakeHeartbeatStore) ListByCluster(_ context.Context, clusterID string, 
 }
 
 type fakeNotifier struct {
-	mu        sync.Mutex
+	mu         sync.Mutex
 	deliveries []TokenDelivery
 }
 
@@ -336,6 +357,7 @@ func newTestEnv() *testEnv {
 		Clusters:   clusters,
 		Tokens:     tokens,
 		Heartbeats: heartbeats,
+		OrgMembers: &fakeOrgMemberStore{},
 		Outbox:     outbox,
 		Tenant:     fakeRunner{},
 		Notifier:   notifier,
@@ -437,10 +459,11 @@ func TestGetCluster(t *testing.T) {
 	env := newTestEnv()
 	ctx := context.Background()
 	orgID := uuid.NewString()
+	userID := uuid.NewString()
 
 	created := env.createCluster(t, orgID, uuid.NewString(), "Test", "test")
 
-	got, err := env.svc.GetCluster(ctx, orgID, created.ID)
+	got, err := env.svc.GetCluster(ctx, orgID, userID, created.ID)
 	if err != nil {
 		t.Fatalf("GetCluster: %v", err)
 	}
@@ -453,11 +476,12 @@ func TestListClusters(t *testing.T) {
 	env := newTestEnv()
 	ctx := context.Background()
 	orgID := uuid.NewString()
+	userID := uuid.NewString()
 
 	env.createCluster(t, orgID, uuid.NewString(), "Cluster 1", "cluster-1")
 	env.createCluster(t, orgID, uuid.NewString(), "Cluster 2", "cluster-2")
 
-	page, err := env.svc.ListClusters(ctx, orgID, database.PageRequest{Limit: 10}, "")
+	page, err := env.svc.ListClusters(ctx, orgID, userID, database.PageRequest{Limit: 10}, "")
 	if err != nil {
 		t.Fatalf("ListClusters: %v", err)
 	}
@@ -470,11 +494,12 @@ func TestUpdateCluster(t *testing.T) {
 	env := newTestEnv()
 	ctx := context.Background()
 	orgID := uuid.NewString()
+	userID := uuid.NewString()
 
 	c := env.createCluster(t, orgID, uuid.NewString(), "Original", "original")
 
 	newName := "Updated"
-	updated, err := env.svc.UpdateCluster(ctx, orgID, c.ID, UpdateClusterRequest{
+	updated, err := env.svc.UpdateCluster(ctx, orgID, userID, c.ID, UpdateClusterRequest{
 		Name: &newName,
 	})
 	if err != nil {
@@ -565,7 +590,7 @@ func TestRevokeRegistrationToken(t *testing.T) {
 	c := env.createCluster(t, orgID, userID, "Test", "test")
 	token, _ := env.svc.GenerateRegistrationToken(ctx, orgID, userID, c.ID, GenerateTokenRequest{})
 
-	if err := env.svc.RevokeRegistrationToken(ctx, orgID, c.ID, token.ID); err != nil {
+	if err := env.svc.RevokeRegistrationToken(ctx, orgID, userID, c.ID, token.ID); err != nil {
 		t.Fatalf("RevokeRegistrationToken: %v", err)
 	}
 
@@ -617,7 +642,12 @@ func TestRegisterAgent(t *testing.T) {
 	}
 }
 
-func TestRegisterAgent_TokenAlreadyUsed(t *testing.T) {
+// TestRegisterAgent_Idempotent verifies the idempotent registration contract:
+// a second registration with an already-consumed token no longer fails with a
+// 409. Instead it returns the existing cluster metadata (HTTP 200) with the
+// ORIGINAL, stable AgentID — even when the caller presents a different AgentID
+// (the lost-state recovery case). This is what prevents CrashLoopBackOff.
+func TestRegisterAgent_Idempotent(t *testing.T) {
 	env := newTestEnv()
 	ctx := context.Background()
 	orgID := uuid.NewString()
@@ -626,24 +656,222 @@ func TestRegisterAgent_TokenAlreadyUsed(t *testing.T) {
 	c := env.createCluster(t, orgID, userID, "Test", "test")
 	token, _ := env.svc.GenerateRegistrationToken(ctx, orgID, userID, c.ID, GenerateTokenRequest{})
 
-	// First registration.
-	_, _ = env.svc.RegisterAgent(ctx, AgentRegisterRequest{
+	// First registration establishes the stable identity.
+	first, err := env.svc.RegisterAgent(ctx, AgentRegisterRequest{
 		Token:             token.Token,
 		AgentID:           "agent-001",
 		KubernetesVersion: "1.28.5",
 		NodeCount:         3,
 	})
+	if err != nil {
+		t.Fatalf("first RegisterAgent: %v", err)
+	}
 
-	// Second attempt should fail.
-	_, err := env.svc.RegisterAgent(ctx, AgentRegisterRequest{
+	// Second registration with a DIFFERENT agent ID (simulating an agent that
+	// lost its state and generated a new ID) must succeed idempotently and
+	// return the original cluster + original AgentID.
+	second, err := env.svc.RegisterAgent(ctx, AgentRegisterRequest{
 		Token:             token.Token,
-		AgentID:           "agent-002",
+		AgentID:           "agent-002-regenerated",
 		KubernetesVersion: "1.28.5",
 		NodeCount:         2,
 	})
-	if !errors.Is(err, errTokenUsed) {
-		t.Errorf("expected errTokenUsed, got %v", err)
+	if err != nil {
+		t.Fatalf("idempotent RegisterAgent must not fail, got: %v", err)
 	}
+	if second.ID != first.ID {
+		t.Errorf("clusterID changed: %q -> %q", first.ID, second.ID)
+	}
+	if second.Status != StatusConnected {
+		t.Errorf("status = %q, want connected", second.Status)
+	}
+	if deref(second.AgentID) != "agent-001" {
+		t.Errorf("agentID = %q, want stable agent-001 (must not adopt regenerated id)", deref(second.AgentID))
+	}
+
+	// A recovery/registered event should have been emitted for auditing.
+	if !hasEvent(env.outbox.list(), EventClusterRecovered) {
+		t.Error("expected cluster.recovered event on idempotent registration")
+	}
+}
+
+// TestRegisterAgent_Concurrent verifies that many agents racing on the SAME
+// installation token (e.g. two replicas booting simultaneously, or aggressive
+// retries) never create duplicate clusters or diverging identities. The
+// token's conditional "mark used" acts as the optimistic guard: at most one
+// call takes the fresh-registration path; the rest either recover or fail and
+// retry. Every successful result must reference the same cluster and the same
+// stable AgentID.
+func TestRegisterAgent_Concurrent(t *testing.T) {
+	env := newTestEnv()
+	ctx := context.Background()
+	orgID := uuid.NewString()
+	userID := uuid.NewString()
+
+	c := env.createCluster(t, orgID, userID, "Test", "test")
+	token, _ := env.svc.GenerateRegistrationToken(ctx, orgID, userID, c.ID, GenerateTokenRequest{})
+
+	const n = 16
+	var wg sync.WaitGroup
+	results := make([]*Cluster, n)
+	errs := make([]error, n)
+	start := make(chan struct{})
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start // maximize contention
+			results[i], errs[i] = env.svc.RegisterAgent(ctx, AgentRegisterRequest{
+				Token:             token.Token,
+				AgentID:           uuid.NewString(),
+				KubernetesVersion: "1.28.5",
+				NodeCount:         3,
+			})
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	var successes []*Cluster
+	for i := 0; i < n; i++ {
+		if errs[i] == nil {
+			successes = append(successes, results[i])
+		}
+	}
+	if len(successes) == 0 {
+		t.Fatal("expected at least one successful registration")
+	}
+
+	// All successful results must reference the same cluster and stable AgentID.
+	wantID := successes[0].ID
+	wantAgent := deref(successes[0].AgentID)
+	if wantAgent == "" {
+		t.Fatal("registered cluster has empty AgentID")
+	}
+	for _, r := range successes {
+		if r.ID != wantID {
+			t.Errorf("cluster ID diverged under concurrency: %q vs %q", r.ID, wantID)
+		}
+		if deref(r.AgentID) != wantAgent {
+			t.Errorf("AgentID diverged under concurrency: %q vs %q", deref(r.AgentID), wantAgent)
+		}
+	}
+
+	// No duplicate cluster may have been created.
+	if got := len(env.clusters.clusters); got != 1 {
+		t.Errorf("cluster count = %d, want 1 (no duplicates)", got)
+	}
+
+	// A subsequent registration is idempotent and returns the same identity.
+	final, err := env.svc.RegisterAgent(ctx, AgentRegisterRequest{
+		Token:   token.Token,
+		AgentID: uuid.NewString(),
+	})
+	if err != nil {
+		t.Fatalf("post-race idempotent RegisterAgent failed: %v", err)
+	}
+	if final.ID != wantID || deref(final.AgentID) != wantAgent {
+		t.Errorf("idempotent result diverged: id=%q agent=%q", final.ID, deref(final.AgentID))
+	}
+}
+
+// TestRegisterAgent_RevokedToken verifies revocation is the hard kill-switch:
+// a revoked token can never register, even idempotently.
+func TestRegisterAgent_RevokedToken(t *testing.T) {
+	env := newTestEnv()
+	ctx := context.Background()
+	orgID := uuid.NewString()
+	userID := uuid.NewString()
+
+	c := env.createCluster(t, orgID, userID, "Test", "test")
+	token, _ := env.svc.GenerateRegistrationToken(ctx, orgID, userID, c.ID, GenerateTokenRequest{})
+	if err := env.svc.RevokeRegistrationToken(ctx, orgID, userID, c.ID, token.ID); err != nil {
+		t.Fatalf("RevokeRegistrationToken: %v", err)
+	}
+
+	_, err := env.svc.RegisterAgent(ctx, AgentRegisterRequest{
+		Token:   token.Token,
+		AgentID: "agent-001",
+	})
+	if !errors.Is(err, errTokenRevoked) {
+		t.Errorf("expected errTokenRevoked, got %v", err)
+	}
+}
+
+// TestRecoverCluster verifies the recovery endpoint returns the existing cluster
+// (with the stable AgentID) for both a used token and after successful
+// registration, so an agent that deleted its state.json can rebuild it.
+func TestRecoverCluster(t *testing.T) {
+	env := newTestEnv()
+	ctx := context.Background()
+	orgID := uuid.NewString()
+	userID := uuid.NewString()
+
+	c := env.createCluster(t, orgID, userID, "Test", "test")
+	token, _ := env.svc.GenerateRegistrationToken(ctx, orgID, userID, c.ID, GenerateTokenRequest{})
+	if _, err := env.svc.RegisterAgent(ctx, AgentRegisterRequest{
+		Token:             token.Token,
+		AgentID:           "agent-001",
+		KubernetesVersion: "1.28.5",
+		NodeCount:         3,
+	}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+
+	recovered, err := env.svc.RecoverCluster(ctx, token.Token, "agent-lost-state")
+	if err != nil {
+		t.Fatalf("RecoverCluster: %v", err)
+	}
+	if recovered.ID != c.ID {
+		t.Errorf("clusterID = %q, want %q", recovered.ID, c.ID)
+	}
+	if recovered.OrgID != orgID {
+		t.Errorf("orgID = %q, want %q", recovered.OrgID, orgID)
+	}
+	if deref(recovered.AgentID) != "agent-001" {
+		t.Errorf("agentID = %q, want stable agent-001", deref(recovered.AgentID))
+	}
+	if recovered.Status != StatusConnected {
+		t.Errorf("status = %q, want connected", recovered.Status)
+	}
+}
+
+// TestRecoverCluster_InvalidToken verifies an unknown token is rejected (401).
+func TestRecoverCluster_InvalidToken(t *testing.T) {
+	env := newTestEnv()
+	_, err := env.svc.RecoverCluster(context.Background(), "totally-unknown-token", "agent-x")
+	if !errors.Is(err, errInvalidToken) {
+		t.Errorf("expected errInvalidToken, got %v", err)
+	}
+}
+
+// TestRecoverCluster_NotYetRegistered verifies recovery on an active token whose
+// cluster has not completed registration returns errClusterNotFound so the agent
+// falls back to a fresh registration.
+func TestRecoverCluster_NotYetRegistered(t *testing.T) {
+	env := newTestEnv()
+	ctx := context.Background()
+	orgID := uuid.NewString()
+	userID := uuid.NewString()
+
+	c := env.createCluster(t, orgID, userID, "Test", "test")
+	token, _ := env.svc.GenerateRegistrationToken(ctx, orgID, userID, c.ID, GenerateTokenRequest{})
+
+	_, err := env.svc.RecoverCluster(ctx, token.Token, "agent-001")
+	if !errors.Is(err, errClusterNotFound) {
+		t.Errorf("expected errClusterNotFound, got %v", err)
+	}
+}
+
+// hasEvent reports whether an event of the given type is present.
+func hasEvent(evts []events.Envelope, eventType string) bool {
+	for _, e := range evts {
+		if e.Type == eventType {
+			return true
+		}
+	}
+	return false
 }
 
 // TestRegisterAgent_ReturnsCompleteClusterData verifies that RegisterAgent
@@ -739,6 +967,7 @@ func TestRegisterAgent_ExpiredToken(t *testing.T) {
 		Clusters:   clusters,
 		Tokens:     tokens,
 		Heartbeats: heartbeats,
+		OrgMembers: &fakeOrgMemberStore{},
 		Outbox:     outbox,
 		Tenant:     fakeRunner{},
 		Notifier:   notifier,
@@ -797,13 +1026,13 @@ func TestRecordHeartbeat(t *testing.T) {
 	}
 
 	// Check cluster updated.
-	got, _ := env.svc.GetCluster(ctx, orgID, c.ID)
+	got, _ := env.svc.GetCluster(ctx, orgID, userID, c.ID)
 	if *got.NodeCount != 4 {
 		t.Errorf("nodeCount = %d, want 4", *got.NodeCount)
 	}
 
 	// Check heartbeat history.
-	heartbeats, _ := env.svc.GetHeartbeats(ctx, orgID, c.ID, 10)
+	heartbeats, _ := env.svc.GetHeartbeats(ctx, orgID, userID, c.ID, 10)
 	if len(heartbeats) != 1 {
 		t.Errorf("got %d heartbeats, want 1", len(heartbeats))
 	}
@@ -878,7 +1107,7 @@ func TestMarkDisconnected(t *testing.T) {
 	}
 
 	// Check status.
-	got, _ := env.svc.GetCluster(ctx, orgID, c.ID)
+	got, _ := env.svc.GetCluster(ctx, orgID, userID, c.ID)
 	if got.Status != StatusDisconnected {
 		t.Errorf("status = %q, want disconnected", got.Status)
 	}

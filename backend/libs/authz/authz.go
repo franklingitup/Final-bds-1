@@ -18,7 +18,7 @@ type OrgRole string
 const (
 	OrgOwner   OrgRole = "owner"
 	OrgAdmin   OrgRole = "admin"
-	OrgMember  OrgRole = "member"
+	RoleMember OrgRole = "member"
 	OrgAuditor OrgRole = "auditor"
 )
 
@@ -87,7 +87,7 @@ func NewPolicyAuthorizer() *PolicyAuthorizer {
 				ActionReadSecrets, ActionWriteSecrets, ActionManageSecrets,
 				ActionManageDomains, ActionReadLogs, ActionReadAudit,
 			),
-			OrgMember: set(
+			RoleMember: set(
 				ActionReadClusters, ActionReadDeployment, ActionReadLogs,
 			),
 			OrgAuditor: set(

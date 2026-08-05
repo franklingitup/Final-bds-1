@@ -9,11 +9,33 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/bdsplatform/platform/backend/libs/authz"
 	apperrors "github.com/bdsplatform/platform/backend/libs/errors"
 	"github.com/bdsplatform/platform/backend/services/gateway/internal/auth"
 )
+
+// rateLimitDecisions counts rate limit decisions labeled by backend
+// implementation ("memory" or "redis") and outcome ("allowed", "blocked",
+// "error"). The "error" outcome indicates the limiter backend failed and the
+// request was allowed through (fail-open).
+var rateLimitDecisions = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "gateway_rate_limit_decisions_total",
+		Help: "Total rate limit decisions by backend and outcome.",
+	},
+	[]string{"backend", "outcome"},
+)
+
+// Limiter is the behavior the gateway router requires from a rate limiter.
+// Both the in-memory RateLimiter and the Redis-backed RedisRateLimiter
+// satisfy it, allowing the backend to be selected at startup without changing
+// the router.
+type Limiter interface {
+	Middleware() fiber.Handler
+}
 
 // Header names used by the gateway.
 const (
@@ -54,9 +76,21 @@ func RequestID() fiber.Handler {
 }
 
 // Authentication validates the Bearer token and stores the identity in context.
-func Authentication(validator *auth.Validator) fiber.Handler {
+// OPTIONS (preflight) requests are always allowed through without authentication.
+//
+// When revoker is non-nil, a revocation check runs after signature validation:
+// a signature-valid token whose JTI or owning session has been revoked is
+// rejected with 401. A nil revoker disables the check (signature-only), matching
+// the gateway's pre-revocation behavior.
+func Authentication(validator *auth.Validator, revoker *RevocationChecker) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		token := auth.ExtractBearerToken(c.Get(fiber.HeaderAuthorization))
+		// Skip authentication for CORS preflight requests.
+		if c.Method() == fiber.MethodOptions {
+			return c.Next()
+		}
+
+		authHeader := c.Get(fiber.HeaderAuthorization)
+		token := auth.ExtractBearerToken(authHeader)
 		if token == "" {
 			return auth.ErrNoToken
 		}
@@ -64,6 +98,10 @@ func Authentication(validator *auth.Validator) fiber.Handler {
 		identity, err := validator.ValidateToken(token)
 		if err != nil {
 			return err
+		}
+
+		if revoker != nil && revoker.Revoked(c.UserContext(), GetRequestID(c), identity) {
+			return auth.ErrTokenRevoked
 		}
 
 		// Store identity in locals and context.
@@ -74,19 +112,21 @@ func Authentication(validator *auth.Validator) fiber.Handler {
 			OrgID:  identity.OrgID,
 		}))
 
-		// Forward identity headers to downstream services.
-		c.Set(HeaderUserID, identity.UserID)
+		// Forward identity headers to downstream services via request headers.
+		c.Request().Header.Set(HeaderUserID, identity.UserID)
 		if identity.Email != "" {
-			c.Set(HeaderUserEmail, identity.Email)
+			c.Request().Header.Set(HeaderUserEmail, identity.Email)
 		}
-		c.Set(HeaderTokenType, string(identity.Type))
+		c.Request().Header.Set(HeaderTokenType, string(identity.Type))
 
 		return c.Next()
 	}
 }
 
 // OptionalAuthentication validates the Bearer token if present but doesn't require it.
-func OptionalAuthentication(validator *auth.Validator) fiber.Handler {
+// A present-but-revoked token is rejected (a revoker must not be bypassable by
+// routing through an optional-auth path).
+func OptionalAuthentication(validator *auth.Validator, revoker *RevocationChecker) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		token := auth.ExtractBearerToken(c.Get(fiber.HeaderAuthorization))
 		if token == "" {
@@ -99,13 +139,17 @@ func OptionalAuthentication(validator *auth.Validator) fiber.Handler {
 			return err
 		}
 
+		if revoker != nil && revoker.Revoked(c.UserContext(), GetRequestID(c), identity) {
+			return auth.ErrTokenRevoked
+		}
+
 		c.Locals(LocalIdentity, identity)
 		c.SetUserContext(auth.WithIdentity(c.UserContext(), identity))
-		c.Set(HeaderUserID, identity.UserID)
+		c.Request().Header.Set(HeaderUserID, identity.UserID)
 		if identity.Email != "" {
-			c.Set(HeaderUserEmail, identity.Email)
+			c.Request().Header.Set(HeaderUserEmail, identity.Email)
 		}
-		c.Set(HeaderTokenType, string(identity.Type))
+		c.Request().Header.Set(HeaderTokenType, string(identity.Type))
 
 		return c.Next()
 	}
@@ -132,8 +176,8 @@ func OrgScope() fiber.Handler {
 			}
 		}
 
-		// Forward org ID to downstream services.
-		c.Set(HeaderOrgID, orgID)
+		// Forward org ID to downstream services via request header.
+		c.Request().Header.Set(HeaderOrgID, orgID)
 		c.SetUserContext(authz.WithOrg(c.UserContext(), orgID))
 
 		return c.Next()
@@ -261,6 +305,7 @@ func (rl *RateLimiter) Middleware() fiber.Handler {
 			c.Set(HeaderRateLimitRemain, itoa(remaining))
 			c.Set(HeaderRateLimitReset, itoa(int(resetTime.Seconds())))
 
+			rateLimitDecisions.WithLabelValues("memory", "blocked").Inc()
 			return apperrors.RateLimited("rate limit exceeded")
 		}
 
@@ -272,6 +317,7 @@ func (rl *RateLimiter) Middleware() fiber.Handler {
 		c.Set(HeaderRateLimitLimit, itoa(rl.config.RequestsPerMinute))
 		c.Set(HeaderRateLimitRemain, itoa(remaining))
 
+		rateLimitDecisions.WithLabelValues("memory", "allowed").Inc()
 		return c.Next()
 	}
 }

@@ -1,12 +1,12 @@
 # Cluster agent values. Installed via the generated install command.
 image:
-  repository: ghcr.io/bdsplatform/platform/cluster-agent
-  tag: ""
+  repository: platform-agent
+  tag: "0.1.0"
   pullPolicy: IfNotPresent
 
 # Control-plane connection (outbound only).
 controlPlane:
-  endpoint: "https://api.platform.example.com"
+  endpoint: "http://host.docker.internal:8080"
   # One-time install token; consumed once then exchanged for an agent credential.
   installToken: ""
 
@@ -30,3 +30,58 @@ securityContext:
   readOnlyRootFilesystem: true
   capabilities:
     drop: ["ALL"]
+
+# Writable state for the agent (state.json, reconciler-state.json,
+# secret-sync-state.json). The container root filesystem stays read-only; this
+# is the only writable path the agent requires.
+#
+# With idempotent registration and control-plane recovery, an ephemeral
+# emptyDir is safe: if the volume (or the whole pod) is lost, the agent rebuilds
+# its state from the control plane on restart without a new install token.
+#
+#   type: emptyDir  -> ephemeral, rebuilt on restart (recommended for HA Deployments)
+#   type: pvc       -> survives pod recreation; use with replicaCount: 1
+#                      (a ReadWriteOnce PVC cannot be shared by multiple pods).
+persistence:
+  type: emptyDir
+  mountPath: /var/lib/platform-agent
+  # size caps the emptyDir and sizes the PVC request.
+  size: 64Mi
+  # storageClass is only used when type: pvc ("" uses the cluster default).
+  storageClass: ""
+
+# PodDisruptionBudget keeps at least one replica (the potential leader) running
+# during voluntary disruptions (node drains, rolling upgrades). Disabled
+# automatically has no effect when replicaCount is 1.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Spread replicas across nodes so a single node failure cannot take out every
+# agent replica. "soft" (preferred) keeps scheduling possible on small clusters;
+# set to "hard" (required) on clusters with enough nodes.
+spreadReplicas:
+  enabled: true
+  mode: soft   # soft | hard
+
+# Optional PriorityClass so the agent is scheduled/evicted appropriately
+# relative to workloads. Empty = cluster default.
+priorityClassName: ""
+
+# Startup probe: gives a cold agent time to establish registration/recovery and
+# leader election before liveness starts counting, preventing restart storms on
+# slow starts. failureThreshold * periodSeconds bounds the max startup time.
+startupProbe:
+  enabled: true
+  failureThreshold: 30
+  periodSeconds: 5
+
+# Prometheus Operator integration for alerting on the registration/heartbeat
+# metrics. Requires the PrometheusRule CRD (kube-prometheus-stack).
+metrics:
+  port: 8080
+  path: /metrics
+  prometheusRule:
+    enabled: false
+    # Extra labels so your Prometheus instance selects the rule.
+    labels: {}

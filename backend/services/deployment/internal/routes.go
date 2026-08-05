@@ -64,4 +64,10 @@ func RegisterAgentRoutes(app *fiber.App, agentHandler *AgentHandler, agentAuth f
 	agent.Post("/deployments/:deploymentId/releases/:releaseId/status", func(c *fiber.Ctx) error {
 		return agentHandler.UpdateDeploymentStatus(c, releases, deployments)
 	})
+
+	// Rollout progress endpoint (deployment engine). Additive: agents that do
+	// not report progress simply never call it.
+	agent.Post("/deployments/:deploymentId/releases/:releaseId/progress", func(c *fiber.Ctx) error {
+		return agentHandler.UpdateDeploymentProgress(c, releases, deployments)
+	})
 }

@@ -9,8 +9,14 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 
+	libmw "github.com/bdsplatform/platform/backend/libs/middleware"
 	"github.com/bdsplatform/platform/backend/services/gateway/internal/auth"
 )
+
+// newTestApp creates a Fiber app with the standard error handler.
+func newTestApp() *fiber.App {
+	return fiber.New(fiber.Config{ErrorHandler: libmw.ErrorHandler()})
+}
 
 func TestRequestID_GeneratesID(t *testing.T) {
 	app := fiber.New()
@@ -110,7 +116,7 @@ func TestRateLimiter_BlocksExcessRequests(t *testing.T) {
 		KeyFunc:           func(c *fiber.Ctx) string { return "test" },
 	})
 
-	app := fiber.New()
+	app := newTestApp()
 	app.Use(rl.Middleware())
 	app.Get("/", func(c *fiber.Ctx) error {
 		return c.SendString("ok")
@@ -214,10 +220,14 @@ func TestOrgScope_SetsHeader(t *testing.T) {
 		})
 		return c.Next()
 	})
-	app.Use(OrgScope())
 
-	app.Get("/orgs/:orgId/test", func(c *fiber.Ctx) error {
-		return c.SendString(c.Get(HeaderOrgID))
+	var receivedOrgID string
+	// OrgScope must be added to a route group (not globally) so c.Params() works.
+	orgs := app.Group("/orgs/:orgId", OrgScope())
+	orgs.Get("/test", func(c *fiber.Ctx) error {
+		// Read the org ID from the request header that OrgScope set.
+		receivedOrgID = c.Get(HeaderOrgID)
+		return c.SendString("ok")
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/orgs/org-456/test", nil)
@@ -227,9 +237,9 @@ func TestOrgScope_SetsHeader(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-	if string(body) != "org-456" {
-		t.Errorf("expected org-456, got %s", body)
+	// OrgScope sets the org ID as a request header for downstream services.
+	if receivedOrgID != "org-456" {
+		t.Errorf("expected org-456, got %s", receivedOrgID)
 	}
 }
 
@@ -249,9 +259,10 @@ func TestOrgScope_ValidatesServiceAccountOrg(t *testing.T) {
 		})
 		return c.Next()
 	})
-	app.Use(OrgScope())
 
-	app.Get("/orgs/:orgId/test", func(c *fiber.Ctx) error {
+	// OrgScope must be added to a route group (not globally) so c.Params() works.
+	orgs := app.Group("/orgs/:orgId", OrgScope())
+	orgs.Get("/test", func(c *fiber.Ctx) error {
 		return c.SendString("ok")
 	})
 

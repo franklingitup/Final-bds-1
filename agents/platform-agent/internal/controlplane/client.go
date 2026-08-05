@@ -92,6 +92,49 @@ func (c *Client) Register(ctx context.Context, req RegisterRequest) (*RegisterRe
 	return &result, nil
 }
 
+// Recover fetches the cluster bound to the installation token from the control
+// plane so an agent that lost its local state can rebuild it without a new
+// token. It calls GET /v1/agent/recover, authenticating solely by possession of
+// the installation token (passed via the X-Registration-Token header). The
+// response reuses RegisterResponse; the returned AgentID is the authoritative,
+// stable identity the agent should adopt.
+func (c *Client) Recover(ctx context.Context, token, agentID string) (*RegisterResponse, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/agent/recover", nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	httpReq.Header.Set("X-Registration-Token", token)
+	if agentID != "" {
+		httpReq.Header.Set("X-Agent-ID", agentID)
+	}
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		var errResp ErrorResponse
+		if json.Unmarshal(respBody, &errResp) == nil && errResp.Error != "" {
+			return nil, &APIError{StatusCode: resp.StatusCode, Message: errResp.Error}
+		}
+		return nil, &APIError{StatusCode: resp.StatusCode, Message: string(respBody)}
+	}
+
+	var result RegisterResponse
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, fmt.Errorf("unmarshal response: %w", err)
+	}
+
+	return &result, nil
+}
+
 // HeartbeatRequest is sent periodically by the agent.
 type HeartbeatRequest struct {
 	AgentID           string `json:"agentId"`
@@ -179,4 +222,10 @@ func (e *APIError) IsConflict() bool {
 // IsForbidden returns true if the error is a 403 forbidden.
 func (e *APIError) IsForbidden() bool {
 	return e.StatusCode == http.StatusForbidden
+}
+
+// IsNotFound returns true if the error is a 404 not found (e.g., the control
+// plane no longer has a record of the cluster).
+func (e *APIError) IsNotFound() bool {
+	return e.StatusCode == http.StatusNotFound
 }

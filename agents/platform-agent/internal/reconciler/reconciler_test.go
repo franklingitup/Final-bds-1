@@ -4,6 +4,8 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"testing"
 	"time"
 
@@ -22,13 +24,16 @@ import (
 type fakeDeploymentClient struct {
 	deployments      []controlplane.DesiredDeployment
 	reportedStatuses map[string]controlplane.DeploymentStatusRequest
+	reportedProgress map[string][]controlplane.DeploymentProgressRequest
 	getError         error
 	reportError      error
+	progressError    error
 }
 
 func newFakeDeploymentClient() *fakeDeploymentClient {
 	return &fakeDeploymentClient{
 		reportedStatuses: make(map[string]controlplane.DeploymentStatusRequest),
+		reportedProgress: make(map[string][]controlplane.DeploymentProgressRequest),
 	}
 }
 
@@ -47,42 +52,207 @@ func (c *fakeDeploymentClient) ReportDeploymentStatusWithCreds(ctx context.Conte
 	return nil
 }
 
+func (c *fakeDeploymentClient) ReportDeploymentProgressWithCreds(ctx context.Context, creds controlplane.AgentCredentials, deploymentID, releaseID string, req controlplane.DeploymentProgressRequest) error {
+	if c.progressError != nil {
+		return c.progressError
+	}
+	c.reportedProgress[releaseID] = append(c.reportedProgress[releaseID], req)
+	return nil
+}
+
+func (c *fakeDeploymentClient) lastProgress(releaseID string) (controlplane.DeploymentProgressRequest, bool) {
+	reqs := c.reportedProgress[releaseID]
+	if len(reqs) == 0 {
+		return controlplane.DeploymentProgressRequest{}, false
+	}
+	return reqs[len(reqs)-1], true
+}
+
 // ----------------------------------------------------------------------------
 // Fake Resource Manager
 // ----------------------------------------------------------------------------
 
 type fakeResourceManager struct {
-	deployments      map[string]*k8s.DeploymentStatus
-	appliedSpecs     []k8s.DeploymentSpec
-	applyError       error
-	deleteError      error
+	deployments    map[string]*k8s.DeploymentStatus
+	appliedSpecs   map[string]k8s.DeploymentSpec // keyed by deployment ID for uniqueness
+	applyError     error
+	deleteError    error
+
+	// ConfigMap state.
+	configMaps        map[string]k8s.ConfigMapSpec // applied configmaps by name
+	managedConfigMaps map[string]bool              // names considered "managed" in the cluster
+	deletedConfigMaps []string
+	configMapApplyErr error
+
+	// PVC state.
+	pvcs        map[string]k8s.PVCSpec // applied pvcs by name
+	managedPVCs map[string]bool        // names considered "managed" in the cluster
+	deletedPVCs []string
+	pvcApplyErr error
+	// pvcImmutable, when it contains a name, forces ApplyPVC to report an
+	// immutable-change skip for that PVC.
+	pvcImmutable map[string]bool
+
+	// Ingress state.
+	ingresses        map[string]k8s.IngressSpec // applied ingresses by name
+	managedIngresses map[string]bool            // names considered "managed" in the cluster
+	deletedIngresses []string
+	ingressApplyErr  error
+
+	// Pod health keyed by application slug (as passed to GetPodHealth).
+	podHealth      map[string]*k8s.PodHealth
+	podHealthError error
 }
 
 func newFakeResourceManager() *fakeResourceManager {
 	return &fakeResourceManager{
-		deployments: make(map[string]*k8s.DeploymentStatus),
+		deployments:       make(map[string]*k8s.DeploymentStatus),
+		appliedSpecs:      make(map[string]k8s.DeploymentSpec),
+		configMaps:        make(map[string]k8s.ConfigMapSpec),
+		managedConfigMaps: make(map[string]bool),
+		pvcs:              make(map[string]k8s.PVCSpec),
+		managedPVCs:       make(map[string]bool),
+		pvcImmutable:      make(map[string]bool),
+		ingresses:         make(map[string]k8s.IngressSpec),
+		managedIngresses:  make(map[string]bool),
 	}
+}
+
+func (m *fakeResourceManager) ApplyIngress(ctx context.Context, spec k8s.IngressSpec) (*k8s.ApplyResult, error) {
+	if m.ingressApplyErr != nil {
+		return nil, m.ingressApplyErr
+	}
+	existing, found := m.ingresses[spec.Name]
+	m.ingresses[spec.Name] = spec
+	m.managedIngresses[spec.Name] = true
+	if !found {
+		return &k8s.ApplyResult{Created: true}, nil
+	}
+	if !reflect.DeepEqual(existing, spec) {
+		return &k8s.ApplyResult{Updated: true}, nil
+	}
+	return &k8s.ApplyResult{NoOp: true}, nil
+}
+
+func (m *fakeResourceManager) DeleteIngress(ctx context.Context, name string) error {
+	if m.deleteError != nil {
+		return m.deleteError
+	}
+	delete(m.ingresses, name)
+	delete(m.managedIngresses, name)
+	m.deletedIngresses = append(m.deletedIngresses, name)
+	return nil
+}
+
+func (m *fakeResourceManager) ListManagedIngresses(ctx context.Context) ([]string, error) {
+	names := make([]string, 0, len(m.managedIngresses))
+	for name := range m.managedIngresses {
+		names = append(names, name)
+	}
+	return names, nil
+}
+
+func (m *fakeResourceManager) ApplyPVC(ctx context.Context, spec k8s.PVCSpec) (*k8s.ApplyResult, error) {
+	if m.pvcApplyErr != nil {
+		return nil, m.pvcApplyErr
+	}
+	if m.pvcImmutable[spec.Name] {
+		return &k8s.ApplyResult{ImmutableSkipped: true}, nil
+	}
+	existing, found := m.pvcs[spec.Name]
+	if !found {
+		m.pvcs[spec.Name] = spec
+		m.managedPVCs[spec.Name] = true
+		return &k8s.ApplyResult{Created: true}, nil
+	}
+	// Legal drift: labels, annotations, storage expansion.
+	drift := !reflect.DeepEqual(existing.Labels, spec.Labels) ||
+		!reflect.DeepEqual(existing.Annotations, spec.Annotations) ||
+		spec.StorageRequest.Cmp(existing.StorageRequest) > 0
+	m.pvcs[spec.Name] = spec
+	m.managedPVCs[spec.Name] = true
+	if drift {
+		return &k8s.ApplyResult{Updated: true}, nil
+	}
+	return &k8s.ApplyResult{NoOp: true}, nil
+}
+
+func (m *fakeResourceManager) DeletePVC(ctx context.Context, name string) error {
+	if m.deleteError != nil {
+		return m.deleteError
+	}
+	delete(m.pvcs, name)
+	delete(m.managedPVCs, name)
+	m.deletedPVCs = append(m.deletedPVCs, name)
+	return nil
+}
+
+func (m *fakeResourceManager) ListManagedPVCs(ctx context.Context) ([]string, error) {
+	names := make([]string, 0, len(m.managedPVCs))
+	for name := range m.managedPVCs {
+		names = append(names, name)
+	}
+	return names, nil
+}
+
+func (m *fakeResourceManager) ApplyConfigMap(ctx context.Context, spec k8s.ConfigMapSpec) (*k8s.ApplyResult, error) {
+	if m.configMapApplyErr != nil {
+		return nil, m.configMapApplyErr
+	}
+	existing, found := m.configMaps[spec.Name]
+	m.configMaps[spec.Name] = spec
+	m.managedConfigMaps[spec.Name] = true
+	if !found {
+		return &k8s.ApplyResult{Created: true}, nil
+	}
+	// Detect drift on the reconcilable surface.
+	if !reflect.DeepEqual(existing.Data, spec.Data) ||
+		!reflect.DeepEqual(existing.BinaryData, spec.BinaryData) ||
+		!reflect.DeepEqual(existing.Labels, spec.Labels) ||
+		!reflect.DeepEqual(existing.Annotations, spec.Annotations) {
+		return &k8s.ApplyResult{Updated: true}, nil
+	}
+	return &k8s.ApplyResult{NoOp: true}, nil
+}
+
+func (m *fakeResourceManager) DeleteConfigMap(ctx context.Context, name string) error {
+	if m.deleteError != nil {
+		return m.deleteError
+	}
+	delete(m.configMaps, name)
+	delete(m.managedConfigMaps, name)
+	m.deletedConfigMaps = append(m.deletedConfigMaps, name)
+	return nil
+}
+
+func (m *fakeResourceManager) ListManagedConfigMaps(ctx context.Context) ([]string, error) {
+	names := make([]string, 0, len(m.managedConfigMaps))
+	for name := range m.managedConfigMaps {
+		names = append(names, name)
+	}
+	return names, nil
 }
 
 func (m *fakeResourceManager) ApplyDeployment(ctx context.Context, spec k8s.DeploymentSpec) (*k8s.ApplyResult, error) {
 	if m.applyError != nil {
 		return nil, m.applyError
 	}
-	m.appliedSpecs = append(m.appliedSpecs, spec)
+	// Track unique applied specs by deployment ID (idempotent like real K8s)
+	m.appliedSpecs[spec.DeploymentID] = spec
 
 	name := spec.ResourceName()
 	existing, found := m.deployments[name]
 	if !found {
 		m.deployments[name] = &k8s.DeploymentStatus{
 			Name:      name,
-			Revision:  spec.Revision,
+			Revision:  strconv.Itoa(spec.Revision),
 			ReleaseID: spec.ReleaseID,
 		}
 		return &k8s.ApplyResult{Created: true}, nil
 	}
 
-	if existing.Revision != spec.Revision {
-		existing.Revision = spec.Revision
+	if existing.Revision != strconv.Itoa(spec.Revision) {
+		existing.Revision = strconv.Itoa(spec.Revision)
 		existing.ReleaseID = spec.ReleaseID
 		return &k8s.ApplyResult{Updated: true}, nil
 	}
@@ -92,6 +262,18 @@ func (m *fakeResourceManager) ApplyDeployment(ctx context.Context, spec k8s.Depl
 
 func (m *fakeResourceManager) ApplyService(ctx context.Context, spec k8s.DeploymentSpec) (*k8s.ApplyResult, error) {
 	return &k8s.ApplyResult{NoOp: true}, nil
+}
+
+func (m *fakeResourceManager) GetPodHealth(ctx context.Context, appSlug string) (*k8s.PodHealth, error) {
+	if m.podHealthError != nil {
+		return nil, m.podHealthError
+	}
+	if m.podHealth != nil {
+		if ph, ok := m.podHealth[appSlug]; ok {
+			return ph, nil
+		}
+	}
+	return &k8s.PodHealth{}, nil
 }
 
 func (m *fakeResourceManager) GetDeploymentStatus(ctx context.Context, name string) (*k8s.DeploymentStatus, error) {
@@ -181,9 +363,10 @@ func TestReconciler_AppliesNewDeployment(t *testing.T) {
 
 	// Verify deployment was applied.
 	assert.Len(t, manager.appliedSpecs, 1)
-	assert.Equal(t, "my-app", manager.appliedSpecs[0].ResourceName())
-	assert.Equal(t, "nginx:1.25", manager.appliedSpecs[0].Image)
-	assert.Equal(t, int32(3), manager.appliedSpecs[0].Replicas)
+	spec := manager.appliedSpecs["dep-1"]
+	assert.Equal(t, "my-app", spec.ResourceName())
+	assert.Equal(t, "nginx:1.25", spec.Image)
+	assert.Equal(t, int32(3), spec.Replicas)
 }
 
 func TestReconciler_UpdatesExistingDeployment(t *testing.T) {
@@ -220,9 +403,10 @@ func TestReconciler_UpdatesExistingDeployment(t *testing.T) {
 
 	// Verify deployment was updated.
 	assert.Len(t, manager.appliedSpecs, 1)
-	assert.Equal(t, "nginx:1.26", manager.appliedSpecs[0].Image)
-	assert.Equal(t, int32(5), manager.appliedSpecs[0].Replicas)
-	assert.Equal(t, 2, manager.appliedSpecs[0].Revision)
+	spec := manager.appliedSpecs["dep-1"]
+	assert.Equal(t, "nginx:1.26", spec.Image)
+	assert.Equal(t, int32(5), spec.Replicas)
+	assert.Equal(t, 2, spec.Revision)
 }
 
 func TestReconciler_ReportsSuccessStatus(t *testing.T) {

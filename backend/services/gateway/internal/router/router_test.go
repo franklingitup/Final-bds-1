@@ -12,6 +12,7 @@ import (
 
 	"github.com/bdsplatform/platform/backend/libs/config"
 	"github.com/bdsplatform/platform/backend/services/gateway/internal/auth"
+	"github.com/bdsplatform/platform/backend/services/gateway/internal/middleware"
 	"github.com/bdsplatform/platform/backend/services/gateway/internal/proxy"
 )
 
@@ -58,7 +59,7 @@ func TestRouterCreation(t *testing.T) {
 		},
 	}
 
-	router, err := New(validator, cfg, log)
+	router, err := New(validator, nil, nil, cfg, log)
 	if err != nil {
 		t.Fatalf("failed to create router: %v", err)
 	}
@@ -83,7 +84,7 @@ func TestRouterCreation_DisabledServices(t *testing.T) {
 		},
 	}
 
-	router, err := New(validator, cfg, log)
+	router, err := New(validator, nil, nil, cfg, log)
 	if err != nil {
 		t.Fatalf("failed to create router: %v", err)
 	}
@@ -104,7 +105,7 @@ func TestRouterCreation_InvalidURL(t *testing.T) {
 		},
 	}
 
-	_, err := New(validator, cfg, log)
+	_, err := New(validator, nil, nil, cfg, log)
 	if err == nil {
 		t.Error("expected error for invalid URL")
 	}
@@ -127,7 +128,7 @@ func TestRouter_PublicAuthRoutes(t *testing.T) {
 		},
 	}
 
-	router, _ := New(validator, cfg, log)
+	router, _ := New(validator, nil, nil, cfg, log)
 	app := fiber.New()
 	router.Register(app)
 
@@ -171,7 +172,7 @@ func TestRouter_ProtectedRoutes(t *testing.T) {
 		},
 	}
 
-	router, _ := New(validator, cfg, log)
+	router, _ := New(validator, nil, nil, cfg, log)
 	app := fiber.New(fiber.Config{
 		ErrorHandler: func(c *fiber.Ctx, err error) error {
 			return c.Status(fiber.StatusUnauthorized).SendString(err.Error())
@@ -210,7 +211,7 @@ func TestRouter_AuthenticatedRequest(t *testing.T) {
 		},
 	}
 
-	router, _ := New(validator, cfg, log)
+	router, _ := New(validator, nil, nil, cfg, log)
 	app := fiber.New()
 	router.Register(app)
 
@@ -251,7 +252,7 @@ func TestRouter_OrgScopedRequest(t *testing.T) {
 		},
 	}
 
-	router, _ := New(validator, cfg, log)
+	router, _ := New(validator, nil, nil, cfg, log)
 	app := fiber.New()
 	router.Register(app)
 
@@ -286,7 +287,8 @@ func TestRouter_RateLimitHeaders(t *testing.T) {
 		},
 	}
 
-	router, _ := New(validator, cfg, log)
+	rateLimiter := middleware.NewRateLimiter(middleware.DefaultRateLimiterConfig())
+	router, _ := New(validator, nil, rateLimiter, cfg, log)
 	app := fiber.New()
 	router.Register(app)
 
@@ -322,7 +324,7 @@ func TestRouter_RequestIDPropagation(t *testing.T) {
 		},
 	}
 
-	router, _ := New(validator, cfg, log)
+	router, _ := New(validator, nil, nil, cfg, log)
 	app := fiber.New()
 	router.Register(app)
 

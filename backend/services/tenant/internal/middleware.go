@@ -22,10 +22,12 @@ func (h *Handler) RequireAuth() fiber.Handler {
 		if token == "" {
 			return errInvalidToken
 		}
+
 		id, err := h.verifier.Verify(token)
 		if err != nil {
 			return errInvalidToken
 		}
+
 		c.Locals(localUserID, id.UserID)
 		c.Locals(localEmail, id.Email)
 		c.SetUserContext(authz.WithPrincipal(c.UserContext(), authz.Principal{UserID: id.UserID}))

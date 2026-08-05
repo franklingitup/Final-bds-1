@@ -9,6 +9,7 @@ package gateway
 import (
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -65,7 +66,7 @@ func setupGateway(t *testing.T, backends map[string]*httptest.Server) *fiber.App
 		cfg.AuditService = proxy.ServiceConfig{Name: "audit", BaseURL: s.URL}
 	}
 
-	r, err := router.New(validator, cfg, nil)
+	r, err := router.New(validator, nil, nil, cfg, slog.Default())
 	if err != nil {
 		t.Fatalf("failed to create router: %v", err)
 	}

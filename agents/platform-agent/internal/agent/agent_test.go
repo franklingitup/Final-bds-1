@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -50,6 +51,7 @@ func TestWorkerFactoryReceivesCredentialsAfterRegistration(t *testing.T) {
 		cfg:           cfg,
 		state:         state,
 		workerFactory: workerFactory,
+		log:           slog.Default(),
 	}
 
 	// Initialize workers (called after registration in real flow).
@@ -145,6 +147,7 @@ func TestInitializeWorkersOnlyWhenEnabled(t *testing.T) {
 				cfg:           cfg,
 				state:         state,
 				workerFactory: workerFactory,
+				log:           slog.Default(),
 			}
 
 			_ = agent.initializeWorkers()

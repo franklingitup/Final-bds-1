@@ -116,13 +116,16 @@ func TestEventContract_SecretDeleted(t *testing.T) {
 }
 
 func TestEventContract_EventNames(t *testing.T) {
+	// SEC-CRIT-05: Event type names do NOT include version suffix.
+	// Version is specified via events.New(eventType, version, ...).
+	// E.g., events.New("secret.created", 1, ...) produces subject "evt.secret.created.v1"
 	tests := []struct {
 		constant string
 		expected string
 	}{
-		{EventSecretCreated, "secret.created.v1"},
-		{EventSecretUpdated, "secret.updated.v1"},
-		{EventSecretDeleted, "secret.deleted.v1"},
+		{EventSecretCreated, "secret.created"},
+		{EventSecretUpdated, "secret.updated"},
+		{EventSecretDeleted, "secret.deleted"},
 	}
 
 	for _, tt := range tests {
@@ -140,16 +143,16 @@ func TestEventContract_NamingConvention(t *testing.T) {
 	}
 
 	for _, event := range events {
-		// Format: <domain>.<resource>.<action>.v<version>
+		// SEC-CRIT-05: Format is <domain>.<action> (without version suffix).
+		// Version is provided separately via events.New().
 		parts := strings.Split(event, ".")
-		if len(parts) != 3 {
-			t.Errorf("event %q doesn't follow naming convention", event)
+		if len(parts) != 2 {
+			t.Errorf("event %q doesn't follow naming convention (expected 2 parts, got %d)", event, len(parts))
 			continue
 		}
 
 		domain := parts[0]
 		action := parts[1]
-		version := parts[2]
 
 		if domain != "secret" {
 			t.Errorf("event %q: domain should be 'secret', got %q", event, domain)
@@ -158,10 +161,6 @@ func TestEventContract_NamingConvention(t *testing.T) {
 		validActions := map[string]bool{"created": true, "updated": true, "deleted": true}
 		if !validActions[action] {
 			t.Errorf("event %q: invalid action %q", event, action)
-		}
-
-		if !strings.HasPrefix(version, "v") {
-			t.Errorf("event %q: version should start with 'v', got %q", event, version)
 		}
 	}
 }

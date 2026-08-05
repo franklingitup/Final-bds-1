@@ -6,8 +6,8 @@ metadata:
   labels:
     {{- include "agent.labels" . | nindent 4 }}
 ---
-# Scoped to managing workloads in customer project namespaces. No access to
-# kube-system or unrelated resources. See docs/08-agent-design.md section 10.
+# Scoped to managing workloads in customer project namespaces.
+# Also allows reading cluster inventory (nodes) during agent registration.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -15,18 +15,72 @@ metadata:
   labels:
     {{- include "agent.labels" . | nindent 4 }}
 rules:
+  # Workloads
   - apiGroups: ["apps"]
-    resources: ["deployments", "replicasets"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    resources:
+      - deployments
+      - replicasets
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+
+  # Core resources
   - apiGroups: [""]
-    resources: ["services", "secrets", "configmaps", "pods", "pods/log"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    resources:
+      - services
+      - secrets
+      - configmaps
+      - pods
+      - pods/log
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+
+  # Cluster inventory (required during registration)
+  - apiGroups: [""]
+    resources:
+      - nodes
+    verbs:
+      - get
+      - list
+      - watch
+
+  # Networking
   - apiGroups: ["networking.k8s.io"]
-    resources: ["ingresses"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    resources:
+      - ingresses
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+
+  # Autoscaling
   - apiGroups: ["autoscaling"]
-    resources: ["horizontalpodautoscalers"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    resources:
+      - horizontalpodautoscalers
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -42,8 +96,9 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "agent.name" . }}
     namespace: {{ .Values.namespace }}
+
 ---
-# Leader-election permissions (Leases) within the agent namespace for HA.
+# Leader election permissions
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -51,8 +106,17 @@ metadata:
   namespace: {{ .Values.namespace }}
 rules:
   - apiGroups: ["coordination.k8s.io"]
-    resources: ["leases"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    resources:
+      - leases
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

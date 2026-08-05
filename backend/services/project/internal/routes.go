@@ -14,6 +14,9 @@ func RegisterRoutes(app *fiber.App, h *Handler) {
 	projects := v1.Group("/organizations/:orgId/projects")
 	projects.Post("", h.CreateProject)
 	projects.Get("", h.ListProjects)
+	// Lookup by slug must be registered before the :projectId param route so
+	// "by-slug" is not captured as a projectId.
+	projects.Get("/by-slug/:slug", h.GetProjectBySlug)
 	projects.Get("/:projectId", h.GetProject)
 	projects.Patch("/:projectId", h.UpdateProject)
 	projects.Delete("/:projectId", h.DeleteProject)

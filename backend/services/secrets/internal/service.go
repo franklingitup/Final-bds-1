@@ -18,7 +18,7 @@ var secretNamePattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,254}$`)
 
 // TenantRunner executes operations within tenant context.
 type TenantRunner interface {
-	WithTenant(ctx context.Context, orgID string, fn func(ctx context.Context) error) error
+	WithTenant(ctx context.Context, orgID string, fn database.TxFunc) error
 }
 
 // MemberLookup checks project membership.
@@ -123,7 +123,7 @@ func (s *Service) CreateSecret(ctx context.Context, orgID, userID, projectID str
 		// Check for duplicate name
 		existing, err := s.secrets.GetByName(ctx, projectID, req.Name)
 		if err == nil && existing != nil {
-			return apperrors.Conflict("secret with name '%s' already exists", req.Name)
+			return apperrors.Conflict("secret with name '" + req.Name + "' already exists")
 		}
 		if err != nil && !database.IsNotFound(err) {
 			return err

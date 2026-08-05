@@ -131,7 +131,7 @@ func (h *Handler) ListSecrets(c *fiber.Ctx) error {
 	return c.JSON(SecretListView{
 		Items:      views,
 		Total:      len(views),
-		HasMore:    page.HasMore,
+		HasMore:    page.NextCursor != "",
 		NextCursor: page.NextCursor,
 	})
 }

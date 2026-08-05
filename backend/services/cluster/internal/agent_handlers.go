@@ -156,13 +156,27 @@ func (v *clusterValidatorImpl) ValidateCluster(ctx context.Context, clusterID, a
 		return "", apperrors.Unauthorized("invalid cluster credentials")
 	}
 
-	// Validate cluster status - must be connected.
-	if cluster.Status != StatusConnected {
-		return "", apperrors.Forbidden("cluster not connected")
+	// A deleted cluster is gone for good; the agent must not silently recover it.
+	if cluster.Status == StatusDeleted {
+		return "", apperrors.Forbidden("cluster deleted")
+	}
+
+	// Accept any *registered* cluster, i.e. one that has completed registration
+	// and therefore has an agent_id. This deliberately includes StatusDisconnected
+	// (and StatusRegistering): a cluster whose heartbeats lapsed — because of a
+	// control-plane restart, network partition, or the disconnection sweep — must
+	// be able to reconnect simply by heartbeating again. RecordHeartbeat ->
+	// UpdateHeartbeat flips the status back to "connected". Rejecting non-connected
+	// clusters here (as the previous code did) meant a disconnected cluster could
+	// NEVER reconnect: the middleware returned 403 before RecordHeartbeat ran, and
+	// the agent treats 403 as a terminal mismatch rather than a recoverable state.
+	// Only genuinely-unregistered clusters (pending, no agent) are rejected.
+	if cluster.AgentID == nil {
+		return "", apperrors.Forbidden("cluster not registered")
 	}
 
 	// Validate agent ID matches.
-	if cluster.AgentID == nil || *cluster.AgentID != agentID {
+	if *cluster.AgentID != agentID {
 		return "", apperrors.Unauthorized("invalid agent credentials")
 	}
 

@@ -221,12 +221,23 @@ func newTestEnv() *testEnv {
 	svc := NewService(Deps{
 		Projects:   projects,
 		Members:    members,
+		OrgMembers: fakeOrgMemberStoreAllow{},
 		Outbox:     outbox,
 		Tenant:     fakeRunner{},
 		Authorizer: authz.NewPolicyAuthorizer(),
 		Now:        func() time.Time { return now },
 	})
 	return &testEnv{svc: svc, projects: projects, members: members, outbox: outbox, now: now}
+}
+
+// fakeOrgMemberStoreAllow treats every caller as an active org owner so that
+// org-level authorization (AuthorizeOrgMember/AuthorizeOrgRead) passes. Project
+// role enforcement is still exercised via the project members store, so the
+// negative authorization cases below remain meaningful.
+type fakeOrgMemberStoreAllow struct{}
+
+func (fakeOrgMemberStoreAllow) GetOrgMember(_ context.Context, userID string) (*authz.OrgMember, error) {
+	return &authz.OrgMember{UserID: userID, Role: authz.OrgOwner, Status: "active"}, nil
 }
 
 const testOrgID = "org-1"
@@ -300,12 +311,33 @@ func TestGetProject(t *testing.T) {
 	e := newTestEnv()
 	p := mustCreateProject(t, e, "user-1")
 
-	got, err := e.svc.GetProject(context.Background(), testOrgID, p.ID)
+	got, err := e.svc.GetProject(context.Background(), testOrgID, "user-1", p.ID)
 	if err != nil {
 		t.Fatalf("get project: %v", err)
 	}
 	if got.ID != p.ID {
 		t.Errorf("got %s, want %s", got.ID, p.ID)
+	}
+}
+
+func TestGetProjectBySlug(t *testing.T) {
+	e := newTestEnv()
+	p := mustCreateProject(t, e, "user-1")
+
+	got, err := e.svc.GetProjectBySlug(context.Background(), testOrgID, "user-1", p.Slug)
+	if err != nil {
+		t.Fatalf("get project by slug: %v", err)
+	}
+	if got.ID != p.ID {
+		t.Errorf("got %s, want %s", got.ID, p.ID)
+	}
+	if got.Slug != p.Slug {
+		t.Errorf("slug = %s, want %s", got.Slug, p.Slug)
+	}
+
+	// Unknown slug returns not found.
+	if _, err := e.svc.GetProjectBySlug(context.Background(), testOrgID, "user-1", "does-not-exist"); err == nil {
+		t.Error("expected error for unknown slug")
 	}
 }
 
@@ -320,7 +352,7 @@ func TestListProjects(t *testing.T) {
 		t.Fatalf("create second: %v", err)
 	}
 
-	page, err := e.svc.ListProjects(context.Background(), testOrgID, database.PageRequest{Limit: 10})
+	page, err := e.svc.ListProjects(context.Background(), testOrgID, "user-1", database.PageRequest{Limit: 10})
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -503,7 +535,7 @@ func TestListMembers(t *testing.T) {
 	e.addMember(p.ID, "dev-1", RoleDeveloper)
 	e.addMember(p.ID, "viewer-1", RoleViewer)
 
-	page, err := e.svc.ListMembers(context.Background(), testOrgID, p.ID, database.PageRequest{Limit: 10})
+	page, err := e.svc.ListMembers(context.Background(), testOrgID, "admin-1", p.ID, database.PageRequest{Limit: 10})
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}

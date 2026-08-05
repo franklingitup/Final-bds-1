@@ -7,7 +7,10 @@ export const auditApi = {
     orgId: string,
     params?: AuditLogFilter & { limit?: number; cursor?: string }
   ): Promise<PaginatedResponse<AuditLog>> {
-    return apiClient.get<PaginatedResponse<AuditLog>>(`/v1/organizations/${orgId}/audit-logs`, params);
+    return apiClient.get<PaginatedResponse<AuditLog>>(
+      `/v1/organizations/${orgId}/audit-logs`,
+      params as Record<string, string | number | boolean | undefined> | undefined
+    );
   },
 
   async get(orgId: string, eventId: string): Promise<AuditLog> {

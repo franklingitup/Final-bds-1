@@ -40,7 +40,7 @@ func TestAuthorize_ProjectRoleGrants(t *testing.T) {
 	a := NewPolicyAuthorizer()
 	dev := Principal{
 		OrgID:        "o",
-		OrgRoles:     []OrgRole{OrgMember},
+		OrgRoles:     []OrgRole{RoleMember},
 		ProjectRoles: map[string]ProjectRole{"p1": ProjectDeveloper},
 	}
 

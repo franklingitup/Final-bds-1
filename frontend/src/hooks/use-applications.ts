@@ -14,7 +14,7 @@ export function useApplications(orgId: string, projectId: string) {
 export function useApplication(orgId: string, projectId: string, applicationId: string) {
   return useQuery({
     queryKey: ["organizations", orgId, "projects", projectId, "applications", applicationId],
-    queryFn: () => applicationsApi.get(orgId, projectId, applicationId),
+    queryFn: () => applicationsApi.get(orgId, applicationId),
     enabled: !!orgId && !!projectId && !!applicationId,
   });
 }
@@ -45,7 +45,7 @@ export function useUpdateApplication(orgId: string, projectId: string, applicati
 
   return useMutation({
     mutationFn: (data: UpdateApplicationRequest) =>
-      applicationsApi.update(orgId, projectId, applicationId, data),
+      applicationsApi.update(orgId, applicationId, data),
     onSuccess: () => {
       queryClient.invalidateQueries({
         queryKey: ["organizations", orgId, "projects", projectId, "applications"],
@@ -67,7 +67,7 @@ export function useDeleteApplication(orgId: string, projectId: string) {
 
   return useMutation({
     mutationFn: (applicationId: string) =>
-      applicationsApi.delete(orgId, projectId, applicationId),
+      applicationsApi.delete(orgId, applicationId),
     onSuccess: () => {
       queryClient.invalidateQueries({
         queryKey: ["organizations", orgId, "projects", projectId, "applications"],

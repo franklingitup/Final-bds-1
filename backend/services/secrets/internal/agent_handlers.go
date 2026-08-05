@@ -5,6 +5,7 @@ import (
 	"log/slog"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/jackc/pgx/v5"
 
 	apperrors "github.com/bdsplatform/platform/backend/libs/errors"
 )
@@ -134,7 +135,7 @@ func RegisterAgentRoutes(app *fiber.App, h *AgentHandler) {
 
 // PoolQuerier is the interface for a connection pool that can query.
 type PoolQuerier interface {
-	QueryRow(ctx context.Context, sql string, args ...any) interface{ Scan(dest ...any) error }
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
 // clusterValidatorImpl validates clusters by querying the cluster table directly.

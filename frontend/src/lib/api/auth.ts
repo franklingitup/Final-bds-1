@@ -45,8 +45,4 @@ export const authApi = {
       : null;
     return apiClient.post<AuthTokens>("/v1/auth/refresh", { refreshToken });
   },
-
-  async changePassword(data: { currentPassword: string; newPassword: string }): Promise<void> {
-    return apiClient.post("/v1/auth/change-password", data);
-  },
 };

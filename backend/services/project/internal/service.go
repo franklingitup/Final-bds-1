@@ -138,6 +138,24 @@ func (s *Service) GetProject(ctx context.Context, orgID, userID, projectID strin
 	return p, err
 }
 
+// GetProjectBySlug returns a project by its slug within an organization.
+// SECURITY: Requires org membership to read projects. Tenant isolation is
+// enforced by RLS within WithTenant, so the slug lookup is scoped to orgID.
+func (s *Service) GetProjectBySlug(ctx context.Context, orgID, userID, slug string) (*Project, error) {
+	// SECURITY: Verify caller is org member
+	if _, err := s.authSvc.AuthorizeOrgRead(ctx, orgID, userID); err != nil {
+		return nil, err
+	}
+
+	var p *Project
+	err := s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
+		var err error
+		p, err = s.projects.GetBySlug(ctx, slug)
+		return err
+	})
+	return p, err
+}
+
 // ListProjects returns a paginated list of projects within an org.
 // SECURITY: Requires org membership to list projects.
 func (s *Service) ListProjects(ctx context.Context, orgID, userID string, page database.PageRequest) (database.Page[Project], error) {

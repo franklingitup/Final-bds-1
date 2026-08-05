@@ -62,8 +62,13 @@ func (v *TokenVerifier) Verify(token string) (Identity, error) {
 		}
 		return v.key, nil
 	}, jwt.WithIssuer(jwtIssuer), jwt.WithValidMethods([]string{"HS256"}))
-	if err != nil || !parsed.Valid {
+
+	if err != nil {
 		return Identity{}, errInvalidToken
 	}
+	if !parsed.Valid {
+		return Identity{}, errInvalidToken
+	}
+
 	return Identity{UserID: claims.Subject, Email: claims.Email}, nil
 }

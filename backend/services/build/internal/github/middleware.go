@@ -1,0 +1,48 @@
+package github
+
+import (
+	"strings"
+
+	"github.com/gofiber/fiber/v2"
+
+	"github.com/bdsplatform/platform/backend/libs/authz"
+	apperrors "github.com/bdsplatform/platform/backend/libs/errors"
+)
+
+const (
+	localUserID = "github_user_id"
+	localEmail  = "github_user_email"
+)
+
+// RequireAuth returns a middleware that authenticates requests via Bearer token.
+func (h *Handler) RequireAuth() fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		token := bearerToken(c)
+		if token == "" {
+			return apperrors.Unauthorized("invalid or expired token")
+		}
+		id, err := h.verifier.Verify(token)
+		if err != nil {
+			return apperrors.Unauthorized("invalid or expired token")
+		}
+		c.Locals(localUserID, id.UserID)
+		c.Locals(localEmail, id.Email)
+		c.SetUserContext(authz.WithPrincipal(c.UserContext(), authz.Principal{UserID: id.UserID}))
+		return c.Next()
+	}
+}
+
+func bearerToken(c *fiber.Ctx) string {
+	header := c.Get(fiber.HeaderAuthorization)
+	const prefix = "Bearer "
+	if len(header) <= len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
+		return ""
+	}
+	return strings.TrimSpace(header[len(prefix):])
+}
+
+func callerIdentity(c *fiber.Ctx) Identity {
+	uid, _ := c.Locals(localUserID).(string)
+	email, _ := c.Locals(localEmail).(string)
+	return Identity{UserID: uid, Email: email}
+}

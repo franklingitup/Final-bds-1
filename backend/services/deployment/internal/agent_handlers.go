@@ -3,18 +3,27 @@ package deployment
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/bdsplatform/platform/backend/libs/contracts/deploymentstatus"
 	"github.com/bdsplatform/platform/backend/libs/database"
 	apperrors "github.com/bdsplatform/platform/backend/libs/errors"
+	"github.com/bdsplatform/platform/backend/libs/events"
+	"github.com/bdsplatform/platform/backend/libs/telemetry"
 )
 
 // AgentHandler handles agent-specific endpoints.
 type AgentHandler struct {
 	desiredState DesiredStateStore
 	tenant       TenantQuerier
+	outbox       events.Outbox
+	rollouts     RolloutStatusStore
+	autoRollback bool
+	now          func() time.Time
+	tracer       trace.Tracer
 	log          *slog.Logger
 }
 
@@ -22,7 +31,20 @@ type AgentHandler struct {
 type AgentHandlerDeps struct {
 	DesiredState DesiredStateStore
 	Tenant       TenantQuerier
-	Logger       *slog.Logger
+	// Outbox, when set, receives the same deployment domain events emitted by
+	// the service layer for user-driven transitions. It is optional so existing
+	// tests that do not assert on events can omit it.
+	Outbox events.Outbox
+	// Rollouts persists the rollout snapshots reported via the progress
+	// endpoint. Optional: when nil the progress endpoint is effectively a no-op
+	// persistence-wise (used by tests that do not exercise progress).
+	Rollouts RolloutStatusStore
+	// AutoRollback enables automatic rollback to the previous successful release
+	// when a rollout fails/times out. Defaults to false (backward compatible).
+	AutoRollback bool
+	// Now overrides the clock (for tests). Defaults to time.Now.
+	Now    func() time.Time
+	Logger *slog.Logger
 }
 
 // NewAgentHandler creates a new agent handler.
@@ -30,9 +52,17 @@ func NewAgentHandler(deps AgentHandlerDeps) *AgentHandler {
 	if deps.Logger == nil {
 		deps.Logger = slog.Default()
 	}
+	if deps.Now == nil {
+		deps.Now = time.Now
+	}
 	return &AgentHandler{
 		desiredState: deps.DesiredState,
 		tenant:       deps.Tenant,
+		outbox:       deps.Outbox,
+		rollouts:     deps.Rollouts,
+		autoRollback: deps.AutoRollback,
+		now:          deps.Now,
+		tracer:       telemetry.Tracer("deployment-engine"),
 		log:          deps.Logger,
 	}
 }
@@ -156,10 +186,7 @@ func (h *AgentHandler) UpdateDeploymentStatus(c *fiber.Ctx, releases ReleaseStor
 		}
 
 		// Step 3: Ownership validated - proceed with status update.
-		var errMsg *string
-		if req.ErrorMessage != "" {
-			errMsg = &req.ErrorMessage
-		}
+		errMsg := req.ErrorMessage
 
 		switch req.Status {
 		case ReleaseStatusDeploying:
@@ -191,6 +218,18 @@ func (h *AgentHandler) UpdateDeploymentStatus(c *fiber.Ctx, releases ReleaseStor
 			return err
 		}
 
+		// Emit the SAME domain events as the service-layer status transitions
+		// (MarkDeploymentStarted/Succeeded/Failed). The enqueue runs inside this
+		// tenant transaction (transactional outbox), so the event is persisted
+		// atomically with the status change and later relayed to the broker,
+		// reaching the audit service identically to user-driven transitions.
+		if h.outbox != nil {
+			if err := h.emitStatusEvent(ctx, agent, deploymentID, releaseID, req, release); err != nil {
+				updateErr = err
+				return err
+			}
+		}
+
 		return nil
 	})
 
@@ -204,6 +243,58 @@ func (h *AgentHandler) UpdateDeploymentStatus(c *fiber.Ctx, releases ReleaseStor
 	return c.JSON(fiber.Map{"status": "ok"})
 }
 
+// emitStatusEvent builds and enqueues the deployment domain event that
+// corresponds to an agent-reported status transition. It mirrors the payloads
+// and event types used by the service-layer MarkDeployment* methods so that
+// downstream consumers (notably the audit service) observe agent-driven and
+// user-driven transitions identically. The actor is recorded as the agent.
+func (h *AgentHandler) emitStatusEvent(ctx context.Context, agent *AgentIdentity, deploymentID, releaseID string, req UpdateStatusRequest, release *Release) error {
+	actor := events.WithActor(events.Actor{Type: "agent", ID: agent.AgentID})
+	resource := events.WithResource(events.Resource{Type: "deployment", ID: deploymentID})
+
+	var (
+		evt events.Envelope
+		err error
+	)
+	switch req.Status {
+	case ReleaseStatusDeploying:
+		evt, err = events.New(EventDeploymentStarted, eventVersion, agent.OrganizationID, deploymentStartedPayload{
+			DeploymentID: deploymentID,
+			ReleaseID:    releaseID,
+			Revision:     release.Revision,
+			Image:        release.Image,
+		}, actor, resource)
+	case ReleaseStatusSucceeded:
+		ready := 0
+		if req.ReadyReplicas != nil {
+			ready = *req.ReadyReplicas
+		}
+		evt, err = events.New(EventDeploymentSucceeded, eventVersion, agent.OrganizationID, deploymentSucceededPayload{
+			DeploymentID:  deploymentID,
+			ReleaseID:     releaseID,
+			Revision:      release.Revision,
+			ReadyReplicas: ready,
+		}, actor, resource)
+	case ReleaseStatusFailed:
+		errorMsg := ""
+		if req.ErrorMessage != nil {
+			errorMsg = *req.ErrorMessage
+		}
+		evt, err = events.New(EventDeploymentFailed, eventVersion, agent.OrganizationID, deploymentFailedPayload{
+			DeploymentID: deploymentID,
+			ReleaseID:    releaseID,
+			Revision:     release.Revision,
+			ErrorMessage: errorMsg,
+		}, actor, resource)
+	default:
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return h.outbox.Enqueue(ctx, evt)
+}
+
 // logOwnershipViolation logs a security event when ownership validation fails.
 func (h *AgentHandler) logOwnershipViolation(ctx context.Context, reason string, agent *AgentIdentity, deploymentID, releaseID string) {
 	h.log.WarnContext(ctx, "ownership validation failed",
@@ -215,9 +306,4 @@ func (h *AgentHandler) logOwnershipViolation(ctx context.Context, reason string,
 		slog.String("release_id", releaseID))
 }
 
-// UpdateStatusRequest is the request body for updating deployment status.
-type UpdateStatusRequest struct {
-	Status        string `json:"status"`
-	ReadyReplicas *int   `json:"readyReplicas,omitempty"`
-	ErrorMessage  string `json:"errorMessage,omitempty"`
-}
+// UpdateStatusRequest is defined in domain.go

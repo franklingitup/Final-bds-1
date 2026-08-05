@@ -18,7 +18,7 @@ import (
 // files embeds every service's migration directory. Add new service directories
 // to this directive as they are created.
 //
-//go:embed auth tenant project cluster deployment audit secrets outbox
+//go:embed auth tenant project cluster deployment audit secrets outbox build domain observability notification provisioning
 var files embed.FS
 
 // Service returns the migration file system for a single service directory,

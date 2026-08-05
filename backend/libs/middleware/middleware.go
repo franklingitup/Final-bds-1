@@ -8,6 +8,7 @@
 package middleware
 
 import (
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -43,7 +44,14 @@ func CorrelationID() fiber.Handler {
 		c.Set(HeaderCorrelationID, id)
 		c.Locals(localCorrelationID, id)
 		c.SetUserContext(logger.WithCorrelationID(c.UserContext(), id))
-		return c.Next()
+
+		fmt.Printf("\n=== MIDDLEWARE ENTER ===\nmiddleware=CorrelationID\nmethod=%s\npath=%s\ncorrelation_id=%s\n", c.Method(), c.Path(), id)
+
+		err := c.Next()
+
+		fmt.Printf("\n=== MIDDLEWARE EXIT ===\nmiddleware=CorrelationID\nstatus=%d\nerror=%v\n", c.Response().StatusCode(), err)
+
+		return err
 	}
 }
 
@@ -61,6 +69,9 @@ func Tracing(serviceName string) fiber.Handler {
 		defer span.End()
 		c.SetUserContext(ctx)
 
+		corrID, _ := c.Locals(localCorrelationID).(string)
+		fmt.Printf("\n=== MIDDLEWARE ENTER ===\nmiddleware=Tracing\nmethod=%s\npath=%s\ncorrelation_id=%s\n", c.Method(), c.Path(), corrID)
+
 		err := c.Next()
 
 		status := c.Response().StatusCode()
@@ -75,6 +86,9 @@ func Tracing(serviceName string) fiber.Handler {
 				span.RecordError(err)
 			}
 		}
+
+		fmt.Printf("\n=== MIDDLEWARE EXIT ===\nmiddleware=Tracing\nstatus=%d\nerror=%v\n", status, err)
+
 		return err
 	}
 }
@@ -93,6 +107,9 @@ func Tenant() fiber.Handler {
 // RequestLogger logs one structured line per request and records HTTP metrics.
 func RequestLogger(log *slog.Logger) fiber.Handler {
 	return func(c *fiber.Ctx) error {
+		corrID, _ := c.Locals(localCorrelationID).(string)
+		fmt.Printf("\n=== MIDDLEWARE ENTER ===\nmiddleware=RequestLogger\nmethod=%s\npath=%s\ncorrelation_id=%s\n", c.Method(), c.Path(), corrID)
+
 		start := time.Now()
 		err := c.Next()
 		latency := time.Since(start)
@@ -113,6 +130,9 @@ func RequestLogger(log *slog.Logger) fiber.Handler {
 			slog.Duration("latency", latency),
 			slog.String("ip", c.IP()),
 		)
+
+		fmt.Printf("\n=== MIDDLEWARE EXIT ===\nmiddleware=RequestLogger\nstatus=%d\nerror=%v\n", status, err)
+
 		return err
 	}
 }
@@ -120,11 +140,15 @@ func RequestLogger(log *slog.Logger) fiber.Handler {
 // Recover converts panics into INTERNAL errors and logs them.
 func Recover(log *slog.Logger) fiber.Handler {
 	return func(c *fiber.Ctx) (err error) {
+		corrID, _ := c.Locals(localCorrelationID).(string)
+		fmt.Printf("\n=== MIDDLEWARE ENTER ===\nmiddleware=Recover\nmethod=%s\npath=%s\ncorrelation_id=%s\n", c.Method(), c.Path(), corrID)
+
 		defer func() {
 			if r := recover(); r != nil {
 				log.ErrorContext(c.UserContext(), "panic recovered", slog.Any("panic", r))
 				err = errors.Internal("internal server error")
 			}
+			fmt.Printf("\n=== MIDDLEWARE EXIT ===\nmiddleware=Recover\nstatus=%d\nerror=%v\n", c.Response().StatusCode(), err)
 		}()
 		return c.Next()
 	}

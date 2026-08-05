@@ -166,11 +166,10 @@ func (r *secretRepo) List(ctx context.Context, projectID string, page database.P
 	}
 
 	result := database.Page[Secret]{
-		Items:   secrets,
-		HasMore: len(secrets) > limit,
+		Items: secrets,
 	}
 
-	if result.HasMore {
+	if len(secrets) > limit {
 		result.Items = secrets[:limit]
 		last := result.Items[len(result.Items)-1]
 		result.NextCursor = database.EncodeCursor(last.Cursor())

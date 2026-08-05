@@ -10,6 +10,9 @@ func RegisterRoutes(app *fiber.App, h *Handler) {
 
 	// Agent registration endpoint (capability-based, no auth required).
 	v1.Post("/agent/register", h.RegisterAgent)
+	// Agent recovery endpoint (capability-based; installation token in header).
+	// Lets an agent that lost local state rebuild it without a new token.
+	v1.Get("/agent/recover", h.RecoverAgent)
 
 	// Authenticated routes.
 	authenticated := v1.Group("", h.RequireAuth())

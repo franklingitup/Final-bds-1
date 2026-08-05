@@ -14,4 +14,5 @@ var (
 	errNoRollbackTarget  = apperrors.Conflict("no previous successful release to rollback to")
 	errInvalidImage      = apperrors.Validation("image is required")
 	errInvalidReplicas   = apperrors.Validation("replicas must be at least 1")
+	errArgoAppNotFound   = apperrors.NotFound("gitops application not found for deployment")
 )
