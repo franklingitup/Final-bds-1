@@ -1,0 +1,100 @@
+# Production certification pipeline for the Platform Agent registration &
+# recovery mechanism. Unit tests + Helm validation run on every push; the
+# kind-based E2E, chaos and load suites run on demand (workflow_dispatch) or on
+# the `certify` label, because they need a real cluster and a control plane.
+name: agent-certification
+
+on:
+  push:
+    paths:
+      - "agents/platform-agent/**"
+      - "backend/services/cluster/**"
+      - "helm/agent/**"
+      - "test/**"
+      - ".github/workflows/agent-certification.yml"
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_e2e:
+        description: "Run the kind-based E2E + chaos + load suites"
+        type: boolean
+        default: false
+
+jobs:
+  unit:
+    name: unit tests + static checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - name: Agent unit tests
+        working-directory: agents/platform-agent
+        run: go test ./...
+      - name: Cluster service unit tests
+        working-directory: backend
+        run: go test ./services/cluster/...
+      - name: Load generator builds + vets
+        working-directory: test/load
+        run: |
+          go vet ./...
+          go build ./...
+
+  helm:
+    name: helm lint + render
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: helm lint helm/agent
+      - name: Render with all production features enabled
+        run: |
+          helm template ra helm/agent \
+            --set podDisruptionBudget.enabled=true \
+            --set spreadReplicas.enabled=true \
+            --set metrics.prometheusRule.enabled=true \
+            --set metrics.serviceMonitor.enabled=true \
+            --set persistence.type=pvc > /tmp/rendered.yaml
+          test -s /tmp/rendered.yaml
+      - name: Assert probes + health endpoints are wired
+        run: |
+          grep -q "path: /healthz" /tmp/rendered.yaml
+          grep -q "path: /readyz" /tmp/rendered.yaml
+
+  e2e:
+    name: kind E2E + chaos + load
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_e2e || contains(github.event.pull_request.labels.*.name, 'certify') }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: agent-e2e
+      - uses: azure/setup-helm@v4
+      - name: Bring up control plane
+        run: docker compose up -d --wait
+      - name: Provision admin token + org
+        run: ./test/scripts/bootstrap-control-plane.sh   # exports ADMIN_JWT, ORG_ID
+      - name: E2E suite
+        env:
+          KIND_CLUSTER: agent-e2e
+        run: ./test/e2e/e2e.sh all
+      - name: Chaos (short)
+        env:
+          ROUNDS: "6"
+          INTERVAL: "30"
+          COMPOSE_FILE: docker-compose.yml
+        run: ./test/chaos/chaos.sh
+      - name: Load smoke (100 agents, 2m)
+        env:
+          SIZES: "100"
+          DURATION: "2m"
+          SYNTHETIC: "1"
+        run: ./test/load/run.sh
+      - name: Teardown
+        if: always()
+        run: ./test/e2e/e2e.sh teardown

@@ -62,4 +62,62 @@ spec:
           annotations:
             summary: "Platform agent recovering frequently"
             description: "Agent has recovered registration more than 5 times in the last hour."
+
+        # Corrupt/unreadable local state on load — the agent recovers from the
+        # control plane, but this flags a bad volume that will churn identity.
+        - alert: PlatformAgentStateCorruption
+          expr: increase(agent_state_load_failures_total[15m]) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Platform agent local state is corrupt/unreadable"
+            description: "State-file loads are failing; the agent is rebuilding from the control plane. Inspect the state volume."
+
+    - name: platform-agent.availability
+      rules:
+        # No agent is reporting metrics at all => the whole fleet member is down
+        # or unscrapeable. absent() fires once the series goes stale.
+        - alert: PlatformAgentDown
+          expr: absent(agent_heartbeat_success_total)
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Platform agent is not reporting"
+            description: "No agent_* metrics for 10m; the agent is down or its /metrics endpoint is unreachable."
+
+        # Leader election is enabled but no replica currently holds leadership =>
+        # reconciliation and secret sync are stalled (split-brain-avoidance gone
+        # wrong or all replicas unhealthy).
+        - alert: PlatformAgentNoLeader
+          expr: max(agent_is_leader) == 0
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "No platform agent leader elected"
+            description: "No replica holds the leader lease for 10m; reconciliation and secret sync are stalled."
+
+        # Leadership churn => flapping health, unstable renew deadline, or node
+        # pressure repeatedly killing the leader.
+        - alert: PlatformAgentLeaderFlapping
+          expr: increase(agent_leader_transitions_total[15m]) > 6
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Platform agent leadership is flapping"
+            description: "More than 6 leadership transitions in 15m; investigate node pressure or lease timings."
+
+        # Goroutine growth is the classic leak signal (soak-test guard). Threshold
+        # is intentionally generous; tune to your observed steady state.
+        - alert: PlatformAgentGoroutineLeak
+          expr: go_goroutines{job=~".*agent.*"} > 1000
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "Platform agent goroutine count is high"
+            description: "go_goroutines has exceeded 1000 for 1h; possible goroutine leak or retry storm."
 {{- end }}

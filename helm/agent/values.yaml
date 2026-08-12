@@ -81,6 +81,16 @@ startupProbe:
 metrics:
   port: 8080
   path: /metrics
+  # Emit prometheus.io/scrape pod annotations for annotation-based scraping.
+  podAnnotations: true
+  # Headless Service + ServiceMonitor for Prometheus Operator scraping. Requires
+  # the ServiceMonitor CRD. Disabled by default (annotation scraping is enough
+  # for most clusters); enable when running kube-prometheus-stack.
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    labels: {}
   prometheusRule:
     enabled: false
     # Extra labels so your Prometheus instance selects the rule.

@@ -141,10 +141,20 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start the metrics endpoint if configured. It is defaulted on when leader
-	// election is enabled so followers expose metrics; it stays off otherwise,
-	// preserving the agent's previous no-HTTP-server behaviour.
-	if cfg.MetricsAddr != "" {
+	// Start the always-on health server. It serves /healthz (liveness),
+	// /readyz (readiness — Ready only after registration succeeds) and /metrics
+	// on the port the Kubernetes probes target (default :8080). Without this the
+	// probes have nothing to hit and the pod CrashLoopBackOffs.
+	if cfg.HealthAddr != "" {
+		startHealthServer(ctx, cfg.HealthAddr, a.Ready, log)
+	}
+
+	// Optionally start a DEDICATED metrics server on a separate port. This is
+	// only needed when METRICS_ADDR points somewhere other than the health
+	// server (e.g. a scrape port isolated from probes). Metrics are already
+	// served on HealthAddr, so skip when they coincide to avoid a redundant
+	// listener.
+	if cfg.MetricsAddr != "" && cfg.MetricsAddr != cfg.HealthAddr {
 		startMetricsServer(ctx, cfg.MetricsAddr, log)
 	}
 
@@ -270,22 +280,59 @@ func leaderIdentity(cfg config.Config, log *slog.Logger) string {
 	return id
 }
 
+// startHealthServer serves liveness (/healthz), readiness (/readyz) and
+// Prometheus metrics (/metrics) on addr until ctx is cancelled. Liveness is
+// always healthy while the process runs; readiness reflects whether the agent
+// has completed registration (via ready()). It runs in the background and
+// logs, but never aborts, the agent on failure.
+func startHealthServer(ctx context.Context, addr string, ready func() bool, log *slog.Logger) {
+	serveHTTP(ctx, addr, "health", healthHandler(ready), log)
+}
+
+// healthHandler builds the liveness/readiness/metrics mux. /healthz is always
+// 200 while the process runs; /readyz is 200 only once ready() reports true
+// (registration established); /metrics serves the Prometheus registry.
+func healthHandler(ready func() bool) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if ready != nil && ready() {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ready"))
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("registering"))
+	})
+	mux.Handle("/metrics", metrics.Handler())
+	return mux
+}
+
 // startMetricsServer serves the Prometheus metrics registry on addr until ctx
 // is cancelled. It runs in the background and logs, but never aborts, the agent
 // on failure so metrics can never take down reconciliation.
 func startMetricsServer(ctx context.Context, addr string, log *slog.Logger) {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", metrics.Handler())
+	serveHTTP(ctx, addr, "metrics", mux, log)
+}
+
+// serveHTTP runs an HTTP server on addr until ctx is cancelled, shutting it down
+// gracefully. Failures are logged but never abort the agent.
+func serveHTTP(ctx context.Context, addr, name string, handler http.Handler, log *slog.Logger) {
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           mux,
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	go func() {
-		log.Info("starting metrics server", "addr", addr)
+		log.Info("starting "+name+" server", "addr", addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Error("metrics server stopped with error", "error", err)
+			log.Error(name+" server stopped with error", "error", err)
 		}
 	}()
 
@@ -294,7 +341,7 @@ func startMetricsServer(ctx context.Context, addr string, log *slog.Logger) {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
-			log.Warn("metrics server shutdown error", "error", err)
+			log.Warn(name+" server shutdown error", "error", err)
 		}
 	}()
 }

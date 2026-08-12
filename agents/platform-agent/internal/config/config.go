@@ -103,12 +103,22 @@ type Config struct {
 	// Kubernetes recommended default: 2s.
 	RetryPeriod time.Duration
 
-	// MetricsAddr is the listen address for the Prometheus metrics endpoint
-	// (e.g. ":9091"). Empty disables the metrics server. It is defaulted to
-	// ":9091" only when leader election is enabled so that followers can
-	// expose metrics out of the box, while a leader-election-disabled agent
-	// keeps its previous (no HTTP server) behaviour.
+	// MetricsAddr is the listen address for a DEDICATED Prometheus metrics
+	// endpoint (e.g. ":9091"). Empty disables the dedicated metrics server. It
+	// is defaulted to ":9091" only when leader election is enabled so that
+	// followers can expose metrics out of the box, while a leader-election-
+	// disabled agent keeps its previous (no dedicated server) behaviour.
+	// NOTE: metrics are ALSO always served on HealthAddr (/metrics), so this is
+	// only needed when you want metrics on a separate port.
 	MetricsAddr string
+
+	// HealthAddr is the listen address for the always-on health/metrics HTTP
+	// server. It serves /healthz (liveness), /readyz (readiness — 200 once the
+	// agent is registered) and /metrics. It MUST match the container port the
+	// Kubernetes probes target (the Helm chart uses :8080). This server is
+	// always started; without it the pod's liveness/readiness probes have
+	// nothing to hit and the pod CrashLoopBackOffs.
+	HealthAddr string
 }
 
 // DefaultConfig returns the default configuration.
@@ -119,18 +129,19 @@ func DefaultConfig() Config {
 		RegistrationRetryInterval:    10 * time.Second,
 		RegistrationMaxRetryInterval: 5 * time.Minute,
 		RequestTimeout:               30 * time.Second,
-		StateFile:                 "/var/lib/platform-agent/state.json",
-		ReconcilerStateFile:       "/var/lib/platform-agent/reconciler-state.json",
-		Namespace:                 "default",
-		ReconcilerEnabled:         false,
-		SecretsSyncerEnabled:      false,
-		SecretsSyncInterval:       60 * time.Second,
-		SecretsSyncerStateFile:    "/var/lib/platform-agent/secrets-state.json",
-		LeaderElectionEnabled:     false,
-		LeaseName:                 "platform-agent-leader",
-		LeaseDuration:             15 * time.Second,
-		RenewDeadline:             10 * time.Second,
-		RetryPeriod:               2 * time.Second,
+		StateFile:                    "/var/lib/platform-agent/state.json",
+		ReconcilerStateFile:          "/var/lib/platform-agent/reconciler-state.json",
+		Namespace:                    "default",
+		ReconcilerEnabled:            false,
+		SecretsSyncerEnabled:         false,
+		SecretsSyncInterval:          60 * time.Second,
+		SecretsSyncerStateFile:       "/var/lib/platform-agent/secrets-state.json",
+		LeaderElectionEnabled:        false,
+		LeaseName:                    "platform-agent-leader",
+		LeaseDuration:                15 * time.Second,
+		RenewDeadline:                10 * time.Second,
+		RetryPeriod:                  2 * time.Second,
+		HealthAddr:                   ":8080",
 	}
 }
 
@@ -268,6 +279,13 @@ func LoadFromEnv() (Config, error) {
 
 	if v := os.Getenv("METRICS_ADDR"); v != "" {
 		cfg.MetricsAddr = v
+	}
+
+	// HealthAddr backs the always-on liveness/readiness/metrics server. An
+	// explicit empty value ("HEALTH_ADDR=") disables it, but that is strongly
+	// discouraged in Kubernetes where probes depend on it.
+	if v, ok := os.LookupEnv("HEALTH_ADDR"); ok {
+		cfg.HealthAddr = v
 	}
 
 	// Only validate/observe leader-election timings when the feature is on,

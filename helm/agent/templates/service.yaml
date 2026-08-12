@@ -1,0 +1,21 @@
+{{- if .Values.metrics.serviceMonitor.enabled }}
+# Headless Service exposing the agent's /metrics endpoint for the ServiceMonitor
+# below. Kept separate from any workload traffic — the agent is outbound-only.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "agent.name" . }}-metrics
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "agent.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: {{ include "agent.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: http-metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: http
+      protocol: TCP
+{{- end }}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -57,6 +58,11 @@ type Agent struct {
 	leaderElector LeaderElector
 	state         *State
 	log           *slog.Logger
+
+	// ready reports whether the agent has completed registration and is serving
+	// as Ready. It is read by the /readyz probe handler from a different
+	// goroutine than Run, so it is an atomic to avoid a data race.
+	ready atomic.Bool
 }
 
 // InventoryCollector collects cluster inventory information.
@@ -102,6 +108,12 @@ func (a *Agent) SetSecretsSyncer(s *secrets.Syncer) {
 	a.secretsSyncer = s
 }
 
+// Ready reports whether the agent has completed registration with the control
+// plane. It backs the /readyz Kubernetes readiness probe: the pod is only added
+// to Services / considered available once registration has succeeded, so a
+// rollout never surfaces an agent that cannot yet reconcile.
+func (a *Agent) Ready() bool { return a.ready.Load() }
+
 // Run starts the agent and blocks until the context is cancelled.
 func (a *Agent) Run(ctx context.Context) error {
 	// Load persisted state. A missing file is normal (first boot); a corrupt
@@ -127,6 +139,12 @@ func (a *Agent) Run(ctx context.Context) error {
 	if err := a.ensureRegistered(ctx); err != nil {
 		return err
 	}
+
+	// Registration is established: the agent now has valid cluster credentials
+	// and can serve as Ready. Until this point /readyz returns 503 so rollouts
+	// wait for a working agent, while /healthz stays 200 so the pod is not
+	// killed during a long (backing-off) registration.
+	a.ready.Store(true)
 
 	// IMPORTANT: Create workers AFTER registration to ensure valid credentials.
 	// This fixes the first-boot credential race condition.
@@ -247,10 +265,10 @@ func (a *Agent) initializeWorkers() error {
 // resolveAgentID establishes a stable AgentID using the following precedence,
 // so the identity remains constant across restarts and local-state loss:
 //
-//	1. Existing persisted AgentID   (kept as-is; highest priority for stability)
-//	2. Explicitly configured AgentID (AGENT_ID env)
-//	3. Pod UID                       (downward API metadata.uid; stable per pod)
-//	4. Generated UUID                (first boot only, last resort)
+//  1. Existing persisted AgentID   (kept as-is; highest priority for stability)
+//  2. Explicitly configured AgentID (AGENT_ID env)
+//  3. Pod UID                       (downward API metadata.uid; stable per pod)
+//  4. Generated UUID                (first boot only, last resort)
 //
 // On recovery the agent additionally adopts the control-plane's authoritative
 // AgentID (see adoptRegistration), which supersedes any locally-derived value.

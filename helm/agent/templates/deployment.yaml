@@ -18,6 +18,12 @@ spec:
     metadata:
       labels:
         {{- include "agent.labels" . | nindent 8 }}
+      {{- if .Values.metrics.podAnnotations }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+      {{- end }}
 
     spec:
       serviceAccountName: {{ include "agent.name" . }}
@@ -100,6 +106,18 @@ spec:
 
             - name: RECONCILE_INTERVAL
               value: "30s"
+
+            #
+            # Health + metrics HTTP server. Liveness/readiness/metrics are all
+            # served on this port (matches containerPort http:8080 and the
+            # probes below). Pinning METRICS_ADDR to the same address keeps
+            # everything on one port instead of an extra dedicated listener.
+            #
+            - name: HEALTH_ADDR
+              value: ":8080"
+
+            - name: METRICS_ADDR
+              value: ":8080"
 
             #
             # Leader election (optional)

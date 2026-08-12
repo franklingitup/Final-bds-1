@@ -154,6 +154,40 @@ func TestLeaderElectionValidation(t *testing.T) {
 	}
 }
 
+// TestHealthAddrDefault proves the always-on health/readiness/metrics server is
+// configured on :8080 by default (matching the Helm probes/containerPort) and
+// can be overridden or explicitly disabled via HEALTH_ADDR.
+func TestHealthAddrDefault(t *testing.T) {
+	setRequired(t)
+
+	cfg, err := LoadFromEnv()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.HealthAddr != ":8080" {
+		t.Errorf("HealthAddr = %q, want :8080", cfg.HealthAddr)
+	}
+
+	t.Setenv("HEALTH_ADDR", ":9000")
+	cfg, err = LoadFromEnv()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.HealthAddr != ":9000" {
+		t.Errorf("HealthAddr override = %q, want :9000", cfg.HealthAddr)
+	}
+
+	// Explicit empty disables the server (discouraged, but supported).
+	t.Setenv("HEALTH_ADDR", "")
+	cfg, err = LoadFromEnv()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.HealthAddr != "" {
+		t.Errorf("HealthAddr explicit empty = %q, want empty", cfg.HealthAddr)
+	}
+}
+
 // TestLeaderElectionDisabledSkipsValidation ensures a disabled agent never
 // fails to start due to leader-election timing misconfiguration.
 func TestLeaderElectionDisabledSkipsValidation(t *testing.T) {

@@ -1,0 +1,48 @@
+# Chaos Mesh NetworkChaos: partition the agent from the control plane for 2m.
+# Requires Chaos Mesh installed. Apply, observe the agent tolerate the outage
+# (bounded backoff, no crash-loop), then delete to restore and confirm recovery:
+#
+#   kubectl apply -f test/chaos/chaos-mesh/network-partition.yaml
+#   # ... observe agent logs: "heartbeat failed", bounded backoff, no restarts ...
+#   kubectl delete -f test/chaos/chaos-mesh/network-partition.yaml
+#   # ... confirm agent_heartbeat_success_total resumes climbing ...
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: agent-control-plane-partition
+  namespace: platform-agent
+spec:
+  action: partition
+  mode: all
+  selector:
+    namespaces:
+      - platform-agent
+    labelSelectors:
+      app.kubernetes.io/name: bds-agent
+  direction: to
+  # Drop all egress from the agent (to the control plane). Narrow `externalTargets`
+  # to the control-plane host/CIDR in production to avoid impacting DNS.
+  target:
+    mode: all
+    selector:
+      namespaces:
+        - platform-agent
+  duration: "2m"
+---
+# PodChaos: randomly kill an agent pod every minute for 10 minutes to exercise
+# restart + recovery under sustained churn.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: agent-pod-kill
+  namespace: platform-agent
+spec:
+  action: pod-kill
+  mode: one
+  selector:
+    namespaces:
+      - platform-agent
+    labelSelectors:
+      app.kubernetes.io/name: bds-agent
+  scheduler:
+    cron: "@every 1m"
