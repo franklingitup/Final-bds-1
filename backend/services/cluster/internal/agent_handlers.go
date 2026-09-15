@@ -140,25 +140,41 @@ func RegisterAgentRoutes(app *fiber.App, h *AgentHandler) {
 // clusterValidatorImpl implements ClusterValidator using direct database queries.
 type clusterValidatorImpl struct {
 	clusters ClusterStore
+	log      *slog.Logger
 }
 
 // NewClusterValidator creates a new cluster validator.
-func NewClusterValidator(clusters ClusterStore) ClusterValidator {
-	return &clusterValidatorImpl{clusters: clusters}
+// The logger is used for debug-level logging of failure reasons; client-facing
+// error messages are uniform within each HTTP status bucket to prevent
+// information leakage (cluster existence vs agent mismatch, deleted vs unregistered).
+func NewClusterValidator(clusters ClusterStore, log *slog.Logger) ClusterValidator {
+	if log == nil {
+		log = slog.Default()
+	}
+	return &clusterValidatorImpl{clusters: clusters, log: log}
 }
 
 // ValidateCluster checks that the cluster is registered and the agent ID matches.
 // Returns the organization ID on success.
+//
+// Client-facing messages are unified within each status-code bucket (401 vs 403).
+// The 401/403 split itself is load-bearing for agent reconnect semantics and must
+// not be collapsed — only the message text within each bucket is shared.
 func (v *clusterValidatorImpl) ValidateCluster(ctx context.Context, clusterID, agentID string) (string, error) {
+	const authFailedErr = "authentication failed"   // 401 bucket
+	const notAvailableErr = "cluster not available" // 403 bucket
+
 	// Fetch the cluster without tenant context (cross-tenant lookup for agent auth).
 	cluster, err := v.clusters.GetByIDWithoutTenant(ctx, clusterID)
 	if err != nil {
-		return "", apperrors.Unauthorized("invalid cluster credentials")
+		v.log.DebugContext(ctx, "agent auth failed: cluster not found", "cluster_id", clusterID)
+		return "", apperrors.Unauthorized(authFailedErr)
 	}
 
 	// A deleted cluster is gone for good; the agent must not silently recover it.
 	if cluster.Status == StatusDeleted {
-		return "", apperrors.Forbidden("cluster deleted")
+		v.log.DebugContext(ctx, "agent auth failed: cluster deleted", "cluster_id", clusterID)
+		return "", apperrors.Forbidden(notAvailableErr)
 	}
 
 	// Accept any *registered* cluster, i.e. one that has completed registration
@@ -172,12 +188,14 @@ func (v *clusterValidatorImpl) ValidateCluster(ctx context.Context, clusterID, a
 	// the agent treats 403 as a terminal mismatch rather than a recoverable state.
 	// Only genuinely-unregistered clusters (pending, no agent) are rejected.
 	if cluster.AgentID == nil {
-		return "", apperrors.Forbidden("cluster not registered")
+		v.log.DebugContext(ctx, "agent auth failed: cluster not registered", "cluster_id", clusterID)
+		return "", apperrors.Forbidden(notAvailableErr)
 	}
 
 	// Validate agent ID matches.
 	if *cluster.AgentID != agentID {
-		return "", apperrors.Unauthorized("invalid agent credentials")
+		v.log.DebugContext(ctx, "agent auth failed: agent ID mismatch", "cluster_id", clusterID)
+		return "", apperrors.Unauthorized(authFailedErr)
 	}
 
 	return cluster.OrgID, nil

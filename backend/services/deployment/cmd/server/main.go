@@ -71,7 +71,7 @@ func main() {
 		AutoRollback: autoRollbackEnabled(),
 		Logger:       log,
 	})
-	clusterValidator := deployment.NewClusterValidator(db.Pool)
+	clusterValidator := deployment.NewClusterValidator(db.Pool, log)
 	agentAuth := deployment.AgentAuthMiddleware(clusterValidator)
 
 	// Pipeline service for deployment orchestration.

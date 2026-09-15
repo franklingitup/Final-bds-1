@@ -78,7 +78,7 @@ func main() {
 	handler := secrets.NewHandler(svc, newTokenVerifier(cfg.Auth))
 
 	// Agent handler (for Platform Agent to sync secrets)
-	clusterValidator := secrets.NewClusterValidator(db.Pool)
+	clusterValidator := secrets.NewClusterValidator(db.Pool, log)
 	agentHandler := secrets.NewAgentHandler(svc, clusterValidator, log)
 
 	// Drain the transactional outbox to the broker in the background.

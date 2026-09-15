@@ -5,11 +5,18 @@ package cluster
 import "github.com/gofiber/fiber/v2"
 
 // RegisterRoutes mounts cluster routes onto the app.
-func RegisterRoutes(app *fiber.App, h *Handler) {
+// The optional registrationLimiter middleware is applied only to the
+// /agent/register endpoint to prevent brute-force attacks on registration tokens.
+func RegisterRoutes(app *fiber.App, h *Handler, registrationLimiter fiber.Handler) {
 	v1 := app.Group("/v1")
 
 	// Agent registration endpoint (capability-based, no auth required).
-	v1.Post("/agent/register", h.RegisterAgent)
+	// Rate-limited to prevent brute-force attacks on registration tokens.
+	if registrationLimiter != nil {
+		v1.Post("/agent/register", registrationLimiter, h.RegisterAgent)
+	} else {
+		v1.Post("/agent/register", h.RegisterAgent)
+	}
 	// Agent recovery endpoint (capability-based; installation token in header).
 	// Lets an agent that lost local state rebuild it without a new token.
 	v1.Get("/agent/recover", h.RecoverAgent)

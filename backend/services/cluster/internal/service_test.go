@@ -1000,6 +1000,97 @@ func TestRegisterAgent_ExpiredToken(t *testing.T) {
 	}
 }
 
+// TestTokenAuth_UniformClientMessages confirms unknown, revoked, and expired
+// tokens present the same client-facing message while remaining distinguishable
+// via errors.Is against their respective sentinels. errTokenUsed (409) stays a
+// separate, unchanged path.
+func TestTokenAuth_UniformClientMessages(t *testing.T) {
+	const wantMsg = "invalid or expired token"
+
+	env := newTestEnv()
+	ctx := context.Background()
+	orgID := uuid.NewString()
+	userID := uuid.NewString()
+
+	// Unknown token -> errInvalidToken
+	_, errUnknown := env.svc.RegisterAgent(ctx, AgentRegisterRequest{
+		Token:   "totally-unknown-token",
+		AgentID: "agent-x",
+	})
+	if !errors.Is(errUnknown, errInvalidToken) {
+		t.Fatalf("unknown: expected errInvalidToken, got %v", errUnknown)
+	}
+	if msg := apperrors.From(errUnknown).Message; msg != wantMsg {
+		t.Errorf("unknown message = %q, want %q", msg, wantMsg)
+	}
+
+	// Revoked token -> errTokenRevoked
+	cRev := env.createCluster(t, orgID, userID, "Rev", "rev")
+	tokRev, _ := env.svc.GenerateRegistrationToken(ctx, orgID, userID, cRev.ID, GenerateTokenRequest{})
+	if err := env.svc.RevokeRegistrationToken(ctx, orgID, userID, cRev.ID, tokRev.ID); err != nil {
+		t.Fatalf("RevokeRegistrationToken: %v", err)
+	}
+	_, errRevoked := env.svc.RegisterAgent(ctx, AgentRegisterRequest{
+		Token:   tokRev.Token,
+		AgentID: "agent-rev",
+	})
+	if !errors.Is(errRevoked, errTokenRevoked) {
+		t.Fatalf("revoked: expected errTokenRevoked, got %v", errRevoked)
+	}
+	if msg := apperrors.From(errRevoked).Message; msg != wantMsg {
+		t.Errorf("revoked message = %q, want %q", msg, wantMsg)
+	}
+	if errors.Is(errRevoked, errInvalidToken) {
+		t.Error("revoked must not errors.Is as errInvalidToken (distinct sentinel)")
+	}
+
+	// Expired token -> errTokenExpired
+	clusters := newFakeClusterStore()
+	tokens := newFakeTokenStore()
+	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+	svc := NewService(Deps{
+		Clusters:   clusters,
+		Tokens:     tokens,
+		Heartbeats: newFakeHeartbeatStore(),
+		OrgMembers: &fakeOrgMemberStore{},
+		Outbox:     &fakeOutbox{},
+		Tenant:     fakeRunner{},
+		Notifier:   &fakeNotifier{},
+		Now:        func() time.Time { return now },
+	})
+	cExp, _ := svc.CreateCluster(ctx, orgID, userID, CreateClusterRequest{Name: "Exp", Slug: "exp"})
+	tokExp, _ := svc.GenerateRegistrationToken(ctx, orgID, userID, cExp.ID, GenerateTokenRequest{ExpiresIn: "1h"})
+	now = now.Add(2 * time.Hour)
+	_, errExpired := svc.RegisterAgent(ctx, AgentRegisterRequest{
+		Token:             tokExp.Token,
+		AgentID:           "agent-exp",
+		KubernetesVersion: "1.28.5",
+		NodeCount:         1,
+	})
+	if !errors.Is(errExpired, errTokenExpired) {
+		t.Fatalf("expired: expected errTokenExpired, got %v", errExpired)
+	}
+	if msg := apperrors.From(errExpired).Message; msg != wantMsg {
+		t.Errorf("expired message = %q, want %q", msg, wantMsg)
+	}
+	if errors.Is(errExpired, errInvalidToken) || errors.Is(errExpired, errTokenRevoked) {
+		t.Error("expired must remain a distinct sentinel from unknown/revoked")
+	}
+
+	if apperrors.From(errUnknown).Message != apperrors.From(errRevoked).Message ||
+		apperrors.From(errUnknown).Message != apperrors.From(errExpired).Message {
+		t.Error("unknown, revoked, and expired must share the same client-facing message")
+	}
+
+	// errTokenUsed remains a 409 with a different message (sentinel identity check).
+	if apperrors.From(errTokenUsed).Code != apperrors.CodeConflict {
+		t.Errorf("errTokenUsed code = %q, want CONFLICT", apperrors.From(errTokenUsed).Code)
+	}
+	if apperrors.From(errTokenUsed).Message == wantMsg {
+		t.Error("errTokenUsed must not share the 401 uniform message")
+	}
+}
+
 func TestRecordHeartbeat(t *testing.T) {
 	env := newTestEnv()
 	ctx := context.Background()

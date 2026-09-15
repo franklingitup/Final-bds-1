@@ -4,6 +4,7 @@ package deployment
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"testing"
 	"time"
@@ -639,7 +640,7 @@ func TestIntegration_ClusterValidator(t *testing.T) {
 	createTestOrg(t, db, orgID)
 	createTestClusterWithAgent(t, db, orgID, clusterID, agentID)
 
-	validator := NewClusterValidator(db.Pool())
+	validator := NewClusterValidator(db.Pool(), slog.Default())
 
 	// Valid credentials.
 	gotOrgID, err := validator.ValidateCluster(ctx, clusterID, agentID)

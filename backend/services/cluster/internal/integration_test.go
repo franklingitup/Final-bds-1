@@ -103,7 +103,7 @@ ON CONFLICT (id) DO NOTHING`, orgID, uuid.NewString())
 		}
 		return c.Status(code).JSON(fiber.Map{"error": err.Error()})
 	}})
-	RegisterRoutes(app, handler)
+	RegisterRoutes(app, handler, nil)
 
 	return &testGateway{
 		app:    app,

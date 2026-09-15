@@ -375,6 +375,8 @@ func (s *Service) RegisterAgent(ctx context.Context, req AgentRegisterRequest) (
 	// Validate token status. Revocation is the hard kill-switch and always wins.
 	switch token.Status {
 	case TokenStatusRevoked:
+		s.log.WarnContext(ctx, "agent registration rejected: token revoked",
+			"agent_id", req.AgentID)
 		return nil, errTokenRevoked
 	case TokenStatusUsed:
 		// Idempotent recovery arm: the token was already consumed. Return the
@@ -383,9 +385,13 @@ func (s *Service) RegisterAgent(ctx context.Context, req AgentRegisterRequest) (
 		// recovery credential for its cluster until revoked.
 		return s.recoverRegisteredCluster(ctx, token, req.AgentID, "register")
 	case TokenStatusExpired:
+		s.log.WarnContext(ctx, "agent registration rejected: token status expired",
+			"agent_id", req.AgentID)
 		return nil, errTokenExpired
 	}
 	if now.After(token.ExpiresAt) {
+		s.log.WarnContext(ctx, "agent registration rejected: token past expiry",
+			"agent_id", req.AgentID)
 		return nil, errTokenExpired
 	}
 
@@ -468,12 +474,16 @@ func (s *Service) RegisterAgent(ctx context.Context, req AgentRegisterRequest) (
 // taken from the cluster record so identity never changes on recovery.
 func (s *Service) RecoverCluster(ctx context.Context, plainToken, requestAgentID string) (*Cluster, error) {
 	if plainToken == "" {
+		s.log.WarnContext(ctx, "agent recovery rejected: empty token",
+			"agent_id", requestAgentID)
 		return nil, errInvalidToken
 	}
 
 	token, err := s.tokens.GetByHash(ctx, hashToken(plainToken))
 	if err != nil {
 		if database.IsNotFound(err) {
+			s.log.WarnContext(ctx, "agent recovery rejected: unknown token",
+				"agent_id", requestAgentID)
 			return nil, errInvalidToken
 		}
 		return nil, err
@@ -481,14 +491,20 @@ func (s *Service) RecoverCluster(ctx context.Context, plainToken, requestAgentID
 
 	switch token.Status {
 	case TokenStatusRevoked:
+		s.log.WarnContext(ctx, "agent recovery rejected: token revoked",
+			"agent_id", requestAgentID)
 		return nil, errTokenRevoked
 	case TokenStatusUsed:
 		// A consumed token stays valid for recovery until revoked.
 		return s.recoverRegisteredCluster(ctx, token, requestAgentID, "recover")
 	case TokenStatusExpired:
+		s.log.WarnContext(ctx, "agent recovery rejected: token status expired",
+			"agent_id", requestAgentID)
 		return nil, errTokenExpired
 	}
 	if s.now().After(token.ExpiresAt) {
+		s.log.WarnContext(ctx, "agent recovery rejected: token past expiry",
+			"agent_id", requestAgentID)
 		return nil, errTokenExpired
 	}
 	// Active, unexpired token: only meaningful to recover once the cluster has
@@ -576,13 +592,13 @@ func (s *Service) RecordHeartbeat(ctx context.Context, orgID, clusterID string, 
 
 		// Record heartbeat history.
 		h := &Heartbeat{
-			OrgID:              orgID,
-			ClusterID:          clusterID,
-			AgentID:            req.AgentID,
-			KubernetesVersion:  &req.KubernetesVersion,
-			NodeCount:          &req.NodeCount,
-			APIServerHealthy:   req.APIServerHealthy,
-			ReceivedAt:         now,
+			OrgID:             orgID,
+			ClusterID:         clusterID,
+			AgentID:           req.AgentID,
+			KubernetesVersion: &req.KubernetesVersion,
+			NodeCount:         &req.NodeCount,
+			APIServerHealthy:  req.APIServerHealthy,
+			ReceivedAt:        now,
 		}
 		if err := s.heartbeats.Create(ctx, h); err != nil {
 			s.log.WarnContext(ctx, "failed to record heartbeat history", "error", err)
@@ -594,11 +610,11 @@ func (s *Service) RecordHeartbeat(ctx context.Context, orgID, clusterID string, 
 		}
 
 		return s.enqueue(ctx, EventClusterHeartbeatReceived, orgID, heartbeatReceivedPayload{
-			ClusterID:          clusterID,
-			AgentID:            req.AgentID,
-			KubernetesVersion:  req.KubernetesVersion,
-			NodeCount:          req.NodeCount,
-			APIServerHealthy:   req.APIServerHealthy,
+			ClusterID:         clusterID,
+			AgentID:           req.AgentID,
+			KubernetesVersion: req.KubernetesVersion,
+			NodeCount:         req.NodeCount,
+			APIServerHealthy:  req.APIServerHealthy,
 		}, events.WithActor(events.Actor{Type: "agent", ID: req.AgentID}),
 			events.WithResource(events.Resource{Type: "cluster", ID: clusterID}))
 	})

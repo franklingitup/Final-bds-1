@@ -15,6 +15,7 @@ import (
 	"github.com/bdsplatform/platform/backend/libs/events"
 	"github.com/bdsplatform/platform/backend/libs/httpserver"
 	"github.com/bdsplatform/platform/backend/libs/logger"
+	"github.com/bdsplatform/platform/backend/libs/ratelimit"
 	"github.com/bdsplatform/platform/backend/migrations"
 	cluster "github.com/bdsplatform/platform/backend/services/cluster/internal"
 )
@@ -57,8 +58,23 @@ func main() {
 	handler := cluster.NewHandler(svc, cluster.NewTokenVerifier(cfg.Auth))
 
 	// Create agent handler for credential-based agent endpoints.
-	clusterValidator := cluster.NewClusterValidator(clusterStore)
+	clusterValidator := cluster.NewClusterValidator(clusterStore, log)
 	agentHandler := cluster.NewAgentHandler(svc, clusterValidator, log)
+
+	// Set up rate limiting for agent registration (defense-in-depth).
+	var registrationLimiter fiber.Handler
+	if cfg.Redis.URL != "" {
+		redisClient, err := ratelimit.ParseRedisURL(cfg.Redis.URL)
+		if err != nil {
+			log.Error("parse redis url for rate limiter", "error", err)
+			os.Exit(1)
+		}
+		limiter := ratelimit.NewRedisLimiter(redisClient, "cluster:")
+		registrationLimiter = cluster.RegistrationRateLimiter(limiter, log)
+		log.Info("agent registration rate limiting enabled")
+	} else {
+		log.Warn("REDIS_URL not set; agent registration endpoint has no rate limiting")
+	}
 
 	// Drain the transactional outbox to the broker in the background.
 	relay := events.NewRelay(db, outbox, publisher, log, events.RelayOptions{})
@@ -71,7 +87,7 @@ func main() {
 	}()
 
 	if err := httpserver.Run(cfg, func(app *fiber.App) {
-		cluster.RegisterRoutes(app, handler)
+		cluster.RegisterRoutes(app, handler, registrationLimiter)
 		cluster.RegisterAgentRoutes(app, agentHandler)
 	}); err != nil {
 		log.Error("server exited with error", "error", err)

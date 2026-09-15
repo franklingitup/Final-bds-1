@@ -2,6 +2,7 @@ package deployment
 
 import (
 	"context"
+	"log/slog"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5"
@@ -76,14 +77,22 @@ type PoolQuerier interface {
 // clusterValidatorImpl validates clusters by querying the cluster table directly.
 type clusterValidatorImpl struct {
 	pool PoolQuerier
+	log  *slog.Logger
 }
 
 // NewClusterValidator creates a ClusterValidator that queries the database directly.
-func NewClusterValidator(pool PoolQuerier) ClusterValidator {
-	return &clusterValidatorImpl{pool: pool}
+// The logger is used for debug-level logging of failure reasons; client-facing
+// errors are always generic to prevent information leakage.
+func NewClusterValidator(pool PoolQuerier, log *slog.Logger) ClusterValidator {
+	if log == nil {
+		log = slog.Default()
+	}
+	return &clusterValidatorImpl{pool: pool, log: log}
 }
 
 // ValidateCluster checks that the cluster is registered and the agent ID matches.
+// All failure cases return the same generic error message to prevent enumeration
+// of cluster IDs or status probing by attackers.
 func (v *clusterValidatorImpl) ValidateCluster(ctx context.Context, clusterID, agentID string) (string, error) {
 	const sql = `
 SELECT org_id, agent_id, status 
@@ -94,16 +103,26 @@ WHERE id = $1`
 	var storedAgentID *string
 	var status string
 
+	// Generic error message for all failure cases to prevent information leakage.
+	const genericErr = "authentication failed"
+
 	if err := v.pool.QueryRow(ctx, sql, clusterID).Scan(&orgID, &storedAgentID, &status); err != nil {
-		return "", apperrors.Unauthorized("cluster not found")
+		v.log.DebugContext(ctx, "agent auth failed: cluster not found",
+			slog.String("cluster_id", clusterID))
+		return "", apperrors.Unauthorized(genericErr)
 	}
 
 	if status != "connected" {
-		return "", apperrors.Unauthorized("cluster not connected")
+		v.log.DebugContext(ctx, "agent auth failed: cluster not connected",
+			slog.String("cluster_id", clusterID),
+			slog.String("status", status))
+		return "", apperrors.Unauthorized(genericErr)
 	}
 
 	if storedAgentID == nil || *storedAgentID != agentID {
-		return "", apperrors.Unauthorized("invalid agent credentials")
+		v.log.DebugContext(ctx, "agent auth failed: agent ID mismatch",
+			slog.String("cluster_id", clusterID))
+		return "", apperrors.Unauthorized(genericErr)
 	}
 
 	return orgID, nil
