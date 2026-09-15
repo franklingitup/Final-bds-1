@@ -119,6 +119,34 @@ type OrgSSOConfig struct {
 	SPPrivateKeyPEM    []byte  `db:"sp_private_key_pem" json:"-"`
 }
 
+// UpsertSSOConfigRequest is the admin write body for org SSO settings.
+// Exactly one of IDPMetadataURL or IDPMetadataXML must be set.
+type UpsertSSOConfigRequest struct {
+	IDPMetadataURL     *string `json:"idpMetadataUrl"`
+	IDPMetadataXML     *string `json:"idpMetadataXml"`
+	AttributeEmail     string  `json:"attributeEmail"`
+	AttributeFirstName string  `json:"attributeFirstName"`
+	AttributeLastName  string  `json:"attributeLastName"`
+	DefaultRole        string  `json:"defaultRole"`
+	Enabled            bool    `json:"enabled"`
+}
+
+// SSOConfigResponse is the admin-visible SSO config. SP private key material
+// is never included.
+type SSOConfigResponse struct {
+	OrgID              string  `json:"orgId"`
+	IDPMetadataURL     *string `json:"idpMetadataUrl,omitempty"`
+	IDPMetadataXML     *string `json:"idpMetadataXml,omitempty"`
+	IDPEntityID        string  `json:"idpEntityId"`
+	SPEntityID         string  `json:"spEntityId"`
+	SPMetadataURL      string  `json:"spMetadataUrl"`
+	AttributeEmail     string  `json:"attributeEmail"`
+	AttributeFirstName string  `json:"attributeFirstName"`
+	AttributeLastName  string  `json:"attributeLastName"`
+	DefaultRole        string  `json:"defaultRole"`
+	Enabled            bool    `json:"enabled"`
+}
+
 // ----------------------------------------------------------------------------
 // Request / response DTOs (see docs/04-api-spec.md section 1).
 // ----------------------------------------------------------------------------

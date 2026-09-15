@@ -273,6 +273,19 @@ func (m *SSOProviderManager) MetadataURL(orgID string) url.URL {
 	return *m.publicBaseURL.ResolveReference(&url.URL{Path: fmt.Sprintf(ssoMetadataPathFormat, orgID)})
 }
 
+// ssoProviderRuntime is the SSOProviderManager surface used by Service.
+type ssoProviderRuntime interface {
+	Get(ctx context.Context, cfg *OrgSSOConfig) (*saml.ServiceProvider, error)
+	Invalidate(orgID string)
+	MetadataURL(orgID string) url.URL
+	LoadIDPMetadata(ctx context.Context, cfg *OrgSSOConfig) (*saml.EntityDescriptor, error)
+}
+
+// LoadIDPMetadata fetches or parses IdP metadata using the same path Get uses.
+func (m *SSOProviderManager) LoadIDPMetadata(ctx context.Context, cfg *OrgSSOConfig) (*saml.EntityDescriptor, error) {
+	return m.loadIDPMetadata(ctx, cfg)
+}
+
 func generateSPKeyPair(now time.Time, orgID string) (key *rsa.PrivateKey, certPEM string, keyPEM []byte, err error) {
 	key, err = rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {

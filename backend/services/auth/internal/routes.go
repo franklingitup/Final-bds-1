@@ -40,4 +40,7 @@ func RegisterRoutes(app *fiber.App, h *Handler) {
 	orgs.Post("/service-accounts/:id/tokens", h.CreateAPIToken)
 	orgs.Get("/api-tokens", h.ListAPITokens)
 	orgs.Delete("/api-tokens/:id", h.RevokeAPIToken)
+	orgs.Put("/sso/config", h.PutSSOConfig)
+	orgs.Get("/sso/config", h.GetSSOConfig)
+	orgs.Delete("/sso/config", h.DeleteSSOConfig)
 }

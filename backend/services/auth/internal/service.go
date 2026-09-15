@@ -38,7 +38,7 @@ type Deps struct {
 	ServiceAccounts  ServiceAccountStore
 	APITokens        APITokenStore
 	SSOConfigs       SSOConfigStore
-	SSOProviders     *SSOProviderManager
+	SSOProviders     ssoProviderRuntime
 	SSOOrganizations SSOOrganizationStore
 	SSOMembers       SSOMemberStore
 	SSOHandoffs      SSOHandoffStore
@@ -63,28 +63,28 @@ type Deps struct {
 
 // Service implements the auth domain logic.
 type Service struct {
-	users                UserStore
-	sessions             SessionStore
-	otps                 OneTimeTokenStore
-	serviceAccounts      ServiceAccountStore
-	apiTokens            APITokenStore
-	ssoConfigs           SSOConfigStore
-	ssoProviders         *SSOProviderManager
-	ssoOrganizations     SSOOrganizationStore
-	ssoMembers           SSOMemberStore
-	ssoHandoffs          SSOHandoffStore
-	ssoRedirectURL       string
-	orgMembers           authz.OrgMemberStore
-	tx                   Transactor
-	tenant               TenantRunner
-	jwt                  *JWTIssuer
-	outbox               events.Outbox
-	authSvc              *authz.AuthorizationService
-	notifier             Notifier
-	revoker              TokenRevoker
-	cfg                  config.AuthConfig
-	log                  *slog.Logger
-	now                  func() time.Time
+	users            UserStore
+	sessions         SessionStore
+	otps             OneTimeTokenStore
+	serviceAccounts  ServiceAccountStore
+	apiTokens        APITokenStore
+	ssoConfigs       SSOConfigStore
+	ssoProviders     ssoProviderRuntime
+	ssoOrganizations SSOOrganizationStore
+	ssoMembers       SSOMemberStore
+	ssoHandoffs      SSOHandoffStore
+	ssoRedirectURL   string
+	orgMembers       authz.OrgMemberStore
+	tx               Transactor
+	tenant           TenantRunner
+	jwt              *JWTIssuer
+	outbox           events.Outbox
+	authSvc          *authz.AuthorizationService
+	notifier         Notifier
+	revoker          TokenRevoker
+	cfg              config.AuthConfig
+	log              *slog.Logger
+	now              func() time.Time
 }
 
 // NewService wires an AuthService from its dependencies.
@@ -103,28 +103,28 @@ func NewService(d Deps) *Service {
 	}
 
 	return &Service{
-		users:                d.Users,
-		sessions:             d.Sessions,
-		otps:                 d.OneTimeTokens,
-		serviceAccounts:      d.ServiceAccounts,
-		apiTokens:            d.APITokens,
-		ssoConfigs:           d.SSOConfigs,
-		ssoProviders:         d.SSOProviders,
-		ssoOrganizations:     d.SSOOrganizations,
-		ssoMembers:           d.SSOMembers,
-		ssoHandoffs:          d.SSOHandoffs,
-		ssoRedirectURL:       d.SSORedirectURL,
-		orgMembers:           d.OrgMembers,
-		tx:                   d.Tx,
-		tenant:               d.Tenant,
-		jwt:                  d.JWT,
-		outbox:               d.Outbox,
-		authSvc:              authSvc,
-		notifier:             d.Notifier,
-		revoker:              d.Revoker,
-		cfg:                  d.Auth,
-		log:                  d.Logger,
-		now:                  d.Now,
+		users:            d.Users,
+		sessions:         d.Sessions,
+		otps:             d.OneTimeTokens,
+		serviceAccounts:  d.ServiceAccounts,
+		apiTokens:        d.APITokens,
+		ssoConfigs:       d.SSOConfigs,
+		ssoProviders:     d.SSOProviders,
+		ssoOrganizations: d.SSOOrganizations,
+		ssoMembers:       d.SSOMembers,
+		ssoHandoffs:      d.SSOHandoffs,
+		ssoRedirectURL:   d.SSORedirectURL,
+		orgMembers:       d.OrgMembers,
+		tx:               d.Tx,
+		tenant:           d.Tenant,
+		jwt:              d.JWT,
+		outbox:           d.Outbox,
+		authSvc:          authSvc,
+		notifier:         d.Notifier,
+		revoker:          d.Revoker,
+		cfg:              d.Auth,
+		log:              d.Logger,
+		now:              d.Now,
 	}
 }
 

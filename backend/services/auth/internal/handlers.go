@@ -324,3 +324,30 @@ func (h *Handler) RevokeAPIToken(c *fiber.Ctx) error {
 	}
 	return c.SendStatus(fiber.StatusNoContent)
 }
+
+func (h *Handler) PutSSOConfig(c *fiber.Ctx) error {
+	req, err := parseBody[UpsertSSOConfigRequest](c)
+	if err != nil {
+		return err
+	}
+	cfg, err := h.svc.UpsertSSOConfig(c.UserContext(), c.Params("orgId"), currentUserID(c), req)
+	if err != nil {
+		return err
+	}
+	return c.JSON(cfg)
+}
+
+func (h *Handler) GetSSOConfig(c *fiber.Ctx) error {
+	cfg, err := h.svc.GetSSOConfig(c.UserContext(), c.Params("orgId"), currentUserID(c))
+	if err != nil {
+		return err
+	}
+	return c.JSON(cfg)
+}
+
+func (h *Handler) DeleteSSOConfig(c *fiber.Ctx) error {
+	if err := h.svc.DeleteSSOConfig(c.UserContext(), c.Params("orgId"), currentUserID(c)); err != nil {
+		return err
+	}
+	return c.SendStatus(fiber.StatusNoContent)
+}
