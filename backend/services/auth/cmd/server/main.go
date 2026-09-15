@@ -52,6 +52,13 @@ func main() {
 
 	// Create org member repo for authorization checks on service account endpoints
 	orgMemberRepo := authz.NewOrgMemberRepo(db)
+	ssoConfigs := auth.NewSSOConfigStore(db)
+
+	ssoProviders, err := newSSOProviderManager(cfg, ssoConfigs, log)
+	if err != nil {
+		log.Error("init sso provider manager", "error", err)
+		os.Exit(1)
+	}
 
 	// Token revocation store. When REDIS_URL is set, logout and refresh rotation
 	// record the affected session in Redis so the gateway rejects its access
@@ -67,6 +74,8 @@ func main() {
 		OneTimeTokens:   auth.NewOneTimeTokenStore(db),
 		ServiceAccounts: auth.NewServiceAccountStore(db),
 		APITokens:       auth.NewAPITokenStore(db),
+		SSOConfigs:      ssoConfigs,
+		SSOProviders:    ssoProviders,
 		OrgMembers:      orgMemberRepo,
 		Tx:              db,
 		Tenant:          db,
@@ -146,6 +155,37 @@ func newRevoker(ctx context.Context, cfg config.Config, log *slog.Logger) (auth.
 	}
 	log.Info("token revocation enabled", "backend", "redis")
 	return security.NewTokenRevocationList(client, "revoked:"), func() { _ = client.Close() }
+}
+
+// newSSOProviderManager wires the per-org SAML ServiceProvider cache.
+// PUBLIC_API_BASE_URL is the externally reachable API origin used for ACS and
+// SP metadata URLs. CERTIFICATE_ENCRYPTION_KEY (same as the domain service)
+// encrypts SP private keys at rest when set.
+func newSSOProviderManager(cfg config.Config, keys auth.SSOConfigStore, log *slog.Logger) (*auth.SSOProviderManager, error) {
+	publicBase := os.Getenv("PUBLIC_API_BASE_URL")
+	if publicBase == "" {
+		publicBase = "http://localhost:8080"
+		log.Warn("PUBLIC_API_BASE_URL not set; defaulting for SAML ACS/metadata URLs", "url", publicBase)
+	}
+
+	var encryptor *auth.SSOKeyEncryptor
+	if key := os.Getenv("CERTIFICATE_ENCRYPTION_KEY"); key != "" {
+		var err error
+		encryptor, err = auth.NewSSOKeyEncryptor(key)
+		if err != nil {
+			return nil, err
+		}
+	} else if cfg.Environment == config.EnvProduction || cfg.Environment == config.EnvStaging {
+		return nil, errors.New("CERTIFICATE_ENCRYPTION_KEY is required outside local development for SAML SP keys")
+	} else {
+		log.Warn("CERTIFICATE_ENCRYPTION_KEY is not set; SAML SP private keys will be stored unencrypted")
+	}
+
+	return auth.NewSSOProviderManager(auth.SSOProviderManagerOpts{
+		PublicBaseURL: publicBase,
+		Encryptor:     encryptor,
+		Keys:          keys,
+	})
 }
 
 // newPublisher returns an event publisher and a cleanup function. When NATS is

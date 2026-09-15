@@ -99,6 +99,26 @@ type APIToken struct {
 	RevokedAt        *time.Time `db:"revoked_at"`
 }
 
+// OrgSSOConfig is the per-organization SAML SSO settings (one row per org).
+// Attribute* fields map IdP assertion attributes to user profile fields.
+// DefaultRole is the authz.OrgRole granted on JIT membership creation.
+// SPCertificatePEM / SPPrivateKeyPEM hold the org's Service Provider signing
+// material (private key may be AES-GCM ciphertext when encryption is enabled).
+type OrgSSOConfig struct {
+	database.TenantModel
+	IDPMetadataURL     *string `db:"idp_metadata_url" json:"idpMetadataUrl,omitempty"`
+	IDPMetadataXML     *string `db:"idp_metadata_xml" json:"idpMetadataXml,omitempty"`
+	IDPEntityID        string  `db:"idp_entity_id" json:"idpEntityId"`
+	SPEntityID         string  `db:"sp_entity_id" json:"spEntityId"`
+	AttributeEmail     string  `db:"attribute_email" json:"attributeEmail"`
+	AttributeFirstName string  `db:"attribute_first_name" json:"attributeFirstName"`
+	AttributeLastName  string  `db:"attribute_last_name" json:"attributeLastName"`
+	DefaultRole        string  `db:"default_role" json:"defaultRole"`
+	Enabled            bool    `db:"enabled" json:"enabled"`
+	SPCertificatePEM   *string `db:"sp_certificate_pem" json:"-"`
+	SPPrivateKeyPEM    []byte  `db:"sp_private_key_pem" json:"-"`
+}
+
 // ----------------------------------------------------------------------------
 // Request / response DTOs (see docs/04-api-spec.md section 1).
 // ----------------------------------------------------------------------------
