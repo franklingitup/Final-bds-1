@@ -396,8 +396,29 @@ func (s *Service) IssueCertificate(ctx context.Context, orgID, userID, domainID 
 		// Encrypt and store certificate data
 		var certPEM, keyPEM []byte
 		if s.encryptor != nil {
-			certPEM, _ = s.encryptor.Encrypt(result.Certificate)
-			keyPEM, _ = s.encryptor.Encrypt(result.PrivateKey)
+			certPEM, err = s.encryptor.Encrypt(result.Certificate)
+			if err != nil {
+				errMsg := err.Error()
+				if statusErr := s.certs.UpdateStatus(ctx, cert.ID, CertFailed, &errMsg); statusErr != nil {
+					s.log.Error("failed to mark certificate as failed after encryption error",
+						"domain_id", domainID,
+						"certificate_id", cert.ID,
+						"error", statusErr)
+				}
+				return fmt.Errorf("encrypt certificate: %w", err)
+			}
+
+			keyPEM, err = s.encryptor.Encrypt(result.PrivateKey)
+			if err != nil {
+				errMsg := err.Error()
+				if statusErr := s.certs.UpdateStatus(ctx, cert.ID, CertFailed, &errMsg); statusErr != nil {
+					s.log.Error("failed to mark certificate as failed after private key encryption error",
+						"domain_id", domainID,
+						"certificate_id", cert.ID,
+						"error", statusErr)
+				}
+				return fmt.Errorf("encrypt certificate private key: %w", err)
+			}
 		} else {
 			certPEM = result.Certificate
 			keyPEM = result.PrivateKey
@@ -571,20 +592,51 @@ func (s *Service) GetIngressesForAgent(ctx context.Context, orgID, clusterID str
 
 			// Include TLS secret if certificate exists
 			if rec.TLSSecretName != nil {
-				cert, _ := s.certs.GetByDomainID(ctx, rec.DomainID)
-				if cert != nil && cert.Status == CertActive && len(cert.CertificatePEM) > 0 {
-					// Decrypt certificate
+				func() {
+					cert, certErr := s.certs.GetByDomainID(ctx, rec.DomainID)
+					if certErr != nil || cert == nil || cert.Status != CertActive || len(cert.CertificatePEM) == 0 {
+						return
+					}
+
 					var certPEM, keyPEM []byte
 					if s.encryptor != nil {
-						certPEM, _ = s.encryptor.Decrypt(cert.CertificatePEM)
-						keyPEM, _ = s.encryptor.Decrypt(cert.PrivateKeyPEM)
+						certPEM, certErr = s.encryptor.Decrypt(cert.CertificatePEM)
+						if certErr != nil {
+							s.log.Error("failed to decrypt certificate for agent ingress",
+								"domain_id", rec.DomainID,
+								"certificate_id", cert.ID,
+								"error", certErr)
+							return
+						}
+
+						keyPEM, certErr = s.encryptor.Decrypt(cert.PrivateKeyPEM)
+						if certErr != nil {
+							s.log.Error("failed to decrypt certificate private key for agent ingress",
+								"domain_id", rec.DomainID,
+								"certificate_id", cert.ID,
+								"error", certErr)
+							return
+						}
 					} else {
 						certPEM = cert.CertificatePEM
 						keyPEM = cert.PrivateKeyPEM
 					}
-					tlsSecret, _ := s.ingressGen.GenerateTLSSecret(*rec.TLSSecretName, rec.Namespace, certPEM, keyPEM)
+
+					tlsSecret, secretErr := s.ingressGen.GenerateTLSSecret(
+						*rec.TLSSecretName,
+						rec.Namespace,
+						certPEM,
+						keyPEM,
+					)
+					if secretErr != nil {
+						s.log.Error("failed to generate TLS secret for agent ingress",
+							"domain_id", rec.DomainID,
+							"certificate_id", cert.ID,
+							"error", secretErr)
+						return
+					}
 					spec.TLSSecret = tlsSecret
-				}
+				}()
 			}
 
 			specs = append(specs, spec)

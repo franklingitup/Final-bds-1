@@ -1,6 +1,13 @@
 package domain
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"io"
 	"strings"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -50,33 +57,91 @@ func (v *JWTVerifier) Verify(tokenString string) (*Identity, error) {
 	}, nil
 }
 
+// Certificate encryption errors.
+var (
+	ErrInvalidKey        = errors.New("domain: invalid certificate encryption key (must be 32 bytes for AES-256)")
+	ErrEncryptionFailed  = errors.New("domain: certificate encryption failed")
+	ErrDecryptionFailed  = errors.New("domain: certificate decryption failed")
+	ErrInvalidCiphertext = errors.New("domain: invalid certificate ciphertext format")
+)
+
+const (
+	certificateEncryptionKeySize = 32
+	certificateNonceSize         = 12
+)
+
 // CertificateEncryptor encrypts/decrypts certificate data using AES-256-GCM.
 type CertificateEncryptor struct {
-	key []byte
+	gcm cipher.AEAD
 }
 
-// NewCertificateEncryptor creates a new certificate encryptor.
-// The key must be 32 bytes for AES-256.
-func NewCertificateEncryptor(key []byte) *CertificateEncryptor {
-	return &CertificateEncryptor{key: key}
+// NewCertificateEncryptor creates a certificate encryptor from a base64-encoded
+// 32-byte AES-256 key.
+func NewCertificateEncryptor(keyBase64 string) (*CertificateEncryptor, error) {
+	key, err := base64.StdEncoding.DecodeString(keyBase64)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidKey, err)
+	}
+	return NewCertificateEncryptorFromBytes(key)
+}
+
+// NewCertificateEncryptorFromBytes creates a certificate encryptor from a raw
+// 32-byte AES-256 key.
+func NewCertificateEncryptorFromBytes(key []byte) (*CertificateEncryptor, error) {
+	if len(key) != certificateEncryptionKeySize {
+		return nil, fmt.Errorf(
+			"%w: got %d bytes, want %d",
+			ErrInvalidKey,
+			len(key),
+			certificateEncryptionKeySize,
+		)
+	}
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidKey, err)
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidKey, err)
+	}
+
+	return &CertificateEncryptor{gcm: gcm}, nil
 }
 
 // Encrypt encrypts plaintext using AES-256-GCM.
+// The returned format is nonce || ciphertext || authentication tag.
 func (e *CertificateEncryptor) Encrypt(plaintext []byte) ([]byte, error) {
-	// For simplicity, we're using a basic implementation here
-	// In production, use a proper crypto library with nonce management
-	if len(e.key) == 0 {
-		return plaintext, nil // No encryption if no key
+	nonce := make([]byte, certificateNonceSize)
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, fmt.Errorf("%w: generate nonce: %v", ErrEncryptionFailed, err)
 	}
-	// TODO: Implement proper AES-256-GCM encryption
+
+	return e.gcm.Seal(nonce, nonce, plaintext, nil), nil
+}
+
+// Decrypt authenticates and decrypts data produced by Encrypt.
+func (e *CertificateEncryptor) Decrypt(ciphertext []byte) ([]byte, error) {
+	if len(ciphertext) < certificateNonceSize+e.gcm.Overhead() {
+		return nil, ErrInvalidCiphertext
+	}
+
+	nonce := ciphertext[:certificateNonceSize]
+	encryptedData := ciphertext[certificateNonceSize:]
+
+	plaintext, err := e.gcm.Open(nil, nonce, encryptedData, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrDecryptionFailed, err)
+	}
 	return plaintext, nil
 }
 
-// Decrypt decrypts ciphertext using AES-256-GCM.
-func (e *CertificateEncryptor) Decrypt(ciphertext []byte) ([]byte, error) {
-	if len(e.key) == 0 {
-		return ciphertext, nil // No decryption if no key
+// GenerateCertificateEncryptionKey returns a new base64-encoded 32-byte key.
+func GenerateCertificateEncryptionKey() (string, error) {
+	key := make([]byte, certificateEncryptionKeySize)
+	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+		return "", fmt.Errorf("domain: generate certificate encryption key: %w", err)
 	}
-	// TODO: Implement proper AES-256-GCM decryption
-	return ciphertext, nil
+	return base64.StdEncoding.EncodeToString(key), nil
 }

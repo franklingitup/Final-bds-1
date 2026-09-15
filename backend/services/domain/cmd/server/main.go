@@ -61,14 +61,28 @@ func main() {
 	eventStore := domain.NewDomainEventStore(db)
 	orgMemberStore := authz.NewOrgMemberRepo(db)
 
-	// Initialize encryptor (use empty key for dev - in production, use a proper key)
-	encryptor := domain.NewCertificateEncryptor(nil)
+	// Initialize certificate encryption. Staging and production must fail closed;
+	// local development may run without a key for convenience.
+	var encryptor *domain.CertificateEncryptor
+	if key := os.Getenv("CERTIFICATE_ENCRYPTION_KEY"); key != "" {
+		encryptor, err = domain.NewCertificateEncryptor(key)
+		if err != nil {
+			log.Error("failed to initialize certificate encryptor", "error", err)
+			os.Exit(1)
+		}
+	} else if cfg.Environment == config.EnvProduction || cfg.Environment == config.EnvStaging {
+		log.Error("CERTIFICATE_ENCRYPTION_KEY environment variable is required outside local development")
+		os.Exit(1)
+	} else {
+		log.Warn("CERTIFICATE_ENCRYPTION_KEY is not set; TLS certificates and private keys will be stored unencrypted")
+	}
 
 	// Create deployment reader adapter
 	deploymentReader := &deploymentReaderAdapter{db: db}
 
-	// Create service
-	svc := domain.NewService(domain.Deps{
+	// Create service dependencies. Assign the optional encryptor only when it is
+	// non-nil so the interface does not wrap a nil *CertificateEncryptor.
+	deps := domain.Deps{
 		Domains:      domainStore,
 		Certificates: certStore,
 		Challenges:   challengeStore,
@@ -78,9 +92,12 @@ func main() {
 		OrgMembers:   orgMemberStore,
 		Outbox:       outbox,
 		Tenant:       db,
-		Encryptor:    encryptor,
 		Logger:       log,
-	})
+	}
+	if encryptor != nil {
+		deps.Encryptor = encryptor
+	}
+	svc := domain.NewService(deps)
 
 	// Create handler
 	handler := domain.NewHandler(svc, log)
