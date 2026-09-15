@@ -37,6 +37,8 @@ type Deps struct {
 	OneTimeTokens   OneTimeTokenStore
 	ServiceAccounts ServiceAccountStore
 	APITokens       APITokenStore
+	SSOConfigs      SSOConfigStore
+	SSOProviders    *SSOProviderManager
 	OrgMembers      authz.OrgMemberStore // For org membership authorization
 	Tx              Transactor
 	Tenant          TenantRunner
@@ -62,6 +64,8 @@ type Service struct {
 	otps            OneTimeTokenStore
 	serviceAccounts ServiceAccountStore
 	apiTokens       APITokenStore
+	ssoConfigs      SSOConfigStore
+	ssoProviders    *SSOProviderManager
 	orgMembers      authz.OrgMemberStore
 	tx              Transactor
 	tenant          TenantRunner
@@ -96,6 +100,8 @@ func NewService(d Deps) *Service {
 		otps:            d.OneTimeTokens,
 		serviceAccounts: d.ServiceAccounts,
 		apiTokens:       d.APITokens,
+		ssoConfigs:      d.SSOConfigs,
+		ssoProviders:    d.SSOProviders,
 		orgMembers:      d.OrgMembers,
 		tx:              d.Tx,
 		tenant:          d.Tenant,
@@ -382,6 +388,34 @@ func (s *Service) revokeSessionInCache(ctx context.Context, sessionID string) {
 	if err := s.revoker.Revoke(ctx, sessionID, expiresAt); err != nil {
 		s.log.WarnContext(ctx, "failed to record session revocation in cache",
 			slog.String("session_id", sessionID),
+			slog.String("reason", "revocation_store_error"),
+			slog.String("error", err.Error()),
+		)
+	}
+}
+
+// revokeAPITokenInCache best-effort records an API token's JTI as revoked in the
+// shared revocation store (Redis) so the API gateway rejects the JWT before its
+// natural expiry. The token's JTI is stored in the TokenHash field at creation.
+//
+// The database revoked_at column is the durable source of truth; this cache
+// write is best-effort. A failure (or absent revoker) is logged and swallowed so
+// the RevokeAPIToken call still succeeds — the cost is that the already-issued
+// JWT survives until its expiry.
+func (s *Service) revokeAPITokenInCache(ctx context.Context, token *APIToken) {
+	if s.revoker == nil || token == nil || token.TokenHash == "" {
+		return
+	}
+	// Use the token's actual expiry if set; otherwise use a long fallback for
+	// non-expiring tokens (1 year) to ensure the revocation stays in cache until
+	// the token would naturally be considered stale.
+	expiresAt := s.now().Add(24 * time.Hour * 365)
+	if token.ExpiresAt != nil {
+		expiresAt = *token.ExpiresAt
+	}
+	if err := s.revoker.Revoke(ctx, token.TokenHash, expiresAt); err != nil {
+		s.log.WarnContext(ctx, "failed to record API token revocation in cache",
+			slog.String("api_token_id", token.ID),
 			slog.String("reason", "revocation_store_error"),
 			slog.String("error", err.Error()),
 		)

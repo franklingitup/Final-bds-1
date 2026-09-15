@@ -77,7 +77,26 @@ type ServiceAccountStore interface {
 type APITokenStore interface {
 	Create(ctx context.Context, t *APIToken) error
 	ListByOrg(ctx context.Context, req database.PageRequest) (database.Page[APIToken], error)
-	Revoke(ctx context.Context, id string) error
+	// Revoke marks a token as revoked and returns it so the caller can push the
+	// JTI into the shared revocation cache (Redis). Returns NotFound if no
+	// unrevoked token with this ID exists.
+	Revoke(ctx context.Context, id string) (*APIToken, error)
+}
+
+// SSOConfigStore persists per-organization SAML SSO configuration.
+// Callers must run reads/writes inside a tenant-scoped transaction so RLS applies.
+type SSOConfigStore interface {
+	// Upsert creates or replaces the org's SSO config (unique on org_id).
+	// SP key columns are left unchanged on conflict so rotation stays explicit.
+	Upsert(ctx context.Context, c *OrgSSOConfig) error
+	GetByOrgID(ctx context.Context, orgID string) (*OrgSSOConfig, error)
+	DeleteByOrgID(ctx context.Context, orgID string) error
+	// UpdateSPKeys unconditionally replaces the org SP keypair (admin rotation).
+	UpdateSPKeys(ctx context.Context, orgID string, certPEM string, privateKeyPEM []byte) (version int64, err error)
+	// TrySetSPKeys atomically sets the SP keypair only when none exists yet.
+	// ok is false when another writer already persisted keys (or the row is missing);
+	// callers should re-fetch on !ok rather than using the locally generated material.
+	TrySetSPKeys(ctx context.Context, orgID string, certPEM string, privateKeyPEM []byte) (version int64, ok bool, err error)
 }
 
 // ----------------------------------------------------------------------------
@@ -312,16 +331,16 @@ func (r *apiTokenRepo) ListByOrg(ctx context.Context, req database.PageRequest) 
 	return database.BuildPage(items, req.Limit, func(t APIToken) database.Cursor { return t.Cursor() }), nil
 }
 
-func (r *apiTokenRepo) Revoke(ctx context.Context, id string) error {
-	tag, err := r.db.Conn(ctx).Exec(ctx,
-		"UPDATE api_tokens SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL", id)
+func (r *apiTokenRepo) Revoke(ctx context.Context, id string) (*APIToken, error) {
+	const sql = `UPDATE api_tokens SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL RETURNING *`
+	token, err := database.QueryOne[APIToken](ctx, r.db.Conn(ctx), sql, id)
 	if err != nil {
-		return database.MapError(err)
+		if database.IsNotFound(err) {
+			return nil, apperrors.NotFound("api token not found")
+		}
+		return nil, database.MapError(err)
 	}
-	if tag.RowsAffected() == 0 {
-		return apperrors.NotFound("api token not found")
-	}
-	return nil
+	return &token, nil
 }
 
 // scopesOrEmpty normalizes a nil scope slice so it persists as an empty array.
@@ -330,4 +349,99 @@ func scopesOrEmpty(s []string) []string {
 		return []string{}
 	}
 	return s
+}
+
+type ssoConfigRepo struct{ db *database.DB }
+
+// NewSSOConfigStore returns a Postgres-backed SSOConfigStore.
+func NewSSOConfigStore(db *database.DB) SSOConfigStore { return &ssoConfigRepo{db: db} }
+
+func (r *ssoConfigRepo) Upsert(ctx context.Context, c *OrgSSOConfig) error {
+	const sql = `
+INSERT INTO org_sso_configs (
+    org_id, idp_metadata_url, idp_metadata_xml, idp_entity_id, sp_entity_id,
+    attribute_email, attribute_first_name, attribute_last_name, default_role, enabled
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+ON CONFLICT (org_id) DO UPDATE SET
+    idp_metadata_url = EXCLUDED.idp_metadata_url,
+    idp_metadata_xml = EXCLUDED.idp_metadata_xml,
+    idp_entity_id = EXCLUDED.idp_entity_id,
+    sp_entity_id = EXCLUDED.sp_entity_id,
+    attribute_email = EXCLUDED.attribute_email,
+    attribute_first_name = EXCLUDED.attribute_first_name,
+    attribute_last_name = EXCLUDED.attribute_last_name,
+    default_role = EXCLUDED.default_role,
+    enabled = EXCLUDED.enabled,
+    version = org_sso_configs.version + 1,
+    updated_at = now()
+RETURNING id, created_at, updated_at, version`
+	row := r.db.Conn(ctx).QueryRow(ctx, sql,
+		c.OrgID, c.IDPMetadataURL, c.IDPMetadataXML, c.IDPEntityID, c.SPEntityID,
+		c.AttributeEmail, c.AttributeFirstName, c.AttributeLastName, c.DefaultRole, c.Enabled)
+	return database.MapError(row.Scan(&c.ID, &c.CreatedAt, &c.UpdatedAt, &c.Version))
+}
+
+func (r *ssoConfigRepo) GetByOrgID(ctx context.Context, orgID string) (*OrgSSOConfig, error) {
+	c, err := database.QueryOne[OrgSSOConfig](ctx, r.db.Conn(ctx),
+		"SELECT * FROM org_sso_configs WHERE org_id = $1", orgID)
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+func (r *ssoConfigRepo) DeleteByOrgID(ctx context.Context, orgID string) error {
+	tag, err := r.db.Conn(ctx).Exec(ctx, "DELETE FROM org_sso_configs WHERE org_id = $1", orgID)
+	if err != nil {
+		return database.MapError(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return apperrors.NotFound("sso config not found")
+	}
+	return nil
+}
+
+func (r *ssoConfigRepo) UpdateSPKeys(ctx context.Context, orgID string, certPEM string, privateKeyPEM []byte) (int64, error) {
+	const sql = `
+UPDATE org_sso_configs
+SET sp_certificate_pem = $2,
+    sp_private_key_pem = $3,
+    version = version + 1,
+    updated_at = now()
+WHERE org_id = $1
+RETURNING version`
+	var version int64
+	err := r.db.Conn(ctx).QueryRow(ctx, sql, orgID, certPEM, privateKeyPEM).Scan(&version)
+	if err != nil {
+		mapped := database.MapError(err)
+		if database.IsNotFound(mapped) {
+			return 0, apperrors.NotFound("sso config not found")
+		}
+		return 0, mapped
+	}
+	return version, nil
+}
+
+func (r *ssoConfigRepo) TrySetSPKeys(ctx context.Context, orgID string, certPEM string, privateKeyPEM []byte) (int64, bool, error) {
+	// Conditional write: only the first writer to observe a NULL/empty cert wins.
+	// Concurrent losers get ok=false and must re-fetch the persisted keypair.
+	const sql = `
+UPDATE org_sso_configs
+SET sp_certificate_pem = $2,
+    sp_private_key_pem = $3,
+    version = version + 1,
+    updated_at = now()
+WHERE org_id = $1
+  AND (sp_certificate_pem IS NULL OR sp_certificate_pem = '')
+RETURNING version`
+	var version int64
+	err := r.db.Conn(ctx).QueryRow(ctx, sql, orgID, certPEM, privateKeyPEM).Scan(&version)
+	if err != nil {
+		mapped := database.MapError(err)
+		if database.IsNotFound(mapped) {
+			return 0, false, nil
+		}
+		return 0, false, mapped
+	}
+	return version, true, nil
 }

@@ -6,6 +6,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/bdsplatform/platform/backend/libs/database"
 )
 
 // fakeRevoker captures session/token revocations written to the shared store so
@@ -196,4 +198,256 @@ func TestConcurrentLogoutsAreSafe(t *testing.T) {
 
 func fmtEmail(i int) string {
 	return "user" + string(rune('a'+i%26)) + string(rune('0'+i/26)) + "@example.com"
+}
+
+// ----------------------------------------------------------------------------
+// API Token Revocation Tests
+// ----------------------------------------------------------------------------
+
+// fakeAPITokenStore implements APITokenStore for testing API token revocation.
+type fakeAPITokenStore struct {
+	tokens map[string]*APIToken
+}
+
+func newFakeAPITokenStore() *fakeAPITokenStore {
+	return &fakeAPITokenStore{tokens: map[string]*APIToken{}}
+}
+
+func (f *fakeAPITokenStore) Create(_ context.Context, t *APIToken) error {
+	t.ID = "tok-" + t.TokenHash[:8]
+	t.CreatedAt = time.Now()
+	f.tokens[t.ID] = t
+	return nil
+}
+
+func (f *fakeAPITokenStore) ListByOrg(_ context.Context, req database.PageRequest) (database.Page[APIToken], error) {
+	var items []APIToken
+	for _, t := range f.tokens {
+		items = append(items, *t)
+	}
+	return database.Page[APIToken]{Items: items}, nil
+}
+
+func (f *fakeAPITokenStore) Revoke(_ context.Context, id string) (*APIToken, error) {
+	t, ok := f.tokens[id]
+	if !ok || t.RevokedAt != nil {
+		return nil, errors.New("api token not found")
+	}
+	now := time.Now()
+	t.RevokedAt = &now
+	return t, nil
+}
+
+// fakeServiceAccountStore implements ServiceAccountStore for testing.
+type fakeServiceAccountStore struct {
+	accounts map[string]*ServiceAccount
+}
+
+func newFakeServiceAccountStore() *fakeServiceAccountStore {
+	return &fakeServiceAccountStore{accounts: map[string]*ServiceAccount{}}
+}
+
+func (f *fakeServiceAccountStore) Create(_ context.Context, sa *ServiceAccount) error {
+	sa.ID = "sa-" + sa.Name[:8]
+	sa.CreatedAt = time.Now()
+	f.accounts[sa.ID] = sa
+	return nil
+}
+
+func (f *fakeServiceAccountStore) GetByID(_ context.Context, id string) (*ServiceAccount, error) {
+	if sa, ok := f.accounts[id]; ok {
+		return sa, nil
+	}
+	return nil, errors.New("not found")
+}
+
+func (f *fakeServiceAccountStore) List(_ context.Context, req database.PageRequest) (database.Page[ServiceAccount], error) {
+	var items []ServiceAccount
+	for _, sa := range f.accounts {
+		items = append(items, *sa)
+	}
+	return database.Page[ServiceAccount]{Items: items}, nil
+}
+
+func (f *fakeServiceAccountStore) Delete(_ context.Context, id string) error {
+	delete(f.accounts, id)
+	return nil
+}
+
+// fakeTenantRunnerForTokens implements TenantRunner for token tests.
+type fakeTenantRunnerForTokens struct{}
+
+func (f fakeTenantRunnerForTokens) WithTenant(ctx context.Context, orgID string, fn database.TxFunc) error {
+	return fn(ctx)
+}
+
+// newAPITokenRevokerEnv builds a service wired with a fake revoker and API token stores.
+func newAPITokenRevokerEnv(rev TokenRevoker) (*Service, *fakeAPITokenStore, *fakeRevoker, time.Time) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	apiTokens := newFakeAPITokenStore()
+	serviceAccounts := newFakeServiceAccountStore()
+
+	// Seed a service account so we can create tokens.
+	serviceAccounts.accounts["sa-test1234"] = &ServiceAccount{
+		TenantModel: database.TenantModel{Model: database.Model{ID: "sa-test1234"}},
+		Name:        "test-sa",
+		Status:      "active",
+	}
+
+	var fakeRev *fakeRevoker
+	if rev != nil {
+		fakeRev = rev.(*fakeRevoker)
+	}
+
+	svc := NewService(Deps{
+		Users:           newFakeUserStore(),
+		Sessions:        newFakeSessionStore(),
+		OneTimeTokens:   newFakeOTTStore(),
+		ServiceAccounts: serviceAccounts,
+		APITokens:       apiTokens,
+		Tx:              fakeTx{},
+		Tenant:          fakeTenantRunnerForTokens{},
+		JWT:             NewJWTIssuer(testAuthConfig()),
+		Outbox:          &fakeOutbox{},
+		Notifier:        newFakeNotifier(),
+		Revoker:         rev,
+		Auth:            testAuthConfig(),
+		Now:             func() time.Time { return now },
+	})
+	return svc, apiTokens, fakeRev, now
+}
+
+func TestRevokeAPITokenPushesToCache(t *testing.T) {
+	rev := newFakeRevoker()
+	svc, apiTokens, _, now := newAPITokenRevokerEnv(rev)
+	ctx := context.Background()
+	orgID := "org-test"
+
+	// Create an API token manually in the fake store with a known JTI.
+	jti := "jti-" + time.Now().Format("20060102150405")
+	expiry := now.Add(24 * time.Hour)
+	token := &APIToken{
+		TenantModel:      database.TenantModel{Model: database.Model{ID: "tok-testrev"}},
+		ServiceAccountID: "sa-test1234",
+		Name:             "test-token",
+		Prefix:           "jwt_abc",
+		TokenHash:        jti, // JTI is stored in TokenHash
+		Scopes:           []string{"read"},
+		ExpiresAt:        &expiry,
+	}
+	token.OrgID = orgID
+	apiTokens.tokens["tok-testrev"] = token
+
+	// Revoke the token.
+	if err := svc.RevokeAPIToken(ctx, orgID, "user-123", "tok-testrev"); err != nil {
+		t.Fatalf("RevokeAPIToken: %v", err)
+	}
+
+	// Verify the JTI was pushed to the revoker.
+	if !rev.isRevoked(jti) {
+		t.Fatal("expected API token JTI to be revoked in cache")
+	}
+
+	// Verify the expiry matches the token's expiry.
+	cachedExpiry, ok := rev.expiryOf(jti)
+	if !ok {
+		t.Fatal("expected expiry to be recorded")
+	}
+	if !cachedExpiry.Equal(expiry) {
+		t.Errorf("cached expiry = %v, want %v", cachedExpiry, expiry)
+	}
+}
+
+func TestRevokeAPITokenWithoutExpiryUsesLongFallback(t *testing.T) {
+	rev := newFakeRevoker()
+	svc, apiTokens, _, now := newAPITokenRevokerEnv(rev)
+	ctx := context.Background()
+	orgID := "org-test"
+
+	// Create an API token without an expiry (non-expiring token).
+	jti := "jti-noexp-" + time.Now().Format("20060102150405")
+	token := &APIToken{
+		TenantModel:      database.TenantModel{Model: database.Model{ID: "tok-noexp"}},
+		ServiceAccountID: "sa-test1234",
+		Name:             "non-expiring-token",
+		Prefix:           "jwt_noexp",
+		TokenHash:        jti,
+		Scopes:           []string{"read"},
+		ExpiresAt:        nil, // No expiry
+	}
+	token.OrgID = orgID
+	apiTokens.tokens["tok-noexp"] = token
+
+	// Revoke the token.
+	if err := svc.RevokeAPIToken(ctx, orgID, "user-123", "tok-noexp"); err != nil {
+		t.Fatalf("RevokeAPIToken: %v", err)
+	}
+
+	// Verify the JTI was pushed to the revoker with a 1-year fallback.
+	cachedExpiry, ok := rev.expiryOf(jti)
+	if !ok {
+		t.Fatal("expected JTI to be revoked in cache")
+	}
+	expectedFallback := now.Add(24 * time.Hour * 365)
+	if !cachedExpiry.Equal(expectedFallback) {
+		t.Errorf("cached expiry = %v, want 1-year fallback %v", cachedExpiry, expectedFallback)
+	}
+}
+
+func TestRevokeAPITokenSucceedsWhenRevokerErrors(t *testing.T) {
+	rev := newFakeRevoker()
+	rev.err = errors.New("redis down")
+	svc, apiTokens, _, _ := newAPITokenRevokerEnv(rev)
+	ctx := context.Background()
+	orgID := "org-test"
+
+	jti := "jti-err-test"
+	token := &APIToken{
+		TenantModel:      database.TenantModel{Model: database.Model{ID: "tok-err"}},
+		ServiceAccountID: "sa-test1234",
+		Name:             "error-test-token",
+		Prefix:           "jwt_err",
+		TokenHash:        jti,
+		Scopes:           []string{"read"},
+	}
+	token.OrgID = orgID
+	apiTokens.tokens["tok-err"] = token
+
+	// RevokeAPIToken should succeed even when the revoker fails (best-effort).
+	if err := svc.RevokeAPIToken(ctx, orgID, "user-123", "tok-err"); err != nil {
+		t.Fatalf("RevokeAPIToken must not fail on revoker error, got %v", err)
+	}
+
+	// The token should still be marked as revoked in the database.
+	if token.RevokedAt == nil {
+		t.Error("expected token to be marked revoked in database")
+	}
+}
+
+func TestRevokeAPITokenWithoutRevoker(t *testing.T) {
+	svc, apiTokens, _, _ := newAPITokenRevokerEnv(nil)
+	ctx := context.Background()
+	orgID := "org-test"
+
+	jti := "jti-nil-revoker"
+	token := &APIToken{
+		TenantModel:      database.TenantModel{Model: database.Model{ID: "tok-nil"}},
+		ServiceAccountID: "sa-test1234",
+		Name:             "nil-revoker-token",
+		Prefix:           "jwt_nil",
+		TokenHash:        jti,
+		Scopes:           []string{"read"},
+	}
+	token.OrgID = orgID
+	apiTokens.tokens["tok-nil"] = token
+
+	// RevokeAPIToken should succeed when no revoker is configured.
+	if err := svc.RevokeAPIToken(ctx, orgID, "user-123", "tok-nil"); err != nil {
+		t.Fatalf("RevokeAPIToken: %v", err)
+	}
+
+	// The token should still be marked as revoked in the database.
+	if token.RevokedAt == nil {
+		t.Error("expected token to be marked revoked in database")
+	}
 }

@@ -194,7 +194,8 @@ func (s *Service) ListAPITokens(ctx context.Context, orgID, userID string, page 
 	return out, err
 }
 
-// RevokeAPIToken revokes an API token.
+// RevokeAPIToken revokes an API token and pushes the revocation to the shared
+// cache (Redis) so the API gateway rejects the JWT before its natural expiry.
 // SECURITY: Requires org membership with admin privileges.
 func (s *Service) RevokeAPIToken(ctx context.Context, orgID, userID, id string) error {
 	// SECURITY: Verify caller has org admin privileges
@@ -204,11 +205,22 @@ func (s *Service) RevokeAPIToken(ctx context.Context, orgID, userID, id string) 
 		}
 	}
 
-	return s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
-		if err := s.apiTokens.Revoke(ctx, id); err != nil {
+	var revokedToken *APIToken
+	err := s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
+		token, err := s.apiTokens.Revoke(ctx, id)
+		if err != nil {
 			return err
 		}
+		revokedToken = token
 		return s.enqueue(ctx, EventAPITokenRevoked, orgID, apiTokenRevokedPayload{APITokenID: id},
 			events.WithResource(events.Resource{Type: "api_token", ID: id}))
 	})
+	if err != nil {
+		return err
+	}
+	// Push the revocation to the shared cache (Redis) so the gateway rejects
+	// the JWT immediately. This is best-effort: the DB revocation already
+	// succeeded, so a cache failure is logged but not propagated.
+	s.revokeAPITokenInCache(ctx, revokedToken)
+	return nil
 }
