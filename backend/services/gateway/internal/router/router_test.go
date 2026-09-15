@@ -133,15 +133,22 @@ func TestRouter_PublicAuthRoutes(t *testing.T) {
 	router.Register(app)
 
 	// Public auth endpoints should not require authentication.
-	publicEndpoints := []string{
-		"/v1/auth/signup",
-		"/v1/auth/login",
-		"/v1/auth/refresh",
+	publicEndpoints := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPost, "/v1/auth/signup"},
+		{http.MethodPost, "/v1/auth/login"},
+		{http.MethodPost, "/v1/auth/refresh"},
+		{http.MethodGet, "/v1/auth/sso/acme/login"},
+		{http.MethodPost, "/v1/auth/sso/org-1/acs"},
+		{http.MethodGet, "/v1/auth/sso/org-1/metadata"},
+		{http.MethodPost, "/v1/auth/sso/exchange"},
 	}
 
 	for _, endpoint := range publicEndpoints {
-		t.Run(endpoint, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPost, endpoint, nil)
+		t.Run(endpoint.method+" "+endpoint.path, func(t *testing.T) {
+			req := httptest.NewRequest(endpoint.method, endpoint.path, nil)
 			resp, err := app.Test(req)
 			if err != nil {
 				t.Fatal(err)
@@ -150,7 +157,7 @@ func TestRouter_PublicAuthRoutes(t *testing.T) {
 
 			// Should reach backend (200), not be rejected by auth (401).
 			if resp.StatusCode == http.StatusUnauthorized {
-				t.Errorf("endpoint %s should be public", endpoint)
+				t.Errorf("endpoint %s %s should be public", endpoint.method, endpoint.path)
 			}
 		})
 	}

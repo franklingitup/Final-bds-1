@@ -64,6 +64,49 @@ func (h *Handler) Login(c *fiber.Ctx) error {
 	return c.JSON(pair)
 }
 
+func (h *Handler) StartSSOLogin(c *fiber.Ctx) error {
+	redirectURL, err := h.svc.StartSSOLogin(c.UserContext(), c.Params("orgSlug"))
+	if err != nil {
+		return err
+	}
+	return c.Redirect(redirectURL.String(), fiber.StatusFound)
+}
+
+func (h *Handler) SSOACS(c *fiber.Ctx) error {
+	redirectURL, err := h.svc.CompleteSSOLogin(
+		c.UserContext(),
+		c.Params("orgId"),
+		c.FormValue("SAMLResponse"),
+		c.FormValue("RelayState"),
+		h.requestMeta(c),
+	)
+	if err != nil {
+		return err
+	}
+	return c.Redirect(redirectURL.String(), fiber.StatusFound)
+}
+
+func (h *Handler) ExchangeSSOCode(c *fiber.Ctx) error {
+	req, err := parseBody[SSOExchangeRequest](c)
+	if err != nil {
+		return err
+	}
+	pair, err := h.svc.ExchangeSSOCode(c.UserContext(), req)
+	if err != nil {
+		return err
+	}
+	return c.JSON(pair)
+}
+
+func (h *Handler) SSOMetadata(c *fiber.Ctx) error {
+	metadata, err := h.svc.SSOMetadata(c.UserContext(), c.Params("orgId"))
+	if err != nil {
+		return err
+	}
+	c.Set(fiber.HeaderContentType, fiber.MIMEApplicationXMLCharsetUTF8)
+	return c.Send(metadata)
+}
+
 func (h *Handler) Refresh(c *fiber.Ctx) error {
 	req, err := parseBody[RefreshRequest](c)
 	if err != nil {

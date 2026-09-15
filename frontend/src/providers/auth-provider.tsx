@@ -17,7 +17,7 @@ interface AuthContextValue {
 
 const AuthContext = React.createContext<AuthContextValue | undefined>(undefined);
 
-const PUBLIC_PATHS = ["/login", "/signup", "/forgot-password", "/reset-password"];
+const PUBLIC_PATHS = ["/login", "/signup", "/forgot-password", "/reset-password", "/sso/callback"];
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const router = useRouter();

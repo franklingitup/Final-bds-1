@@ -32,17 +32,22 @@ type RequestMeta struct {
 // Deps are the AuthService dependencies. Stores are interfaces so the service
 // is unit-testable with in-memory fakes.
 type Deps struct {
-	Users           UserStore
-	Sessions        SessionStore
-	OneTimeTokens   OneTimeTokenStore
-	ServiceAccounts ServiceAccountStore
-	APITokens       APITokenStore
-	SSOConfigs      SSOConfigStore
-	SSOProviders    *SSOProviderManager
-	OrgMembers      authz.OrgMemberStore // For org membership authorization
-	Tx              Transactor
-	Tenant          TenantRunner
-	JWT             *JWTIssuer
+	Users            UserStore
+	Sessions         SessionStore
+	OneTimeTokens    OneTimeTokenStore
+	ServiceAccounts  ServiceAccountStore
+	APITokens        APITokenStore
+	SSOConfigs       SSOConfigStore
+	SSOProviders     *SSOProviderManager
+	SSOOrganizations SSOOrganizationStore
+	SSOMembers       SSOMemberStore
+	SSOHandoffs      SSOHandoffStore
+	SSOEncryptor     *SSOKeyEncryptor
+	SSORedirectURL   string
+	OrgMembers       authz.OrgMemberStore // For org membership authorization
+	Tx               Transactor
+	Tenant           TenantRunner
+	JWT              *JWTIssuer
 	// Outbox persists domain events in the same transaction as the state change
 	// that produced them; a relay publishes them to the broker.
 	Outbox events.Outbox
@@ -59,24 +64,29 @@ type Deps struct {
 
 // Service implements the auth domain logic.
 type Service struct {
-	users           UserStore
-	sessions        SessionStore
-	otps            OneTimeTokenStore
-	serviceAccounts ServiceAccountStore
-	apiTokens       APITokenStore
-	ssoConfigs      SSOConfigStore
-	ssoProviders    *SSOProviderManager
-	orgMembers      authz.OrgMemberStore
-	tx              Transactor
-	tenant          TenantRunner
-	jwt             *JWTIssuer
-	outbox          events.Outbox
-	authSvc         *authz.AuthorizationService
-	notifier        Notifier
-	revoker         TokenRevoker
-	cfg             config.AuthConfig
-	log             *slog.Logger
-	now             func() time.Time
+	users                UserStore
+	sessions             SessionStore
+	otps                 OneTimeTokenStore
+	serviceAccounts      ServiceAccountStore
+	apiTokens            APITokenStore
+	ssoConfigs           SSOConfigStore
+	ssoProviders         *SSOProviderManager
+	ssoOrganizations     SSOOrganizationStore
+	ssoMembers           SSOMemberStore
+	ssoHandoffs          SSOHandoffStore
+	ssoExchangeEncryptor *SSOKeyEncryptor
+	ssoRedirectURL       string
+	orgMembers           authz.OrgMemberStore
+	tx                   Transactor
+	tenant               TenantRunner
+	jwt                  *JWTIssuer
+	outbox               events.Outbox
+	authSvc              *authz.AuthorizationService
+	notifier             Notifier
+	revoker              TokenRevoker
+	cfg                  config.AuthConfig
+	log                  *slog.Logger
+	now                  func() time.Time
 }
 
 // NewService wires an AuthService from its dependencies.
@@ -95,24 +105,29 @@ func NewService(d Deps) *Service {
 	}
 
 	return &Service{
-		users:           d.Users,
-		sessions:        d.Sessions,
-		otps:            d.OneTimeTokens,
-		serviceAccounts: d.ServiceAccounts,
-		apiTokens:       d.APITokens,
-		ssoConfigs:      d.SSOConfigs,
-		ssoProviders:    d.SSOProviders,
-		orgMembers:      d.OrgMembers,
-		tx:              d.Tx,
-		tenant:          d.Tenant,
-		jwt:             d.JWT,
-		outbox:          d.Outbox,
-		authSvc:         authSvc,
-		notifier:        d.Notifier,
-		revoker:         d.Revoker,
-		cfg:             d.Auth,
-		log:             d.Logger,
-		now:             d.Now,
+		users:                d.Users,
+		sessions:             d.Sessions,
+		otps:                 d.OneTimeTokens,
+		serviceAccounts:      d.ServiceAccounts,
+		apiTokens:            d.APITokens,
+		ssoConfigs:           d.SSOConfigs,
+		ssoProviders:         d.SSOProviders,
+		ssoOrganizations:     d.SSOOrganizations,
+		ssoMembers:           d.SSOMembers,
+		ssoHandoffs:          d.SSOHandoffs,
+		ssoExchangeEncryptor: d.SSOEncryptor,
+		ssoRedirectURL:       d.SSORedirectURL,
+		orgMembers:           d.OrgMembers,
+		tx:                   d.Tx,
+		tenant:               d.Tenant,
+		jwt:                  d.JWT,
+		outbox:               d.Outbox,
+		authSvc:              authSvc,
+		notifier:             d.Notifier,
+		revoker:              d.Revoker,
+		cfg:                  d.Auth,
+		log:                  d.Logger,
+		now:                  d.Now,
 	}
 }
 

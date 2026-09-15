@@ -3,9 +3,13 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
+	"strings"
 
 	"github.com/gofiber/fiber/v2"
 
@@ -54,9 +58,28 @@ func main() {
 	orgMemberRepo := authz.NewOrgMemberRepo(db)
 	ssoConfigs := auth.NewSSOConfigStore(db)
 
-	ssoProviders, err := newSSOProviderManager(cfg, ssoConfigs, log)
+	ssoProviders, ssoKeyEncryptor, err := newSSOProviderManager(cfg, ssoConfigs, log)
 	if err != nil {
 		log.Error("init sso provider manager", "error", err)
+		os.Exit(1)
+	}
+	exchangeEncryptor := ssoKeyEncryptor
+	if exchangeEncryptor == nil {
+		ephemeralKey := make([]byte, 32)
+		if _, err := rand.Read(ephemeralKey); err != nil {
+			log.Error("generate local SSO handoff encryption key", "error", err)
+			os.Exit(1)
+		}
+		exchangeEncryptor, err = auth.NewSSOKeyEncryptorFromBytes(ephemeralKey)
+		if err != nil {
+			log.Error("init local SSO handoff encryption", "error", err)
+			os.Exit(1)
+		}
+		log.Warn("using an ephemeral SSO token-handoff encryption key; configure CERTIFICATE_ENCRYPTION_KEY for multi-replica operation")
+	}
+	ssoRedirectURL, err := ssoBrowserRedirectURL(log)
+	if err != nil {
+		log.Error("init SSO browser redirect", "error", err)
 		os.Exit(1)
 	}
 
@@ -69,21 +92,26 @@ func main() {
 	defer closeRevoker()
 
 	svc := auth.NewService(auth.Deps{
-		Users:           auth.NewUserStore(db),
-		Sessions:        auth.NewSessionStore(db),
-		OneTimeTokens:   auth.NewOneTimeTokenStore(db),
-		ServiceAccounts: auth.NewServiceAccountStore(db),
-		APITokens:       auth.NewAPITokenStore(db),
-		SSOConfigs:      ssoConfigs,
-		SSOProviders:    ssoProviders,
-		OrgMembers:      orgMemberRepo,
-		Tx:              db,
-		Tenant:          db,
-		JWT:             auth.NewJWTIssuer(cfg.Auth),
-		Outbox:          outbox,
-		Revoker:         revoker,
-		Auth:            cfg.Auth,
-		Logger:          log,
+		Users:            auth.NewUserStore(db),
+		Sessions:         auth.NewSessionStore(db),
+		OneTimeTokens:    auth.NewOneTimeTokenStore(db),
+		ServiceAccounts:  auth.NewServiceAccountStore(db),
+		APITokens:        auth.NewAPITokenStore(db),
+		SSOConfigs:       ssoConfigs,
+		SSOProviders:     ssoProviders,
+		SSOOrganizations: auth.NewSSOOrganizationStore(db),
+		SSOMembers:       auth.NewSSOMemberStore(db),
+		SSOHandoffs:      auth.NewSSOHandoffStore(db),
+		SSOEncryptor:     exchangeEncryptor,
+		SSORedirectURL:   ssoRedirectURL,
+		OrgMembers:       orgMemberRepo,
+		Tx:               db,
+		Tenant:           db,
+		JWT:              auth.NewJWTIssuer(cfg.Auth),
+		Outbox:           outbox,
+		Revoker:          revoker,
+		Auth:             cfg.Auth,
+		Logger:           log,
 	})
 	handler := auth.NewHandler(svc)
 
@@ -161,7 +189,7 @@ func newRevoker(ctx context.Context, cfg config.Config, log *slog.Logger) (auth.
 // PUBLIC_API_BASE_URL is the externally reachable API origin used for ACS and
 // SP metadata URLs. CERTIFICATE_ENCRYPTION_KEY (same as the domain service)
 // encrypts SP private keys at rest when set.
-func newSSOProviderManager(cfg config.Config, keys auth.SSOConfigStore, log *slog.Logger) (*auth.SSOProviderManager, error) {
+func newSSOProviderManager(cfg config.Config, keys auth.SSOConfigStore, log *slog.Logger) (*auth.SSOProviderManager, *auth.SSOKeyEncryptor, error) {
 	publicBase := os.Getenv("PUBLIC_API_BASE_URL")
 	if publicBase == "" {
 		publicBase = "http://localhost:8080"
@@ -173,19 +201,39 @@ func newSSOProviderManager(cfg config.Config, keys auth.SSOConfigStore, log *slo
 		var err error
 		encryptor, err = auth.NewSSOKeyEncryptor(key)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	} else if cfg.Environment == config.EnvProduction || cfg.Environment == config.EnvStaging {
-		return nil, errors.New("CERTIFICATE_ENCRYPTION_KEY is required outside local development for SAML SP keys")
+		return nil, nil, errors.New("CERTIFICATE_ENCRYPTION_KEY is required outside local development for SAML SP keys")
 	} else {
 		log.Warn("CERTIFICATE_ENCRYPTION_KEY is not set; SAML SP private keys will be stored unencrypted")
 	}
 
-	return auth.NewSSOProviderManager(auth.SSOProviderManagerOpts{
+	manager, err := auth.NewSSOProviderManager(auth.SSOProviderManagerOpts{
 		PublicBaseURL: publicBase,
 		Encryptor:     encryptor,
 		Keys:          keys,
 	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return manager, encryptor, nil
+}
+
+func ssoBrowserRedirectURL(log *slog.Logger) (string, error) {
+	publicWebBase := strings.TrimRight(strings.TrimSpace(os.Getenv("PUBLIC_WEB_BASE_URL")), "/")
+	if publicWebBase == "" {
+		publicWebBase = "http://localhost:3000"
+		log.Warn("PUBLIC_WEB_BASE_URL not set; defaulting SAML browser callback URL", "url", publicWebBase)
+	}
+	u, err := url.Parse(publicWebBase)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", fmt.Errorf("invalid PUBLIC_WEB_BASE_URL %q", publicWebBase)
+	}
+	u.Path = strings.TrimRight(u.Path, "/") + "/sso/callback"
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String(), nil
 }
 
 // newPublisher returns an event publisher and a cleanup function. When NATS is

@@ -9,6 +9,11 @@ interface SignupResponse extends AuthTokens {
   user: User;
 }
 
+interface SSOExchangeRequest {
+  orgId: string;
+  code: string;
+}
+
 export const authApi = {
   async login(data: LoginRequest): Promise<LoginResponse> {
     const response = await apiClient.post<LoginResponse>("/v1/auth/login", data);
@@ -18,6 +23,12 @@ export const authApi = {
 
   async signup(data: SignupRequest): Promise<SignupResponse> {
     const response = await apiClient.post<SignupResponse>("/v1/auth/signup", data);
+    apiClient.setTokens(response.accessToken, response.refreshToken);
+    return response;
+  },
+
+  async exchangeSSO(data: SSOExchangeRequest): Promise<LoginResponse> {
+    const response = await apiClient.post<LoginResponse>("/v1/auth/sso/exchange", data);
     apiClient.setTokens(response.accessToken, response.refreshToken);
     return response;
   },

@@ -12,6 +12,10 @@ func RegisterRoutes(app *fiber.App, h *Handler) {
 	// Public endpoints.
 	auth.Post("/signup", h.Signup)
 	auth.Post("/login", h.Login)
+	auth.Get("/sso/:orgSlug/login", h.StartSSOLogin)
+	auth.Post("/sso/:orgId/acs", h.SSOACS)
+	auth.Get("/sso/:orgId/metadata", h.SSOMetadata)
+	auth.Post("/sso/exchange", h.ExchangeSSOCode)
 	auth.Post("/refresh", h.Refresh)
 	auth.Post("/verify-email", h.VerifyEmail)
 	auth.Post("/resend-verification", h.ResendVerification)
