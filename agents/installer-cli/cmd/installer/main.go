@@ -33,5 +33,5 @@ func run(ctx context.Context) error {
 
 	fmt.Println("BDS Platform cluster installer")
 	installer := agent.NewInstaller(agent.NewClient(baseURL, 30*time.Second))
-	return installer.RunTerraform(ctx, token)
+	return installer.Run(ctx, token)
 }

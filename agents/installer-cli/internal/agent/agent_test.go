@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 type recordedUpdate struct {
@@ -35,6 +36,9 @@ func newInstallerTestServer(t *testing.T, bundle SessionBundle) *installerTestSe
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/sessions/token/bundle":
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(bundle)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/bootstrap/bootstrap/manifest.yaml":
+			w.Header().Set("Content-Type", "application/x-yaml")
+			_, _ = io.WriteString(w, "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: bds-platform\n")
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/sessions/token/steps/"):
 			var step int
 			if _, err := fmtSscanfStep(r.URL.Path, &step); err != nil {
@@ -80,7 +84,11 @@ type fakeRunner struct {
 func (r *fakeRunner) Run(_ context.Context, _ string, name string, args []string, _ io.Reader, stdout, stderr io.Writer) error {
 	command := filepath.Base(name) + " " + strings.Join(args, " ")
 	r.commands = append(r.commands, command)
-	_, _ = io.WriteString(stdout, "output for "+command)
+	if strings.Contains(command, "output -raw kubeconfig_command") {
+		_, _ = io.WriteString(stdout, "aws eks update-kubeconfig --region us-east-1 --name demo")
+	} else {
+		_, _ = io.WriteString(stdout, "output for "+command)
+	}
 	if r.failAt != "" && strings.HasPrefix(command, r.failAt) {
 		_, _ = io.WriteString(stderr, "\napply error")
 		return errors.New("exit status 1")
@@ -225,5 +233,72 @@ func TestTerraformInitIsSafeForExistingWorkingDirectory(t *testing.T) {
 	}
 	if !strings.HasPrefix(runner.commands[0], "tofu init ") {
 		t.Fatalf("first command = %q", runner.commands[0])
+	}
+}
+
+func TestRunCompletesClusterSetupAndAgentConnection(t *testing.T) {
+	bundle := testBundle()
+	bundle.AgentConnected = true
+	version := "1.2.3"
+	bundle.AgentVersion = &version
+	server := newInstallerTestServer(t, bundle)
+	runner := &fakeRunner{}
+	installer := NewInstaller(server.client())
+	installer.Runner = runner
+	installer.LookPath = allToolsPresent
+	installer.WorkingRoot = t.TempDir()
+	installer.Stdout = io.Discard
+	installer.Stderr = io.Discard
+	installer.PollInterval = time.Millisecond
+	installer.PollTimeout = time.Second
+
+	if err := installer.Run(context.Background(), "token"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(runner.commands) != 6 {
+		t.Fatalf("commands = %v, want Terraform 1-4, kubeconfig, kubectl", runner.commands)
+	}
+	if !strings.Contains(runner.commands[3], "output -raw kubeconfig_command") {
+		t.Fatalf("step 4 command = %q", runner.commands[3])
+	}
+	if !strings.Contains(runner.commands[4], "aws eks update-kubeconfig") {
+		t.Fatalf("step 5 command = %q", runner.commands[4])
+	}
+	if runner.commands[5] != "kubectl apply -f -" {
+		t.Fatalf("step 6 command = %q", runner.commands[5])
+	}
+
+	completed := map[int]bool{}
+	for _, update := range server.snapshot() {
+		if update.Update.Status == "completed" {
+			completed[update.Step] = true
+		}
+	}
+	for step := 1; step <= 8; step++ {
+		if !completed[step] {
+			t.Fatalf("step %d was not reported completed", step)
+		}
+	}
+}
+
+func TestRunAgentConnectionTimeoutReportsStepSevenFailed(t *testing.T) {
+	server := newInstallerTestServer(t, testBundle())
+	installer := NewInstaller(server.client())
+	installer.Runner = &fakeRunner{}
+	installer.LookPath = allToolsPresent
+	installer.WorkingRoot = t.TempDir()
+	installer.Stdout = io.Discard
+	installer.Stderr = io.Discard
+	installer.PollInterval = time.Millisecond
+	installer.PollTimeout = 5 * time.Millisecond
+
+	err := installer.Run(context.Background(), "token")
+	if err == nil || !strings.Contains(err.Error(), "step 7 failed") {
+		t.Fatalf("expected step 7 timeout, got %v", err)
+	}
+	updates := server.snapshot()
+	last := updates[len(updates)-1]
+	if last.Step != 7 || last.Update.Status != "failed" {
+		t.Fatalf("last update = %+v, want step 7 failed", last)
 	}
 }

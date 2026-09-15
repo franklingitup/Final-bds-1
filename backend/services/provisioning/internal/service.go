@@ -632,12 +632,10 @@ func (s *Service) UpdateStep(ctx context.Context, sessionToken string, stepNumbe
 	var step *InstallSessionStep
 
 	// Find session by token (no auth required - token is auth)
-	sessions, err := database.QueryAll[InstallSession](ctx, nil,
-		"SELECT * FROM install_sessions WHERE session_token = $1", sessionToken)
-	if err != nil || len(sessions) == 0 {
+	session, err := s.sessions.GetByToken(ctx, sessionToken)
+	if err != nil || time.Now().After(session.ExpiresAt) {
 		return nil, apperrors.NotFound("session not found")
 	}
-	session = &sessions[0]
 
 	if session.Status != SessionActive {
 		return nil, apperrors.Validation("session is not active")
@@ -663,6 +661,7 @@ func (s *Service) UpdateStep(ctx context.Context, sessionToken string, stepNumbe
 
 		// Update step
 		now := time.Now()
+		previousStatus := step.Status
 		step.Status = req.Status
 		step.Output = req.Output
 		step.Error = req.Error
@@ -683,7 +682,7 @@ func (s *Service) UpdateStep(ctx context.Context, sessionToken string, stepNumbe
 		}
 
 		// Update session progress
-		if req.Status == StepCompleted {
+		if req.Status == StepCompleted && previousStatus != StepCompleted {
 			session.CompletedSteps++
 			session.CurrentStep = step.Name
 		}

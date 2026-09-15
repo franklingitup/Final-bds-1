@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -70,6 +71,27 @@ func (c *Client) GetBundle(ctx context.Context, sessionToken string) (*SessionBu
 		return nil, err
 	}
 	return &bundle, nil
+}
+
+func (c *Client) GetBootstrapManifest(ctx context.Context, bootstrapToken string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		c.baseURL+"/v1/bootstrap/"+bootstrapToken+"/manifest.yaml", nil)
+	if err != nil {
+		return nil, fmt.Errorf("create manifest request: %w", err)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch bootstrap manifest: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, responseError(resp)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read bootstrap manifest: %w", err)
+	}
+	return body, nil
 }
 
 func (c *Client) UpdateStep(ctx context.Context, sessionToken string, step int, update UpdateStepRequest) error {
@@ -152,6 +174,8 @@ type Installer struct {
 	Stdout       io.Writer
 	Stderr       io.Writer
 	WorkingRoot  string
+	PollInterval time.Duration
+	PollTimeout  time.Duration
 	sessionToken string
 	bundle       *SessionBundle
 	terraformBin string
@@ -159,13 +183,23 @@ type Installer struct {
 
 func NewInstaller(client *Client) *Installer {
 	return &Installer{
-		Client:      client,
-		Runner:      ExecRunner{},
-		LookPath:    exec.LookPath,
-		Stdout:      os.Stdout,
-		Stderr:      os.Stderr,
-		WorkingRoot: ".bds-install",
+		Client:       client,
+		Runner:       ExecRunner{},
+		LookPath:     exec.LookPath,
+		Stdout:       os.Stdout,
+		Stderr:       os.Stderr,
+		WorkingRoot:  ".bds-install",
+		PollInterval: 10 * time.Second,
+		PollTimeout:  10 * time.Minute,
 	}
+}
+
+// Run performs all eight installation steps.
+func (i *Installer) Run(ctx context.Context, sessionToken string) error {
+	if err := i.RunTerraform(ctx, sessionToken); err != nil {
+		return err
+	}
+	return i.runClusterSetup(ctx)
 }
 
 // RunTerraform performs installer steps 1-3.
@@ -257,6 +291,11 @@ func (i *Installer) writeTerraformFiles(bundle *SessionBundle) (string, error) {
 }
 
 func (i *Installer) runStep(ctx context.Context, step int, dir, command string, args []string, stdin io.Reader) error {
+	_, err := i.runCapturedStep(ctx, step, dir, command, args, stdin)
+	return err
+}
+
+func (i *Installer) runCapturedStep(ctx context.Context, step int, dir, command string, args []string, stdin io.Reader) (string, error) {
 	_ = i.Client.UpdateStep(ctx, i.sessionToken, step, UpdateStepRequest{Status: "running"})
 
 	var captured bytes.Buffer
@@ -271,17 +310,104 @@ func (i *Installer) runStep(ctx context.Context, step int, dir, command string, 
 			Output: stringPtr(output),
 			Error:  &errText,
 		}); reportErr != nil {
-			return fmt.Errorf("step %d failed: %w (also failed to report: %v)", step, err, reportErr)
+			return output, fmt.Errorf("step %d failed: %w (also failed to report: %v)", step, err, reportErr)
 		}
-		return fmt.Errorf("step %d failed: %w", step, err)
+		return output, fmt.Errorf("step %d failed: %w", step, err)
 	}
 	if err := i.Client.UpdateStep(ctx, i.sessionToken, step, UpdateStepRequest{
 		Status: "completed",
 		Output: stringPtr(output),
 	}); err != nil {
-		return fmt.Errorf("report step %d completion: %w", step, err)
+		return output, fmt.Errorf("report step %d completion: %w", step, err)
 	}
-	return nil
+	return output, nil
+}
+
+func (i *Installer) runClusterSetup(ctx context.Context) error {
+	workDir := filepath.Join(i.WorkingRoot, i.bundle.SessionID)
+
+	// Terraform only emits this output after the cloud control plane exists, so
+	// its availability is the simplest provider-neutral readiness signal.
+	kubeconfigCommand, err := i.runCapturedStep(ctx, 4, workDir, i.terraformBin,
+		[]string{"output", "-raw", "kubeconfig_command"}, nil)
+	if err != nil {
+		return err
+	}
+	kubeconfigCommand = strings.TrimSpace(kubeconfigCommand)
+	if kubeconfigCommand == "" {
+		return i.reportStandaloneFailure(ctx, 5, errors.New("terraform output kubeconfig_command is empty"))
+	}
+
+	shell, shellArgs := shellCommand(kubeconfigCommand)
+	if err := i.runStep(ctx, 5, workDir, shell, shellArgs, nil); err != nil {
+		return err
+	}
+
+	manifest, err := i.Client.GetBootstrapManifest(ctx, i.bundle.BootstrapToken)
+	if err != nil {
+		return i.reportStandaloneFailure(ctx, 6, fmt.Errorf("fetch bootstrap manifest: %w", err))
+	}
+	if err := i.runStep(ctx, 6, workDir, "kubectl", []string{"apply", "-f", "-"}, bytes.NewReader(manifest)); err != nil {
+		return err
+	}
+
+	return i.waitForAgent(ctx)
+}
+
+func (i *Installer) waitForAgent(ctx context.Context) error {
+	_ = i.Client.UpdateStep(ctx, i.sessionToken, 7, UpdateStepRequest{Status: "running"})
+	pollCtx, cancel := context.WithTimeout(ctx, i.PollTimeout)
+	defer cancel()
+	ticker := time.NewTicker(i.PollInterval)
+	defer ticker.Stop()
+
+	for {
+		bundle, err := i.Client.GetBundle(pollCtx, i.sessionToken)
+		if err == nil && bundle.AgentConnected {
+			message := "platform agent registered"
+			if bundle.AgentVersion != nil {
+				message += " (version " + *bundle.AgentVersion + ")"
+			}
+			if err := i.Client.UpdateStep(ctx, i.sessionToken, 7, UpdateStepRequest{
+				Status: "completed", Output: &message,
+			}); err != nil {
+				return fmt.Errorf("report agent registration: %w", err)
+			}
+			_ = i.Client.UpdateStep(ctx, i.sessionToken, 8, UpdateStepRequest{Status: "running"})
+			if err := i.Client.UpdateStep(ctx, i.sessionToken, 8, UpdateStepRequest{
+				Status: "completed", Output: &message,
+			}); err != nil {
+				return fmt.Errorf("report connection verification: %w", err)
+			}
+			fmt.Fprintln(i.Stdout, "Cluster is ready and the BDS Platform agent is connected.")
+			return nil
+		}
+
+		select {
+		case <-pollCtx.Done():
+			return i.reportStandaloneFailure(ctx, 7,
+				fmt.Errorf("timed out after %s waiting for the platform agent to connect", i.PollTimeout))
+		case <-ticker.C:
+		}
+	}
+}
+
+func (i *Installer) reportStandaloneFailure(ctx context.Context, step int, stepErr error) error {
+	errText := stepErr.Error()
+	if err := i.Client.UpdateStep(ctx, i.sessionToken, step, UpdateStepRequest{
+		Status: "failed",
+		Error:  &errText,
+	}); err != nil {
+		return fmt.Errorf("step %d failed: %w (also failed to report: %v)", step, stepErr, err)
+	}
+	return fmt.Errorf("step %d failed: %w", step, stepErr)
+}
+
+func shellCommand(command string) (string, []string) {
+	if runtime.GOOS == "windows" {
+		return "cmd", []string{"/C", command}
+	}
+	return "sh", []string{"-c", command}
 }
 
 func truncateOutput(output string) string {
