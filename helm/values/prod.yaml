@@ -1,5 +1,5 @@
 # Environment overrides for prod.
-api-gateway:
+gateway:
   replicaCount: 3
   autoscaling:
     enabled: true

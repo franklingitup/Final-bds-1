@@ -612,7 +612,7 @@ Complexity scale:
 
 #### Task 8.1.1 — Create Agent Project Skeleton
 
-- **Description:** Create `agents/cluster-agent` with controller runtime structure, config loading, logging, and health endpoints.
+- **Description:** Create `agents/platform-agent` with controller runtime structure, config loading, logging, and health endpoints.
 - **Dependencies:** Task 1.1.1.
 - **Acceptance Criteria:**
   - Agent starts locally with config.

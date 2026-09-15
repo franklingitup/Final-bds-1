@@ -161,7 +161,7 @@ platform/
 - **infra/** — `environments/{dev,staging,prod}`, `gitops/` (ArgoCD/Flux), `platform-services/` (broker, postgres operator, redis, loki, prometheus), `ci/`.
 - **helm/** — `control-plane/` umbrella chart, `charts/<service>`, `agent/` chart for customer clusters, `values/<env>.yaml`.
 - **terraform/** — `modules/{eks,gke,aks,networking,agent-bootstrap}`, `templates/` rendered by Provisioning, `examples/`.
-- **agents/** — `cluster-agent/` reconciler + controllers, `crds/`, `installer-cli/` binary the generated command runs, `manifests/`.
+- **agents/** — `platform-agent/` reconciler + controllers, `crds/`, `installer-cli/` binary the generated command runs, `manifests/`.
 - **docs/** — `architecture/`, `adr/`, `api/`, `runbooks/`, `onboarding/`.
 - **scripts/** — `dev/` local stack up/down, `codegen/`, `db/`, `release/`.
 - **proto/** — shared schema definitions for inter-service contracts and event payloads.

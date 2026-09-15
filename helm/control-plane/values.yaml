@@ -7,10 +7,10 @@ _defaults: &defaults
   serviceMonitor:
     enabled: true
 
-api-gateway:
+gateway:
   <<: *defaults
   image:
-    repository: ghcr.io/bdsplatform/platform/api-gateway
+    repository: ghcr.io/bdsplatform/platform/gateway
   replicaCount: 3
   autoscaling:
     enabled: true

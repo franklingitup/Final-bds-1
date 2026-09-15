@@ -3,7 +3,7 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := build
 
-SERVICES := api-gateway auth tenant cluster provisioning deployment build secrets domain observability notification audit
+SERVICES := gateway auth tenant cluster provisioning deployment build secrets domain observability notification audit
 BIN_DIR := ../bin
 
 .PHONY: build

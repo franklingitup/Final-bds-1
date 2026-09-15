@@ -1,8 +1,7 @@
 go 1.24
 
 use (
-	./backend
-	./agents/cluster-agent
 	./agents/installer-cli
 	./agents/platform-agent
+	./backend
 )

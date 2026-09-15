@@ -4,7 +4,7 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
-SERVICES := api-gateway auth tenant cluster provisioning deployment build secrets domain observability notification audit
+SERVICES := gateway auth tenant cluster provisioning deployment build secrets domain observability notification audit
 
 .PHONY: help
 help: ## Show this help
