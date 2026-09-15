@@ -34,10 +34,10 @@ jobs:
           go-version-file: backend/go.mod
       - name: Agent unit tests
         working-directory: agents/platform-agent
-        run: go test ./...
+        run: go test ./... -race
       - name: Cluster service unit tests
         working-directory: backend
-        run: go test ./services/cluster/...
+        run: go test ./services/cluster/... -race
       - name: Load generator builds + vets
         working-directory: test/load
         run: |
@@ -78,6 +78,9 @@ jobs:
         with:
           cluster_name: agent-e2e
       - uses: azure/setup-helm@v4
+      - name: Platform-agent integration tests (kind)
+        working-directory: agents/platform-agent
+        run: go test ./... -tags=integration -race -v
       - name: Bring up control plane
         run: docker compose up -d --wait
       - name: Provision admin token + org

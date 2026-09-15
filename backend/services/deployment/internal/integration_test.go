@@ -28,7 +28,7 @@ func testDB(t *testing.T) *database.DB {
 	}
 
 	cfg := config.Config{}
-	cfg.Database.DSN = dsn
+	cfg.Database.URL = dsn
 
 	ctx := context.Background()
 	db, err := database.Connect(ctx, cfg)

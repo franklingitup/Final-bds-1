@@ -20,7 +20,7 @@ run-%: ## Run a single service, e.g. `make run-auth`
 
 .PHONY: test
 test: ## Run all tests
-	go test ./...
+	go test ./... -race
 
 .PHONY: lint
 lint: ## Run golangci-lint
