@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -81,7 +82,7 @@ func (c *Client) GetBootstrapManifest(ctx context.Context, bootstrapToken string
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetch bootstrap manifest: %w", err)
+		return nil, fmt.Errorf("fetch bootstrap manifest: %s", sanitizeHTTPError(err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -108,7 +109,7 @@ func (c *Client) UpdateStep(ctx context.Context, sessionToken string, step int, 
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("send step update: %w", err)
+		return fmt.Errorf("send step update: %s", sanitizeHTTPError(err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -124,7 +125,7 @@ func (c *Client) getJSON(ctx context.Context, path string, dst any) error {
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("request %s: %w", path, err)
+		return fmt.Errorf("control plane request failed: %s", sanitizeHTTPError(err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -134,6 +135,14 @@ func (c *Client) getJSON(ctx context.Context, path string, dst any) error {
 		return fmt.Errorf("decode response: %w", err)
 	}
 	return nil
+}
+
+func sanitizeHTTPError(err error) string {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		return urlErr.Err.Error()
+	}
+	return err.Error()
 }
 
 func responseError(resp *http.Response) error {
@@ -196,6 +205,13 @@ func NewInstaller(client *Client) *Installer {
 
 // Run performs all eight installation steps.
 func (i *Installer) Run(ctx context.Context, sessionToken string) error {
+	if err := i.loadBundle(ctx, sessionToken); err != nil {
+		return err
+	}
+	if i.installAlreadyComplete() {
+		fmt.Fprintln(i.Stdout, "Cluster is ready and the BDS Platform agent is connected.")
+		return nil
+	}
 	if err := i.RunTerraform(ctx, sessionToken); err != nil {
 		return err
 	}
@@ -203,21 +219,27 @@ func (i *Installer) Run(ctx context.Context, sessionToken string) error {
 }
 
 // RunTerraform performs installer steps 1-3.
-func (i *Installer) RunTerraform(ctx context.Context, sessionToken string) error {
+func (i *Installer) loadBundle(ctx context.Context, sessionToken string) error {
 	if strings.TrimSpace(sessionToken) == "" {
 		return errors.New("PLATFORM_INSTALL_TOKEN is required")
 	}
 	i.sessionToken = sessionToken
-
 	bundle, err := i.Client.GetBundle(ctx, sessionToken)
 	if err != nil {
 		return fmt.Errorf("fetch installer bundle: %w", err)
 	}
 	i.bundle = bundle
-	if err := i.checkPrerequisites(bundle.Provider); err != nil {
+	if i.terraformBin != "" {
+		return nil
+	}
+	return i.checkPrerequisites(bundle.Provider)
+}
+
+func (i *Installer) RunTerraform(ctx context.Context, sessionToken string) error {
+	if err := i.loadBundle(ctx, sessionToken); err != nil {
 		return err
 	}
-	workDir, err := i.writeTerraformFiles(bundle)
+	workDir, err := i.writeTerraformFiles(i.bundle)
 	if err != nil {
 		return err
 	}
@@ -231,6 +253,9 @@ func (i *Installer) RunTerraform(ctx context.Context, sessionToken string) error
 	}
 	if err := i.runStep(ctx, 3, workDir, i.terraformBin,
 		[]string{"apply", "-input=false", "-auto-approve", "tfplan"}, nil); err != nil {
+		return err
+	}
+	if err := restrictDirContents(workDir); err != nil {
 		return err
 	}
 	return nil
@@ -268,8 +293,11 @@ func (i *Installer) writeTerraformFiles(bundle *SessionBundle) (string, error) {
 		return "", errors.New("installer bundle is missing sessionId")
 	}
 	dir := filepath.Join(i.WorkingRoot, bundle.SessionID)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", fmt.Errorf("create installer working directory: %w", err)
+	if err := ensurePrivateDir(i.WorkingRoot); err != nil {
+		return "", err
+	}
+	if err := ensurePrivateDir(dir); err != nil {
+		return "", err
 	}
 
 	// GenerateTerraform stores Terraform's concatenated main/variables/outputs
@@ -283,8 +311,12 @@ func (i *Installer) writeTerraformFiles(bundle *SessionBundle) (string, error) {
 		"terraform.tfvars.json": bundle.TerraformVars,
 	}
 	for name, content := range files {
-		if err := os.WriteFile(filepath.Join(dir, name), content, 0o600); err != nil {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, content, 0o600); err != nil {
 			return "", fmt.Errorf("write %s: %w", name, err)
+		}
+		if err := os.Chmod(path, 0o600); err != nil {
+			return "", fmt.Errorf("restrict %s: %w", name, err)
 		}
 	}
 	return dir, nil
@@ -296,6 +328,9 @@ func (i *Installer) runStep(ctx context.Context, step int, dir, command string, 
 }
 
 func (i *Installer) runCapturedStep(ctx context.Context, step int, dir, command string, args []string, stdin io.Reader) (string, error) {
+	if i.stepCompleted(step) {
+		return "", nil
+	}
 	_ = i.Client.UpdateStep(ctx, i.sessionToken, step, UpdateStepRequest{Status: "running"})
 
 	var captured bytes.Buffer
@@ -324,6 +359,9 @@ func (i *Installer) runCapturedStep(ctx context.Context, step int, dir, command 
 }
 
 func (i *Installer) runClusterSetup(ctx context.Context) error {
+	if i.stepCompleted(6) {
+		return i.waitForAgent(ctx)
+	}
 	workDir := filepath.Join(i.WorkingRoot, i.bundle.SessionID)
 
 	// Terraform only emits this output after the cloud control plane exists, so
@@ -355,6 +393,10 @@ func (i *Installer) runClusterSetup(ctx context.Context) error {
 }
 
 func (i *Installer) waitForAgent(ctx context.Context) error {
+	if i.stepCompleted(7) && i.stepCompleted(8) {
+		fmt.Fprintln(i.Stdout, "Cluster is ready and the BDS Platform agent is connected.")
+		return nil
+	}
 	_ = i.Client.UpdateStep(ctx, i.sessionToken, 7, UpdateStepRequest{Status: "running"})
 	pollCtx, cancel := context.WithTimeout(ctx, i.PollTimeout)
 	defer cancel()
@@ -408,6 +450,66 @@ func shellCommand(command string) (string, []string) {
 		return "cmd", []string{"/C", command}
 	}
 	return "sh", []string{"-c", command}
+}
+
+func (i *Installer) installAlreadyComplete() bool {
+	if i.bundle == nil {
+		return false
+	}
+	if i.bundle.Status == "completed" {
+		return true
+	}
+	for step := 1; step <= 8; step++ {
+		if !i.stepCompleted(step) {
+			return false
+		}
+	}
+	return true
+}
+
+func (i *Installer) stepCompleted(step int) bool {
+	if i.bundle == nil {
+		return false
+	}
+	for _, info := range i.bundle.Steps {
+		if info.Number == step {
+			return info.Status == "completed"
+		}
+	}
+	return false
+}
+
+func ensurePrivateDir(path string) error {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return fmt.Errorf("create installer working directory: %w", err)
+	}
+	if err := os.Chmod(path, 0o700); err != nil {
+		return fmt.Errorf("restrict installer working directory: %w", err)
+	}
+	return nil
+}
+
+func restrictDirContents(dir string) error {
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("restrict installer working directory: %w", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		path := filepath.Join(dir, entry.Name())
+		if entry.IsDir() {
+			if err := restrictDirContents(path); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := os.Chmod(path, 0o600); err != nil {
+			return fmt.Errorf("restrict %s: %w", entry.Name(), err)
+		}
+	}
+	return nil
 }
 
 func truncateOutput(output string) string {

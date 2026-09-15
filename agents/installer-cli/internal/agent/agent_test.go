@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -26,16 +27,20 @@ type installerTestServer struct {
 	server  *httptest.Server
 	mu      sync.Mutex
 	updates []recordedUpdate
+	bundle  SessionBundle
 }
 
 func newInstallerTestServer(t *testing.T, bundle SessionBundle) *installerTestServer {
 	t.Helper()
-	h := &installerTestServer{}
+	h := &installerTestServer{bundle: bundle}
 	h.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/sessions/token/bundle":
+			h.mu.Lock()
+			current := h.bundle
+			h.mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(bundle)
+			_ = json.NewEncoder(w).Encode(current)
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/bootstrap/bootstrap/manifest.yaml":
 			w.Header().Set("Content-Type", "application/x-yaml")
 			_, _ = io.WriteString(w, "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: bds-platform\n")
@@ -51,7 +56,41 @@ func newInstallerTestServer(t *testing.T, bundle SessionBundle) *installerTestSe
 				return
 			}
 			h.mu.Lock()
+			if h.bundle.Status == "completed" {
+				h.mu.Unlock()
+				http.Error(w, `{"error":"session is not active"}`, http.StatusBadRequest)
+				return
+			}
 			h.updates = append(h.updates, recordedUpdate{Step: step, Update: update})
+			found := false
+			for i := range h.bundle.Steps {
+				if h.bundle.Steps[i].Number == step {
+					h.bundle.Steps[i].Status = update.Status
+					found = true
+					break
+				}
+			}
+			if !found {
+				h.bundle.Steps = append(h.bundle.Steps, StepInfo{Number: step, Status: update.Status})
+			}
+			if update.Status == "completed" {
+				complete := map[int]bool{}
+				for _, info := range h.bundle.Steps {
+					if info.Status == "completed" {
+						complete[info.Number] = true
+					}
+				}
+				allDone := true
+				for n := 1; n <= 8; n++ {
+					if !complete[n] {
+						allDone = false
+						break
+					}
+				}
+				if allDone {
+					h.bundle.Status = "completed"
+				}
+			}
 			h.mu.Unlock()
 			w.WriteHeader(http.StatusOK)
 		default:
@@ -81,9 +120,14 @@ type fakeRunner struct {
 	failAt   string
 }
 
-func (r *fakeRunner) Run(_ context.Context, _ string, name string, args []string, _ io.Reader, stdout, stderr io.Writer) error {
+func (r *fakeRunner) Run(_ context.Context, dir string, name string, args []string, _ io.Reader, stdout, stderr io.Writer) error {
 	command := filepath.Base(name) + " " + strings.Join(args, " ")
 	r.commands = append(r.commands, command)
+	if strings.Contains(command, "apply") {
+		// tofu apply typically creates terraform.tfstate with the process umask
+		// (often 0644). The installer must tighten that after apply.
+		_ = os.WriteFile(filepath.Join(dir, "terraform.tfstate"), []byte(`{"version":4,"serial":1}`), 0o644)
+	}
 	if strings.Contains(command, "output -raw kubeconfig_command") {
 		_, _ = io.WriteString(stdout, "aws eks update-kubeconfig --region us-east-1 --name demo")
 	} else {
@@ -279,6 +323,26 @@ func TestRunCompletesClusterSetupAndAgentConnection(t *testing.T) {
 			t.Fatalf("step %d was not reported completed", step)
 		}
 	}
+
+	secondRunner := &fakeRunner{}
+	second := NewInstaller(server.client())
+	second.Runner = secondRunner
+	second.LookPath = allToolsPresent
+	second.WorkingRoot = installer.WorkingRoot
+	second.Stdout = io.Discard
+	second.Stderr = io.Discard
+	second.PollInterval = time.Millisecond
+	second.PollTimeout = time.Second
+	updatesAfterFirst := len(server.snapshot())
+	if err := second.Run(context.Background(), "token"); err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	if len(secondRunner.commands) != 0 {
+		t.Fatalf("second Run re-executed commands %v", secondRunner.commands)
+	}
+	if got := len(server.snapshot()); got != updatesAfterFirst {
+		t.Fatalf("second Run posted additional step updates (%d -> %d); completed sessions reject UpdateStep", updatesAfterFirst, got)
+	}
 }
 
 func TestRunAgentConnectionTimeoutReportsStepSevenFailed(t *testing.T) {
@@ -300,5 +364,184 @@ func TestRunAgentConnectionTimeoutReportsStepSevenFailed(t *testing.T) {
 	last := updates[len(updates)-1]
 	if last.Step != 7 || last.Update.Status != "failed" {
 		t.Fatalf("last update = %+v, want step 7 failed", last)
+	}
+}
+
+func TestWorkingDirectoryPermissionsAreOwnerOnly(t *testing.T) {
+	server := newInstallerTestServer(t, testBundle())
+	installer := NewInstaller(server.client())
+	installer.Runner = &fakeRunner{}
+	installer.LookPath = allToolsPresent
+	installer.WorkingRoot = t.TempDir()
+	installer.Stdout = io.Discard
+	installer.Stderr = io.Discard
+
+	if err := installer.RunTerraform(context.Background(), "token"); err != nil {
+		t.Fatalf("RunTerraform: %v", err)
+	}
+
+	sessionDir := filepath.Join(installer.WorkingRoot, "session-1")
+	assertOwnerOnlyDir(t, installer.WorkingRoot)
+	assertOwnerOnlyDir(t, sessionDir)
+	for _, name := range []string{"main.tf", "variables.tf", "outputs.tf", "terraform.tfvars.json", "terraform.tfstate"} {
+		assertOwnerOnlyFile(t, filepath.Join(sessionDir, name))
+	}
+}
+
+func TestTerraformResumeReconcilesExistingState(t *testing.T) {
+	server := newInstallerTestServer(t, testBundle())
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "session-1")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "terraform.tfstate"), []byte(`{"version":4,"serial":1}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	wantCommands := []string{
+		"tofu init -input=false",
+		"tofu plan -input=false -out=tfplan",
+		"tofu apply -input=false -auto-approve tfplan",
+	}
+
+	first := &fakeRunner{}
+	installer := NewInstaller(server.client())
+	installer.Runner = first
+	installer.LookPath = allToolsPresent
+	installer.WorkingRoot = root
+	installer.Stdout = io.Discard
+	installer.Stderr = io.Discard
+	if err := installer.RunTerraform(context.Background(), "token"); err != nil {
+		t.Fatalf("first RunTerraform: %v", err)
+	}
+	if !reflect.DeepEqual(first.commands, wantCommands) {
+		t.Fatalf("first commands = %#v", first.commands)
+	}
+
+	second := &fakeRunner{}
+	// Simulate a crash after apply wrote terraform.tfstate but before the
+	// control plane recorded steps 1-3 as completed: same working directory,
+	// session token, and a bundle that still lists those steps as pending.
+	resumeServer := newInstallerTestServer(t, testBundle())
+	resume := NewInstaller(resumeServer.client())
+	resume.Runner = second
+	resume.LookPath = allToolsPresent
+	resume.WorkingRoot = root
+	resume.Stdout = io.Discard
+	resume.Stderr = io.Discard
+	if err := resume.RunTerraform(context.Background(), "token"); err != nil {
+		t.Fatalf("resume RunTerraform: %v", err)
+	}
+	if !reflect.DeepEqual(second.commands, wantCommands) {
+		t.Fatalf("resume commands = %#v, want init/plan/apply reconciliation", second.commands)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "terraform.tfstate")); err != nil {
+		t.Fatalf("terraform.tfstate missing after resume: %v", err)
+	}
+}
+
+func TestRunSkipsCompletedStepsOnRerun(t *testing.T) {
+	bundle := testBundle()
+	bundle.Status = "completed"
+	bundle.AgentConnected = true
+	bundle.Steps = completedSteps(8)
+	server := newInstallerTestServer(t, bundle)
+	runner := &fakeRunner{}
+	var stdout strings.Builder
+	installer := NewInstaller(server.client())
+	installer.Runner = runner
+	installer.LookPath = allToolsPresent
+	installer.WorkingRoot = t.TempDir()
+	installer.Stdout = &stdout
+	installer.Stderr = io.Discard
+
+	if err := installer.Run(context.Background(), "token"); err != nil {
+		t.Fatalf("Run completed session: %v", err)
+	}
+	if len(runner.commands) != 0 {
+		t.Fatalf("completed re-run executed commands %v", runner.commands)
+	}
+	if updates := server.snapshot(); len(updates) != 0 {
+		t.Fatalf("completed re-run posted %d step updates; installer must skip completed steps (server UpdateStep rejects inactive sessions)", len(updates))
+	}
+	if !strings.Contains(stdout.String(), "Cluster is ready") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "token") || strings.Contains(stdout.String(), "bootstrap") {
+		t.Fatalf("stdout leaked a token: %q", stdout.String())
+	}
+}
+
+func TestHTTPClientErrorsOmitSessionAndBootstrapTokens(t *testing.T) {
+	client := NewClient("http://127.0.0.1:1", 50*time.Millisecond)
+	sessionToken := "super-secret-session-token"
+	bootstrapToken := "super-secret-bootstrap-token"
+
+	_, err := client.GetBundle(context.Background(), sessionToken)
+	if err == nil {
+		t.Fatal("expected GetBundle error")
+	}
+	if strings.Contains(err.Error(), sessionToken) {
+		t.Fatalf("GetBundle error leaked session token: %v", err)
+	}
+
+	_, err = client.GetBootstrapManifest(context.Background(), bootstrapToken)
+	if err == nil {
+		t.Fatal("expected GetBootstrapManifest error")
+	}
+	if strings.Contains(err.Error(), bootstrapToken) {
+		t.Fatalf("GetBootstrapManifest error leaked bootstrap token: %v", err)
+	}
+
+	err = client.UpdateStep(context.Background(), sessionToken, 1, UpdateStepRequest{Status: "running"})
+	if err == nil {
+		t.Fatal("expected UpdateStep error")
+	}
+	if strings.Contains(err.Error(), sessionToken) {
+		t.Fatalf("UpdateStep error leaked session token: %v", err)
+	}
+}
+
+func completedSteps(n int) []StepInfo {
+	steps := make([]StepInfo, n)
+	for i := 0; i < n; i++ {
+		steps[i] = StepInfo{Number: i + 1, Status: "completed"}
+	}
+	return steps
+}
+
+func assertOwnerOnlyDir(t *testing.T, path string) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("%s is not a directory", path)
+	}
+	assertUnixMode(t, path, info.Mode(), 0o700)
+}
+
+func assertOwnerOnlyFile(t *testing.T, path string) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.IsDir() {
+		t.Fatalf("%s is a directory", path)
+	}
+	assertUnixMode(t, path, info.Mode(), 0o600)
+}
+
+func assertUnixMode(t *testing.T, path string, mode os.FileMode, want os.FileMode) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		return
+	}
+	got := mode.Perm()
+	if got != want {
+		t.Fatalf("%s mode = %04o, want %04o (after chmod; umask must not leave the tree world-readable)", path, got, want)
 	}
 }
