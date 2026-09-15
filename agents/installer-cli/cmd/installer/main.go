@@ -1,32 +1,37 @@
-// Command installer is the binary the generated install command runs on the
-// customer machine. It performs: prerequisite checks -> tofu init/plan/apply ->
-// kubeconfig retrieval -> agent Helm install -> registration callback.
-// See docs/07-cluster-engine-design.md section 3. Logic is intentionally omitted.
+// Command installer provisions a cluster and installs its platform agent.
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"strings"
+	"time"
+
+	"github.com/bdsplatform/platform/agents/installer-cli/internal/agent"
 )
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("usage: installer <session-id>")
-		fmt.Println("env: PLATFORM_INSTALL_TOKEN, CONTROL_PLANE_ENDPOINT")
-		os.Exit(2)
+	if err := run(context.Background()); err != nil {
+		fmt.Fprintf(os.Stderr, "Installation failed: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run(ctx context.Context) error {
+	token := strings.TrimSpace(os.Getenv("PLATFORM_INSTALL_TOKEN"))
+	if token == "" {
+		return fmt.Errorf("PLATFORM_INSTALL_TOKEN is required")
+	}
+	baseURL := strings.TrimSpace(os.Getenv("CONTROL_PLANE_ENDPOINT"))
+	if baseURL == "" {
+		baseURL = strings.TrimSpace(os.Getenv("PLATFORM_URL"))
+	}
+	if baseURL == "" {
+		baseURL = agent.DefaultControlPlaneEndpoint
 	}
 
-	// TODO: implement staged installer flow with resumable steps.
-	steps := []string{
-		"check-prerequisites",
-		"tofu-init",
-		"tofu-plan",
-		"tofu-apply",
-		"fetch-kubeconfig",
-		"install-agent",
-		"register-callback",
-	}
-	for _, s := range steps {
-		fmt.Printf("[skeleton] step pending: %s\n", s)
-	}
+	fmt.Println("BDS Platform cluster installer")
+	installer := agent.NewInstaller(agent.NewClient(baseURL, 30*time.Second))
+	return installer.RunTerraform(ctx, token)
 }
