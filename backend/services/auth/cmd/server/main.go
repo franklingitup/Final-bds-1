@@ -3,7 +3,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -58,24 +57,10 @@ func main() {
 	orgMemberRepo := authz.NewOrgMemberRepo(db)
 	ssoConfigs := auth.NewSSOConfigStore(db)
 
-	ssoProviders, ssoKeyEncryptor, err := newSSOProviderManager(cfg, ssoConfigs, log)
+	ssoProviders, err := newSSOProviderManager(cfg, ssoConfigs, log)
 	if err != nil {
 		log.Error("init sso provider manager", "error", err)
 		os.Exit(1)
-	}
-	exchangeEncryptor := ssoKeyEncryptor
-	if exchangeEncryptor == nil {
-		ephemeralKey := make([]byte, 32)
-		if _, err := rand.Read(ephemeralKey); err != nil {
-			log.Error("generate local SSO handoff encryption key", "error", err)
-			os.Exit(1)
-		}
-		exchangeEncryptor, err = auth.NewSSOKeyEncryptorFromBytes(ephemeralKey)
-		if err != nil {
-			log.Error("init local SSO handoff encryption", "error", err)
-			os.Exit(1)
-		}
-		log.Warn("using an ephemeral SSO token-handoff encryption key; configure CERTIFICATE_ENCRYPTION_KEY for multi-replica operation")
 	}
 	ssoRedirectURL, err := ssoBrowserRedirectURL(log)
 	if err != nil {
@@ -102,7 +87,6 @@ func main() {
 		SSOOrganizations: auth.NewSSOOrganizationStore(db),
 		SSOMembers:       auth.NewSSOMemberStore(db),
 		SSOHandoffs:      auth.NewSSOHandoffStore(db),
-		SSOEncryptor:     exchangeEncryptor,
 		SSORedirectURL:   ssoRedirectURL,
 		OrgMembers:       orgMemberRepo,
 		Tx:               db,
@@ -189,7 +173,7 @@ func newRevoker(ctx context.Context, cfg config.Config, log *slog.Logger) (auth.
 // PUBLIC_API_BASE_URL is the externally reachable API origin used for ACS and
 // SP metadata URLs. CERTIFICATE_ENCRYPTION_KEY (same as the domain service)
 // encrypts SP private keys at rest when set.
-func newSSOProviderManager(cfg config.Config, keys auth.SSOConfigStore, log *slog.Logger) (*auth.SSOProviderManager, *auth.SSOKeyEncryptor, error) {
+func newSSOProviderManager(cfg config.Config, keys auth.SSOConfigStore, log *slog.Logger) (*auth.SSOProviderManager, error) {
 	publicBase := os.Getenv("PUBLIC_API_BASE_URL")
 	if publicBase == "" {
 		publicBase = "http://localhost:8080"
@@ -201,10 +185,10 @@ func newSSOProviderManager(cfg config.Config, keys auth.SSOConfigStore, log *slo
 		var err error
 		encryptor, err = auth.NewSSOKeyEncryptor(key)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 	} else if cfg.Environment == config.EnvProduction || cfg.Environment == config.EnvStaging {
-		return nil, nil, errors.New("CERTIFICATE_ENCRYPTION_KEY is required outside local development for SAML SP keys")
+		return nil, errors.New("CERTIFICATE_ENCRYPTION_KEY is required outside local development for SAML SP keys")
 	} else {
 		log.Warn("CERTIFICATE_ENCRYPTION_KEY is not set; SAML SP private keys will be stored unencrypted")
 	}
@@ -215,9 +199,9 @@ func newSSOProviderManager(cfg config.Config, keys auth.SSOConfigStore, log *slo
 		Keys:          keys,
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return manager, encryptor, nil
+	return manager, nil
 }
 
 func ssoBrowserRedirectURL(log *slog.Logger) (string, error) {

@@ -78,7 +78,6 @@ func (h *Handler) SSOACS(c *fiber.Ctx) error {
 		c.Params("orgId"),
 		c.FormValue("SAMLResponse"),
 		c.FormValue("RelayState"),
-		h.requestMeta(c),
 	)
 	if err != nil {
 		return err
@@ -91,7 +90,7 @@ func (h *Handler) ExchangeSSOCode(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	pair, err := h.svc.ExchangeSSOCode(c.UserContext(), req)
+	pair, err := h.svc.ExchangeSSOCode(c.UserContext(), req, h.requestMeta(c))
 	if err != nil {
 		return err
 	}

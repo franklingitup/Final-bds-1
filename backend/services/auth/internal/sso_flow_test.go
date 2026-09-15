@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"encoding/json"
 	"net/url"
 	"strings"
 	"sync"
@@ -77,7 +76,6 @@ func (f *fakeSSOHandoffStore) CreateExchangeCode(_ context.Context, code *SSOExc
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	cp := *code
-	cp.EncryptedPayload = append([]byte(nil), code.EncryptedPayload...)
 	f.exchanges[code.CodeHash] = &cp
 	return nil
 }
@@ -91,7 +89,6 @@ func (f *fakeSSOHandoffStore) ConsumeExchangeCode(_ context.Context, orgID, code
 	}
 	delete(f.exchanges, codeHash)
 	cp := *code
-	cp.EncryptedPayload = append([]byte(nil), code.EncryptedPayload...)
 	return &cp, nil
 }
 
@@ -108,10 +105,6 @@ func newSSOFlowTestService(t *testing.T) (*Service, *fakeSSOHandoffStore, *fakeS
 	if err != nil {
 		t.Fatalf("NewSSOProviderManager: %v", err)
 	}
-	encryptor, err := NewSSOKeyEncryptorFromBytes(make([]byte, 32))
-	if err != nil {
-		t.Fatalf("NewSSOKeyEncryptorFromBytes: %v", err)
-	}
 	handoffs := newFakeSSOHandoffStore()
 	members := &fakeSSOMemberStore{}
 	svc := NewService(Deps{
@@ -123,7 +116,6 @@ func newSSOFlowTestService(t *testing.T) (*Service, *fakeSSOHandoffStore, *fakeS
 		SSOOrganizations: &fakeSSOOrganizationStore{bySlug: map[string]string{"acme": cfg.OrgID}},
 		SSOMembers:       members,
 		SSOHandoffs:      handoffs,
-		SSOEncryptor:     encryptor,
 		SSORedirectURL:   "https://app.example.com/sso/callback",
 		Tx:               fakeTx{},
 		Tenant:           &fakeTenantRunner{},
@@ -183,44 +175,95 @@ func TestSSOMetadataUsesOrgServiceProvider(t *testing.T) {
 
 func TestExchangeSSOCodeIsSingleUseAndOrgBound(t *testing.T) {
 	svc, handoffs, _, _ := newSSOFlowTestService(t)
-	pair := &TokenPair{
-		AccessToken:  "access",
-		RefreshToken: "refresh",
-		ExpiresIn:    900,
-		User:         &UserProfile{ID: "user-1", Email: "user@example.com"},
-	}
-	payload, _ := json.Marshal(pair)
-	encrypted, err := svc.ssoExchangeEncryptor.Encrypt(payload)
+	user, err := svc.findOrCreateSSOUser(context.Background(), "sso@example.com", "SSO User")
 	if err != nil {
 		t.Fatal(err)
 	}
 	code := "one-time-code"
-	handoffs.exchanges[hashToken(code)] = &SSOExchangeCode{
-		OrgID:            "org-1",
-		CodeHash:         hashToken(code),
-		EncryptedPayload: encrypted,
-		ExpiresAt:        svc.now().Add(time.Minute),
+	stored := &SSOExchangeCode{
+		OrgID:     "org-1",
+		UserID:    user.ID,
+		CodeHash:  hashToken(code),
+		ExpiresAt: svc.now().Add(time.Minute),
+	}
+	handoffs.exchanges[hashToken(code)] = stored
+	if stored.UserID == "" {
+		t.Fatal("exchange code must store a user ID")
 	}
 
 	if _, err := svc.ExchangeSSOCode(context.Background(), SSOExchangeRequest{
 		OrgID: "org-2", Code: code,
-	}); err == nil {
+	}, RequestMeta{}); err == nil {
 		t.Fatal("expected cross-org exchange to fail")
 	}
 
 	got, err := svc.ExchangeSSOCode(context.Background(), SSOExchangeRequest{
 		OrgID: "org-1", Code: code,
-	})
+	}, RequestMeta{UserAgent: "test", IP: "127.0.0.1"})
 	if err != nil {
 		t.Fatalf("ExchangeSSOCode: %v", err)
 	}
-	if got.AccessToken != pair.AccessToken || got.RefreshToken != pair.RefreshToken {
-		t.Fatalf("unexpected exchanged pair: %+v", got)
+	claims, err := svc.jwt.Verify(got.AccessToken)
+	if err != nil {
+		t.Fatalf("verify minted access token: %v", err)
 	}
+	if claims.Subject != user.ID {
+		t.Fatalf("access token subject = %q, want %q", claims.Subject, user.ID)
+	}
+	if got.RefreshToken == "" {
+		t.Fatal("expected a freshly minted refresh token")
+	}
+
 	if _, err := svc.ExchangeSSOCode(context.Background(), SSOExchangeRequest{
 		OrgID: "org-1", Code: code,
-	}); err == nil {
+	}, RequestMeta{}); err == nil {
 		t.Fatal("expected second exchange to fail")
+	}
+}
+
+func TestSSOExchangeCodeStoresIdentityOnlyAndMintsAtRedemption(t *testing.T) {
+	svc, handoffs, _, _ := newSSOFlowTestService(t)
+	user, err := svc.findOrCreateSSOUser(context.Background(), "handoff@example.com", "Handoff User")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	code := "identity-only-code"
+	if err := handoffs.CreateExchangeCode(context.Background(), &SSOExchangeCode{
+		OrgID:     "org-1",
+		UserID:    user.ID,
+		CodeHash:  hashToken(code),
+		ExpiresAt: svc.now().Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	row := handoffs.exchanges[hashToken(code)]
+	if row == nil {
+		t.Fatal("exchange code was not stored")
+	}
+	if row.OrgID != "org-1" || row.UserID != user.ID || row.CodeHash != hashToken(code) {
+		t.Fatalf("stored identity fields: %+v", row)
+	}
+
+	pair, err := svc.ExchangeSSOCode(context.Background(), SSOExchangeRequest{
+		OrgID: "org-1", Code: code,
+	}, RequestMeta{UserAgent: "test-agent", IP: "10.0.0.1"})
+	if err != nil {
+		t.Fatalf("ExchangeSSOCode: %v", err)
+	}
+	claims, err := svc.jwt.Verify(pair.AccessToken)
+	if err != nil {
+		t.Fatalf("minted access token is invalid: %v", err)
+	}
+	if claims.Subject != user.ID || claims.Email != user.Email {
+		t.Fatalf("minted claims = %+v, want user %s", claims, user.ID)
+	}
+	if pair.User == nil || pair.User.ID != user.ID {
+		t.Fatalf("token pair user = %+v", pair.User)
+	}
+	if len(svc.sessions.(*fakeSessionStore).byHash) != 1 {
+		t.Fatal("expected a new refresh session to be created at exchange time")
 	}
 }
 
@@ -235,7 +278,7 @@ func TestCompleteSSOLoginRejectsInvalidLibraryResponseBeforeProvisioning(t *test
 	}
 
 	_, err := svc.CompleteSSOLogin(
-		context.Background(), cfg.OrgID, "not-a-valid-saml-response", relayState, RequestMeta{})
+		context.Background(), cfg.OrgID, "not-a-valid-saml-response", relayState)
 	if err == nil || apperrors.From(err).Code != apperrors.CodeUnauthenticated {
 		t.Fatalf("expected unauthenticated validation failure, got %v", err)
 	}

@@ -42,7 +42,6 @@ type Deps struct {
 	SSOOrganizations SSOOrganizationStore
 	SSOMembers       SSOMemberStore
 	SSOHandoffs      SSOHandoffStore
-	SSOEncryptor     *SSOKeyEncryptor
 	SSORedirectURL   string
 	OrgMembers       authz.OrgMemberStore // For org membership authorization
 	Tx               Transactor
@@ -74,7 +73,6 @@ type Service struct {
 	ssoOrganizations     SSOOrganizationStore
 	ssoMembers           SSOMemberStore
 	ssoHandoffs          SSOHandoffStore
-	ssoExchangeEncryptor *SSOKeyEncryptor
 	ssoRedirectURL       string
 	orgMembers           authz.OrgMemberStore
 	tx                   Transactor
@@ -115,7 +113,6 @@ func NewService(d Deps) *Service {
 		ssoOrganizations:     d.SSOOrganizations,
 		ssoMembers:           d.SSOMembers,
 		ssoHandoffs:          d.SSOHandoffs,
-		ssoExchangeEncryptor: d.SSOEncryptor,
 		ssoRedirectURL:       d.SSORedirectURL,
 		orgMembers:           d.OrgMembers,
 		tx:                   d.Tx,

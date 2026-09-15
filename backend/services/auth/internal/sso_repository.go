@@ -22,7 +22,7 @@ type SSOMemberStore interface {
 }
 
 // SSOHandoffStore persists short-lived, single-use SAML request state and
-// encrypted browser token handoffs. Calls must run in tenant context.
+// browser exchange codes. Calls must run in tenant context.
 type SSOHandoffStore interface {
 	CreateLoginState(ctx context.Context, state *SSOLoginState) error
 	ConsumeLoginState(ctx context.Context, orgID, stateHash string, now time.Time) (*SSOLoginState, error)
@@ -38,12 +38,13 @@ type SSOLoginState struct {
 	ExpiresAt time.Time
 }
 
-// SSOExchangeCode holds an encrypted TokenPair until one browser redemption.
+// SSOExchangeCode maps an opaque one-time code to a user until one redemption.
+// Tokens are not stored; they are minted at exchange time.
 type SSOExchangeCode struct {
-	OrgID            string
-	CodeHash         string
-	EncryptedPayload []byte
-	ExpiresAt        time.Time
+	OrgID     string
+	UserID    string
+	CodeHash  string
+	ExpiresAt time.Time
 }
 
 type ssoOrganizationRepo struct{ db *database.DB }
@@ -109,9 +110,9 @@ RETURNING org_id, state_hash, request_id, expires_at`,
 
 func (r *ssoHandoffRepo) CreateExchangeCode(ctx context.Context, code *SSOExchangeCode) error {
 	_, err := r.db.Conn(ctx).Exec(ctx, `
-INSERT INTO sso_exchange_codes (org_id, code_hash, encrypted_payload, expires_at)
+INSERT INTO sso_exchange_codes (org_id, user_id, code_hash, expires_at)
 VALUES ($1, $2, $3, $4)`,
-		code.OrgID, code.CodeHash, code.EncryptedPayload, code.ExpiresAt)
+		code.OrgID, code.UserID, code.CodeHash, code.ExpiresAt)
 	return database.MapError(err)
 }
 
@@ -121,8 +122,8 @@ func (r *ssoHandoffRepo) ConsumeExchangeCode(ctx context.Context, orgID, codeHas
 UPDATE sso_exchange_codes
 SET used_at = $3
 WHERE org_id = $1 AND code_hash = $2 AND used_at IS NULL AND expires_at > $3
-RETURNING org_id, code_hash, encrypted_payload, expires_at`,
-		orgID, codeHash, now).Scan(&code.OrgID, &code.CodeHash, &code.EncryptedPayload, &code.ExpiresAt)
+RETURNING org_id, user_id, code_hash, expires_at`,
+		orgID, codeHash, now).Scan(&code.OrgID, &code.UserID, &code.CodeHash, &code.ExpiresAt)
 	if err != nil {
 		mapped := database.MapError(err)
 		if database.IsNotFound(mapped) {
