@@ -292,6 +292,15 @@ func (h *Handler) GetInstallSession(c *fiber.Ctx) error {
 	})
 }
 
+// GetSessionBundle handles GET /sessions/:sessionToken/bundle.
+func (h *Handler) GetSessionBundle(c *fiber.Ctx) error {
+	bundle, err := h.svc.GetSessionBundle(c.Context(), c.Params("sessionToken"))
+	if err != nil {
+		return err
+	}
+	return c.JSON(bundle)
+}
+
 // UpdateStep handles POST /sessions/:sessionToken/steps/:stepNumber.
 func (h *Handler) UpdateStep(c *fiber.Ctx) error {
 	sessionToken := c.Params("sessionToken")

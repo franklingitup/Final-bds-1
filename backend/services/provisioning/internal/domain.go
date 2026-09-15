@@ -154,12 +154,12 @@ type NodeTaint struct {
 
 // NetworkingConfig holds networking configuration.
 type NetworkingConfig struct {
-	VPCCidr         string   `json:"vpcCidr,omitempty"`
-	PodCidr         string   `json:"podCidr,omitempty"`
-	ServiceCidr     string   `json:"serviceCidr,omitempty"`
-	SubnetCidrs     []string `json:"subnetCidrs,omitempty"`
-	PrivateCluster  bool     `json:"privateCluster,omitempty"`
-	NATGateway      bool     `json:"natGateway,omitempty"`
+	VPCCidr        string   `json:"vpcCidr,omitempty"`
+	PodCidr        string   `json:"podCidr,omitempty"`
+	ServiceCidr    string   `json:"serviceCidr,omitempty"`
+	SubnetCidrs    []string `json:"subnetCidrs,omitempty"`
+	PrivateCluster bool     `json:"privateCluster,omitempty"`
+	NATGateway     bool     `json:"natGateway,omitempty"`
 }
 
 // ClusterAddon defines an addon to install.
@@ -204,25 +204,25 @@ type ProvisioningRequest struct {
 
 // InstallSession tracks provisioning progress.
 type InstallSession struct {
-	ID               string     `db:"id"`
-	OrgID            string     `db:"org_id"`
-	RequestID        string     `db:"request_id"`
-	SessionToken     string     `db:"session_token"`
-	CurrentStep      string     `db:"current_step"`
-	TotalSteps       int        `db:"total_steps"`
-	CompletedSteps   int        `db:"completed_steps"`
+	ID               string          `db:"id"`
+	OrgID            string          `db:"org_id"`
+	RequestID        string          `db:"request_id"`
+	SessionToken     string          `db:"session_token"`
+	CurrentStep      string          `db:"current_step"`
+	TotalSteps       int             `db:"total_steps"`
+	CompletedSteps   int             `db:"completed_steps"`
 	Steps            json.RawMessage `db:"steps"`
-	Status           string     `db:"status"`
-	BootstrapToken   *string    `db:"bootstrap_token"`
-	BootstrapCommand *string    `db:"bootstrap_command"`
-	AgentConnected   bool       `db:"agent_connected"`
-	AgentConnectedAt *time.Time `db:"agent_connected_at"`
-	AgentVersion     *string    `db:"agent_version"`
-	ExpiresAt        time.Time  `db:"expires_at"`
-	StartedAt        *time.Time `db:"started_at"`
-	CompletedAt      *time.Time `db:"completed_at"`
-	CreatedAt        time.Time  `db:"created_at"`
-	UpdatedAt        time.Time  `db:"updated_at"`
+	Status           string          `db:"status"`
+	BootstrapToken   *string         `db:"bootstrap_token"`
+	BootstrapCommand *string         `db:"bootstrap_command"`
+	AgentConnected   bool            `db:"agent_connected"`
+	AgentConnectedAt *time.Time      `db:"agent_connected_at"`
+	AgentVersion     *string         `db:"agent_version"`
+	ExpiresAt        time.Time       `db:"expires_at"`
+	StartedAt        *time.Time      `db:"started_at"`
+	CompletedAt      *time.Time      `db:"completed_at"`
+	CreatedAt        time.Time       `db:"created_at"`
+	UpdatedAt        time.Time       `db:"updated_at"`
 }
 
 // InstallSessionStep is a step in an install session.
@@ -277,17 +277,17 @@ type BootstrapToken struct {
 
 // ProvisioningEvent is an event in the provisioning lifecycle.
 type ProvisioningEvent struct {
-	ID         string          `db:"id"`
-	OrgID      string          `db:"org_id"`
-	RequestID  *string         `db:"request_id"`
-	SessionID  *string         `db:"session_id"`
-	EventType  string          `db:"event_type"`
-	Severity   string          `db:"severity"`
-	Message    string          `db:"message"`
-	Details    json.RawMessage `db:"details"`
-	ActorType  *string         `db:"actor_type"`
-	ActorID    *string         `db:"actor_id"`
-	CreatedAt  time.Time       `db:"created_at"`
+	ID        string          `db:"id"`
+	OrgID     string          `db:"org_id"`
+	RequestID *string         `db:"request_id"`
+	SessionID *string         `db:"session_id"`
+	EventType string          `db:"event_type"`
+	Severity  string          `db:"severity"`
+	Message   string          `db:"message"`
+	Details   json.RawMessage `db:"details"`
+	ActorType *string         `db:"actor_type"`
+	ActorID   *string         `db:"actor_id"`
+	CreatedAt time.Time       `db:"created_at"`
 }
 
 // ----------------------------------------------------------------------------
@@ -305,26 +305,26 @@ type CreateCredentialRequest struct {
 
 // CreateTemplateRequest is the request to create a template.
 type CreateTemplateRequest struct {
-	Name        string           `json:"name"`
-	Provider    string           `json:"provider"`
-	K8sVersion  string           `json:"k8sVersion,omitempty"`
-	NodePools   []NodePool       `json:"nodePools,omitempty"`
+	Name        string            `json:"name"`
+	Provider    string            `json:"provider"`
+	K8sVersion  string            `json:"k8sVersion,omitempty"`
+	NodePools   []NodePool        `json:"nodePools,omitempty"`
 	Networking  *NetworkingConfig `json:"networking,omitempty"`
-	Addons      []ClusterAddon   `json:"addons,omitempty"`
-	Description *string          `json:"description,omitempty"`
+	Addons      []ClusterAddon    `json:"addons,omitempty"`
+	Description *string           `json:"description,omitempty"`
 }
 
 // CreateProvisioningRequest is the request to create a provisioning request.
 type CreateProvisioningRequest struct {
-	Name         string           `json:"name"`
-	Provider     string           `json:"provider"`
-	Region       string           `json:"region"`
-	CredentialID *string          `json:"credentialId,omitempty"`
-	TemplateID   *string          `json:"templateId,omitempty"`
-	K8sVersion   string           `json:"k8sVersion,omitempty"`
-	NodePools    []NodePool       `json:"nodePools,omitempty"`
+	Name         string            `json:"name"`
+	Provider     string            `json:"provider"`
+	Region       string            `json:"region"`
+	CredentialID *string           `json:"credentialId,omitempty"`
+	TemplateID   *string           `json:"templateId,omitempty"`
+	K8sVersion   string            `json:"k8sVersion,omitempty"`
+	NodePools    []NodePool        `json:"nodePools,omitempty"`
 	Networking   *NetworkingConfig `json:"networking,omitempty"`
-	Addons       []ClusterAddon   `json:"addons,omitempty"`
+	Addons       []ClusterAddon    `json:"addons,omitempty"`
 }
 
 // UpdateStepRequest is the request to update a step.
@@ -475,6 +475,23 @@ type InstallSessionView struct {
 	AgentVersion     *string    `json:"agentVersion,omitempty"`
 	ExpiresAt        string     `json:"expiresAt"`
 	CreatedAt        string     `json:"createdAt"`
+}
+
+// SessionBundle is the token-authenticated installer payload. It contains only
+// the generated Terraform inputs and install-session state needed by the CLI.
+type SessionBundle struct {
+	SessionID       string          `json:"sessionId"`
+	RequestID       string          `json:"requestId"`
+	Provider        string          `json:"provider"`
+	TerraformConfig string          `json:"terraformConfig"`
+	TerraformVars   json.RawMessage `json:"terraformVars"`
+	SessionToken    string          `json:"sessionToken"`
+	BootstrapToken  string          `json:"bootstrapToken"`
+	Steps           []StepInfo      `json:"steps"`
+	Status          string          `json:"status"`
+	AgentConnected  bool            `json:"agentConnected"`
+	AgentVersion    *string         `json:"agentVersion,omitempty"`
+	ExpiresAt       string          `json:"expiresAt"`
 }
 
 func ToInstallSessionView(s *InstallSession) InstallSessionView {

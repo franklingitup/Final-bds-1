@@ -17,6 +17,7 @@ func RegisterRoutesWithDeps(app *fiber.App, h *Handler, verifier TokenVerifier) 
 
 	// Session step updates (token-based auth)
 	sessions := v1.Group("/sessions")
+	sessions.Get("/:sessionToken/bundle", h.GetSessionBundle)
 	sessions.Post("/:sessionToken/steps/:stepNumber", h.UpdateStep)
 
 	// Organization-scoped routes (JWT auth)

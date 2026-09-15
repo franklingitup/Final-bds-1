@@ -577,6 +577,55 @@ func (s *Service) GetInstallSession(ctx context.Context, orgID, userID, sessionI
 	return session, steps, err
 }
 
+// GetSessionBundle returns the generated installer inputs using the opaque
+// session token as authentication. No user JWT is required.
+func (s *Service) GetSessionBundle(ctx context.Context, sessionToken string) (*SessionBundle, error) {
+	session, err := s.sessions.GetByToken(ctx, sessionToken)
+	if err != nil {
+		return nil, apperrors.NotFound("invalid or expired session token")
+	}
+	if time.Now().After(session.ExpiresAt) {
+		return nil, apperrors.NotFound("invalid or expired session token")
+	}
+
+	var req *ProvisioningRequest
+	err = s.tenant.WithTenant(ctx, session.OrgID, func(ctx context.Context) error {
+		var getErr error
+		req, getErr = s.requests.GetByID(ctx, session.RequestID)
+		return getErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	if req.TerraformConfig == nil || len(req.TerraformVars) == 0 {
+		return nil, apperrors.Validation("terraform configuration is not ready")
+	}
+
+	var steps []StepInfo
+	if err := json.Unmarshal(session.Steps, &steps); err != nil {
+		return nil, apperrors.Internal("invalid install session steps")
+	}
+	bootstrapToken := ""
+	if session.BootstrapToken != nil {
+		bootstrapToken = *session.BootstrapToken
+	}
+
+	return &SessionBundle{
+		SessionID:       session.ID,
+		RequestID:       session.RequestID,
+		Provider:        req.Provider,
+		TerraformConfig: *req.TerraformConfig,
+		TerraformVars:   append(json.RawMessage(nil), req.TerraformVars...),
+		SessionToken:    session.SessionToken,
+		BootstrapToken:  bootstrapToken,
+		Steps:           steps,
+		Status:          session.Status,
+		AgentConnected:  session.AgentConnected,
+		AgentVersion:    session.AgentVersion,
+		ExpiresAt:       session.ExpiresAt.Format(time.RFC3339),
+	}, nil
+}
+
 // UpdateStep updates a step in an install session.
 func (s *Service) UpdateStep(ctx context.Context, sessionToken string, stepNumber int, req UpdateStepRequest) (*InstallSessionStep, error) {
 	var session *InstallSession
