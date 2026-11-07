@@ -102,10 +102,7 @@ func (h *Handler) ListMembers(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	views := make([]MemberView, 0, len(page.Items))
-	for _, m := range page.Items {
-		views = append(views, toMemberView(m))
-	}
+	views := h.svc.memberViews(c.UserContext(), page.Items)
 	return c.JSON(fiber.Map{"items": views, "nextCursor": page.NextCursor})
 }
 
@@ -125,7 +122,8 @@ func (h *Handler) ChangeRole(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return c.JSON(toMemberView(*member))
+	views := h.svc.memberViews(c.UserContext(), []Member{*member})
+	return c.JSON(views[0])
 }
 
 // ----------------------------------------------------------------------------

@@ -10,10 +10,12 @@ func RegisterRoutesWithDeps(app *fiber.App, h *Handler, verifier TokenVerifier) 
 
 	v1 := app.Group("/v1")
 
-	// Public bootstrap endpoints (token-based auth)
-	bootstrap := v1.Group("/bootstrap")
-	bootstrap.Get("/:token/manifest.yaml", h.GetBootstrapManifest)
-	bootstrap.Post("/:token/agent", h.ReportAgentConnection)
+	// Public install script endpoint (session ID in URL, token in env)
+	v1.Get("/install/:sessionId", h.GetInstallScript)
+
+	// NOTE: The old /v1/bootstrap/* endpoints are removed.
+	// Agents now use the cluster service's /v1/agent-install/:token/manifest.yaml
+	// endpoint, which generates the correct manifest with AGENT_TOKEN.
 
 	// Session step updates (token-based auth)
 	sessions := v1.Group("/sessions")

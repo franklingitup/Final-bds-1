@@ -39,7 +39,7 @@ export const clustersApi = {
   async generateToken(
     orgId: string,
     clusterId: string,
-    params?: { expiresIn?: string }
+    params?: { expiresIn?: string; controlPlaneEndpoint?: string; force?: boolean }
   ): Promise<RegistrationToken> {
     return apiClient.post<RegistrationToken>(
       `/v1/organizations/${orgId}/clusters/${clusterId}/tokens`,
@@ -64,12 +64,6 @@ export const clustersApi = {
   },
 };
 
-export function getInstallCommand(token: string, controlPlaneUrl: string): string {
-  return `helm install platform-agent oci://registry.bdsplatform.io/charts/platform-agent \\
-  --namespace bdsplatform-system \\
-  --create-namespace \\
-  --set token=${token} \\
-  --set controlPlaneUrl=${controlPlaneUrl} \\
-  --set reconciler.enabled=true \\
-  --set secretsSyncer.enabled=true`;
+export function getInstallCommand(manifestUrl: string): string {
+  return `kubectl apply -f ${manifestUrl}`;
 }

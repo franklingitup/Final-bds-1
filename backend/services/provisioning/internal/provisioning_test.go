@@ -1,9 +1,25 @@
 package provisioning
 
 import (
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 )
 
 func TestProviderConstants(t *testing.T) {
@@ -149,6 +165,10 @@ func TestToProvisioningRequestView(t *testing.T) {
 		{Name: "default", MachineType: "t3.medium", MinNodes: 1, MaxNodes: 3},
 	}
 	nodePoolsJSON, _ := json.Marshal(nodePools)
+	configJSON, _ := json.Marshal(ProvisioningConfig{
+		Networking: &NetworkingConfig{VPCCidr: "10.50.0.0/16", PrivateCluster: true},
+		Addons:     []ClusterAddon{{Name: "vpc-cni", Enabled: true}},
+	})
 	now := time.Now()
 
 	req := &ProvisioningRequest{
@@ -159,6 +179,7 @@ func TestToProvisioningRequestView(t *testing.T) {
 		Region:     "us-east-1",
 		K8sVersion: "1.28",
 		NodePools:  nodePoolsJSON,
+		Config:     configJSON,
 		Status:     RequestReady,
 		StartedAt:  &now,
 		CreatedAt:  now,
@@ -180,6 +201,12 @@ func TestToProvisioningRequestView(t *testing.T) {
 	}
 	if view.Status != RequestReady {
 		t.Errorf("expected status ready, got %s", view.Status)
+	}
+	if view.Networking == nil || view.Networking.VPCCidr != "10.50.0.0/16" || !view.Networking.PrivateCluster {
+		t.Errorf("unexpected networking view: %#v", view.Networking)
+	}
+	if len(view.Addons) != 1 || view.Addons[0].Name != "vpc-cni" || !view.Addons[0].Enabled {
+		t.Errorf("unexpected addons view: %#v", view.Addons)
 	}
 }
 
@@ -316,7 +343,13 @@ func TestTerraformGenerator_Generate(t *testing.T) {
 		},
 		AWS: &AWSConfig{
 			VPCCidr:          "10.0.0.0/16",
+			ServiceCidr:      "10.80.0.0/16",
 			EnableNATGateway: true,
+			PrivateCluster:   true,
+		},
+		Addons: []ClusterAddon{
+			{Name: "vpc-cni", Enabled: true},
+			{Name: "kube-proxy", Enabled: false},
 		},
 	}
 
@@ -344,6 +377,16 @@ func TestTerraformGenerator_Generate(t *testing.T) {
 	}
 	if result.TFVars["region"] != "us-east-1" {
 		t.Errorf("expected region us-east-1, got %v", result.TFVars["region"])
+	}
+	if result.TFVars["service_cidr"] != "10.80.0.0/16" {
+		t.Errorf("expected custom service CIDR, got %v", result.TFVars["service_cidr"])
+	}
+	if result.TFVars["private_cluster"] != true {
+		t.Errorf("expected private_cluster true, got %v", result.TFVars["private_cluster"])
+	}
+	addons, ok := result.TFVars["addons"].(map[string]bool)
+	if !ok || !addons["vpc-cni"] || addons["kube-proxy"] {
+		t.Errorf("unexpected addons vars: %#v", result.TFVars["addons"])
 	}
 }
 
@@ -400,6 +443,157 @@ func TestTerraformGenerator_GCP(t *testing.T) {
 	}
 }
 
+func TestGeneratedTerraformParses(t *testing.T) {
+	if _, err := exec.LookPath("terraform"); err != nil {
+		t.Skip("terraform CLI is not installed")
+	}
+
+	tests := []struct {
+		name     string
+		provider string
+		config   TerraformConfig
+	}{
+		{
+			name:     "aws",
+			provider: ProviderAWS,
+			config: TerraformConfig{
+				ClusterName: "parse-aws",
+				Region:      "us-east-1",
+				NodePools:   []NodePool{{Name: "default", MachineType: "t3.medium", MinNodes: 1, MaxNodes: 2, DesiredNodes: 1}},
+				Addons:      []ClusterAddon{{Name: "vpc-cni", Enabled: true}},
+				AWS:         &AWSConfig{VPCCidr: "10.0.0.0/16", ServiceCidr: "10.96.0.0/12"},
+			},
+		},
+		{
+			name:     "azure",
+			provider: ProviderAzure,
+			config: TerraformConfig{
+				ClusterName: "parse-azure",
+				Region:      "eastus",
+				NodePools:   []NodePool{{Name: "default", MachineType: "Standard_D2s_v3", MinNodes: 1, MaxNodes: 2, DesiredNodes: 1}},
+				Azure:       &AzureConfig{ResourceGroup: "parse-rg", VNetCidr: "10.0.0.0/16", PodCidr: "10.244.0.0/16", ServiceCidr: "10.96.0.0/12", DNSPrefix: "parse"},
+			},
+		},
+		{
+			name:     "gcp",
+			provider: ProviderGCP,
+			config: TerraformConfig{
+				ClusterName: "parse-gcp",
+				Region:      "us-central1",
+				NodePools:   []NodePool{{Name: "default", MachineType: "e2-medium", MinNodes: 1, MaxNodes: 2, DesiredNodes: 1}},
+				GCP:         &GCPConfig{ProjectID: "project", SubnetCidr: "10.0.0.0/20", PodCidr: "10.1.0.0/16", ServiceCidr: "10.2.0.0/20", MasterIPv4CIDR: "172.16.0.0/28"},
+			},
+		},
+	}
+
+	generator := NewTerraformGenerator()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			generated, err := generator.Generate(tt.provider, tt.config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command("terraform", "fmt", "-")
+			command.Stdin = strings.NewReader(generated.MainTF + "\n" + generated.VariablesTF + "\n" + generated.OutputsTF)
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("generated Terraform does not parse: %v\n%s", err, output)
+			}
+		})
+	}
+}
+
+func TestGeneratedTerraformValidates(t *testing.T) {
+	if os.Getenv("RUN_TERRAFORM_VALIDATE") != "1" {
+		t.Skip("set RUN_TERRAFORM_VALIDATE=1 to download providers/modules and run terraform validate")
+	}
+	if _, err := exec.LookPath("terraform"); err != nil {
+		t.Skip("terraform CLI is not installed")
+	}
+
+	tests := []struct {
+		name     string
+		provider string
+		config   TerraformConfig
+	}{
+		{
+			name:     "aws",
+			provider: ProviderAWS,
+			config: TerraformConfig{
+				ClusterName: "validate-aws",
+				Region:      "us-east-1",
+				NodePools:   []NodePool{{Name: "default", MachineType: "t3.medium", MinNodes: 1, MaxNodes: 2, DesiredNodes: 1}},
+				Addons:      []ClusterAddon{{Name: "vpc-cni", Enabled: true}},
+				AWS:         &AWSConfig{VPCCidr: "10.0.0.0/16", ServiceCidr: "10.96.0.0/12"},
+			},
+		},
+		{
+			name:     "azure",
+			provider: ProviderAzure,
+			config: TerraformConfig{
+				ClusterName: "validate-azure",
+				Region:      "eastus",
+				NodePools:   []NodePool{{Name: "default", MachineType: "Standard_D2s_v3", MinNodes: 1, MaxNodes: 2, DesiredNodes: 1}},
+				Addons:      []ClusterAddon{{Name: "azure-policy", Enabled: true}},
+				Azure:       &AzureConfig{ResourceGroup: "validate-rg", VNetCidr: "10.0.0.0/16", PodCidr: "10.244.0.0/16", ServiceCidr: "10.96.0.0/12", DNSPrefix: "validate"},
+			},
+		},
+		{
+			name:     "gcp",
+			provider: ProviderGCP,
+			config: TerraformConfig{
+				ClusterName: "validate-gcp",
+				Region:      "us-central1",
+				NodePools:   []NodePool{{Name: "default", MachineType: "e2-medium", MinNodes: 1, MaxNodes: 2, DesiredNodes: 1}},
+				Addons:      []ClusterAddon{{Name: "horizontal-pod-autoscaling", Enabled: true}},
+				GCP:         &GCPConfig{ProjectID: "project", SubnetCidr: "10.0.0.0/20", PodCidr: "10.1.0.0/16", ServiceCidr: "10.2.0.0/20", MasterIPv4CIDR: "172.16.0.0/28"},
+			},
+		},
+	}
+
+	generator := NewTerraformGenerator()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			generated, err := generator.Generate(tt.provider, tt.config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir, err := os.MkdirTemp("", "bds-terraform-validate-*")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				// Provider executables can remain briefly locked on Windows
+				// after terraform exits. Cleanup is best-effort; the OS temp
+				// directory remains the fallback cleanup boundary.
+				_ = os.RemoveAll(dir)
+			})
+			configuration := generated.MainTF + "\n" + generated.VariablesTF + "\n" + generated.OutputsTF
+			if err := os.WriteFile(filepath.Join(dir, "main.tf"), []byte(configuration), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			vars, err := json.Marshal(generated.TFVars)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "terraform.tfvars.json"), vars, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			for _, args := range [][]string{
+				{"init", "-backend=false", "-input=false", "-no-color"},
+				{"validate", "-no-color"},
+			} {
+				command := exec.Command("terraform", args...)
+				command.Dir = dir
+				command.Env = append(os.Environ(), "TF_IN_AUTOMATION=1", "CHECKPOINT_DISABLE=1")
+				if output, err := command.CombinedOutput(); err != nil {
+					t.Fatalf("terraform %s failed: %v\n%s", args[0], err, output)
+				}
+			}
+		})
+	}
+}
+
 func TestGenerateBootstrapToken(t *testing.T) {
 	token, hash, err := GenerateBootstrapToken()
 	if err != nil {
@@ -440,30 +634,8 @@ func TestHashToken(t *testing.T) {
 	}
 }
 
-func TestBootstrapGenerator_GenerateCommand(t *testing.T) {
-	gen := NewBootstrapGenerator("https://api.example.com", "ghcr.io/test/agent:latest")
-
-	token := "test-bootstrap-token"
-	expiresAt := time.Now().Add(24 * time.Hour)
-
-	cmd, err := gen.GenerateCommand("my-cluster", token, expiresAt)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if cmd.Command == "" {
-		t.Error("expected command to be non-empty")
-	}
-	if cmd.Manifest == "" {
-		t.Error("expected manifest to be non-empty")
-	}
-	if len(cmd.Instructions) == 0 {
-		t.Error("expected instructions to be non-empty")
-	}
-	if cmd.Token != token {
-		t.Errorf("expected token %s, got %s", token, cmd.Token)
-	}
-}
+// NOTE: TestBootstrapGenerator_GenerateCommand removed - BootstrapGenerator was removed
+// as part of Phase 4 migration to use cluster service's agent manifest.
 
 func TestDefaultInstallSteps(t *testing.T) {
 	if len(DefaultInstallSteps) == 0 {
@@ -481,32 +653,9 @@ func TestDefaultInstallSteps(t *testing.T) {
 	}
 }
 
-func TestAWSProvider_ValidateCredentials(t *testing.T) {
-	provider := &AWSProvider{}
-
-	// Valid credentials
-	validCreds := AWSCredentials{
-		AccessKeyID:     "AKIAIOSFODNN7EXAMPLE",
-		SecretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-	}
-	credsJSON, _ := json.Marshal(validCreds)
-
-	err := provider.ValidateCredentials(nil, credsJSON)
-	if err != nil {
-		t.Errorf("expected no error for valid credentials, got: %v", err)
-	}
-
-	// Missing access key
-	invalidCreds := AWSCredentials{
-		SecretAccessKey: "secret",
-	}
-	credsJSON, _ = json.Marshal(invalidCreds)
-
-	err = provider.ValidateCredentials(nil, credsJSON)
-	if err == nil {
-		t.Error("expected error for missing access key")
-	}
-}
+// Note: TestAWSProvider_ValidateCredentials was replaced by
+// TestAWSProvider_ValidateCredentials_MissingFields and
+// TestAWSProvider_ValidateCredentials_MockedSTS which use mocked clients.
 
 func TestAWSProvider_ListRegions(t *testing.T) {
 	provider := &AWSProvider{}
@@ -523,7 +672,7 @@ func TestAWSProvider_ListRegions(t *testing.T) {
 	// Check us-east-1 exists
 	found := false
 	for _, r := range regions {
-		if r.ID == "us-east-1" {
+		if r.Code == "us-east-1" {
 			found = true
 			break
 		}
@@ -548,10 +697,10 @@ func TestAWSProvider_ListMachineTypes(t *testing.T) {
 	// Check t3.medium exists
 	found := false
 	for _, mt := range types {
-		if mt.ID == "t3.medium" {
+		if mt.Name == "t3.medium" {
 			found = true
-			if mt.VCPU != 2 {
-				t.Errorf("expected t3.medium to have 2 vCPU, got %d", mt.VCPU)
+			if mt.VCPUs != 2 {
+				t.Errorf("expected t3.medium to have 2 vCPU, got %d", mt.VCPUs)
 			}
 			break
 		}
@@ -598,4 +747,366 @@ func TestGetDefaultMachineType(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ----------------------------------------------------------------------------
+// Cloud Provider Validation Tests
+// ----------------------------------------------------------------------------
+
+func TestAWSProvider_ValidateCredentials_MissingFields(t *testing.T) {
+	provider := &AWSProvider{}
+	ctx := t.Context()
+
+	tests := []struct {
+		name        string
+		creds       string
+		errContains string
+	}{
+		{
+			name:        "invalid JSON",
+			creds:       `{invalid`,
+			errContains: "invalid AWS credentials format",
+		},
+		{
+			name:        "missing accessKeyId",
+			creds:       `{"secretAccessKey": "secret"}`,
+			errContains: "accessKeyId is required",
+		},
+		{
+			name:        "missing secretAccessKey",
+			creds:       `{"accessKeyId": "AKIAIOSFODNN7EXAMPLE"}`,
+			errContains: "secretAccessKey is required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := provider.ValidateCredentials(ctx, []byte(tt.creds))
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if !strings.Contains(err.Error(), tt.errContains) {
+				t.Errorf("error %q should contain %q", err.Error(), tt.errContains)
+			}
+		})
+	}
+}
+
+func TestAWSProvider_ValidateCredentials_MockedSTS(t *testing.T) {
+	ctx := t.Context()
+
+	// Save original factory
+	originalFactory := AWSSTSClientFactory
+	defer func() { AWSSTSClientFactory = originalFactory }()
+
+	t.Run("valid credentials", func(t *testing.T) {
+		AWSSTSClientFactory = func(ctx context.Context, creds AWSCredentials) (STSClient, error) {
+			return &mockSTSClient{returnErr: nil}, nil
+		}
+
+		provider := &AWSProvider{}
+		creds := `{"accessKeyId": "AKIAIOSFODNN7EXAMPLE", "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"}`
+		err := provider.ValidateCredentials(ctx, []byte(creds))
+		if err != nil {
+			t.Errorf("expected no error, got: %v", err)
+		}
+	})
+
+	t.Run("invalid credentials - STS error", func(t *testing.T) {
+		AWSSTSClientFactory = func(ctx context.Context, creds AWSCredentials) (STSClient, error) {
+			return &mockSTSClient{returnErr: errors.New("InvalidClientTokenId: The security token included in the request is invalid")}, nil
+		}
+
+		provider := &AWSProvider{}
+		creds := `{"accessKeyId": "AKIAINVALIDKEY", "secretAccessKey": "invalidsecret"}`
+		err := provider.ValidateCredentials(ctx, []byte(creds))
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !strings.Contains(err.Error(), "InvalidClientTokenId") {
+			t.Errorf("error should contain AWS error message, got: %v", err)
+		}
+	})
+}
+
+func TestAzureProvider_ValidateCredentials_MissingFields(t *testing.T) {
+	provider := &AzureProvider{}
+	ctx := t.Context()
+
+	tests := []struct {
+		name        string
+		creds       string
+		errContains string
+	}{
+		{
+			name:        "invalid JSON",
+			creds:       `{invalid`,
+			errContains: "invalid Azure credentials format",
+		},
+		{
+			name:        "missing subscriptionId",
+			creds:       `{"tenantId": "t", "clientId": "c", "clientSecret": "s"}`,
+			errContains: "subscriptionId is required",
+		},
+		{
+			name:        "missing tenantId",
+			creds:       `{"subscriptionId": "s", "clientId": "c", "clientSecret": "s"}`,
+			errContains: "tenantId is required",
+		},
+		{
+			name:        "missing clientId",
+			creds:       `{"subscriptionId": "s", "tenantId": "t", "clientSecret": "s"}`,
+			errContains: "clientId is required",
+		},
+		{
+			name:        "missing clientSecret",
+			creds:       `{"subscriptionId": "s", "tenantId": "t", "clientId": "c"}`,
+			errContains: "clientSecret is required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := provider.ValidateCredentials(ctx, []byte(tt.creds))
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if !strings.Contains(err.Error(), tt.errContains) {
+				t.Errorf("error %q should contain %q", err.Error(), tt.errContains)
+			}
+		})
+	}
+}
+
+func TestAzureProvider_ValidateCredentials_MockedHTTP(t *testing.T) {
+	ctx := t.Context()
+
+	// Save original factory
+	originalFactory := AzureHTTPClientFactory
+	defer func() { AzureHTTPClientFactory = originalFactory }()
+
+	creds := `{"subscriptionId": "sub-123", "tenantId": "tenant-456", "clientId": "client-789", "clientSecret": "secret"}`
+
+	t.Run("valid credentials", func(t *testing.T) {
+		AzureHTTPClientFactory = func() AzureHTTPClient {
+			return &mockHTTPClient{
+				statusCode: 200,
+				body:       `{"access_token": "token", "token_type": "Bearer", "expires_in": 3600}`,
+			}
+		}
+
+		provider := &AzureProvider{}
+		err := provider.ValidateCredentials(ctx, []byte(creds))
+		if err != nil {
+			t.Errorf("expected no error, got: %v", err)
+		}
+	})
+
+	t.Run("invalid credentials - unauthorized", func(t *testing.T) {
+		AzureHTTPClientFactory = func() AzureHTTPClient {
+			return &mockHTTPClient{
+				statusCode: 401,
+				body:       `{"error": "invalid_client", "error_description": "AADSTS7000215: Invalid client secret provided."}`,
+			}
+		}
+
+		provider := &AzureProvider{}
+		err := provider.ValidateCredentials(ctx, []byte(creds))
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !strings.Contains(err.Error(), "invalid_client") {
+			t.Errorf("error should contain Azure error code, got: %v", err)
+		}
+	})
+}
+
+func TestGCPProvider_ValidateCredentials_MissingFields(t *testing.T) {
+	provider := &GCPProvider{}
+	ctx := t.Context()
+
+	tests := []struct {
+		name        string
+		creds       string
+		errContains string
+	}{
+		{
+			name:        "invalid JSON",
+			creds:       `{invalid`,
+			errContains: "invalid GCP credentials format",
+		},
+		{
+			name:        "missing projectId",
+			creds:       `{"serviceAccountJson": "{}"}`,
+			errContains: "projectId is required",
+		},
+		{
+			name:        "missing serviceAccountJson",
+			creds:       `{"projectId": "my-project"}`,
+			errContains: "serviceAccountJson is required",
+		},
+		{
+			name:        "invalid service account type",
+			creds:       `{"projectId": "my-project", "serviceAccountJson": "{\"type\": \"user\", \"client_email\": \"e\", \"private_key\": \"k\"}"}`,
+			errContains: "type must be 'service_account'",
+		},
+		{
+			name:        "missing client_email",
+			creds:       `{"projectId": "my-project", "serviceAccountJson": "{\"type\": \"service_account\", \"private_key\": \"k\"}"}`,
+			errContains: "client_email is required",
+		},
+		{
+			name:        "missing private_key",
+			creds:       `{"projectId": "my-project", "serviceAccountJson": "{\"type\": \"service_account\", \"client_email\": \"e\"}"}`,
+			errContains: "private_key is required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := provider.ValidateCredentials(ctx, []byte(tt.creds))
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if !strings.Contains(err.Error(), tt.errContains) {
+				t.Errorf("error %q should contain %q", err.Error(), tt.errContains)
+			}
+		})
+	}
+}
+
+func TestGCPProvider_ValidateCredentials_MockedHTTP(t *testing.T) {
+	ctx := t.Context()
+
+	// Save original factory
+	originalFactory := GCPHTTPClientFactory
+	defer func() { GCPHTTPClientFactory = originalFactory }()
+
+	// Generate a test RSA private key for JWT signing
+	testPrivateKey := generateTestRSAPrivateKeyPEM(t)
+
+	// Build valid GCP credentials with the test private key
+	serviceAccountJSON := fmt.Sprintf(`{
+		"type": "service_account",
+		"project_id": "test-project",
+		"private_key_id": "key123",
+		"private_key": %s,
+		"client_email": "test@test-project.iam.gserviceaccount.com",
+		"client_id": "123456789",
+		"auth_uri": "https://accounts.google.com/o/oauth2/auth",
+		"token_uri": "https://oauth2.googleapis.com/token"
+	}`, strconv.Quote(testPrivateKey))
+
+	creds := fmt.Sprintf(`{"projectId": "test-project", "serviceAccountJson": %s}`, strconv.Quote(serviceAccountJSON))
+
+	t.Run("valid credentials", func(t *testing.T) {
+		GCPHTTPClientFactory = func() GCPHTTPClient {
+			return &mockHTTPClient{
+				statusCode: 200,
+				body:       `{"access_token": "ya29.test-token", "token_type": "Bearer", "expires_in": 3600}`,
+			}
+		}
+
+		provider := &GCPProvider{}
+		err := provider.ValidateCredentials(ctx, []byte(creds))
+		if err != nil {
+			t.Errorf("expected no error, got: %v", err)
+		}
+	})
+
+	t.Run("invalid credentials - invalid_grant", func(t *testing.T) {
+		GCPHTTPClientFactory = func() GCPHTTPClient {
+			return &mockHTTPClient{
+				statusCode: 400,
+				body:       `{"error": "invalid_grant", "error_description": "Invalid JWT Signature."}`,
+			}
+		}
+
+		provider := &GCPProvider{}
+		err := provider.ValidateCredentials(ctx, []byte(creds))
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !strings.Contains(err.Error(), "invalid_grant") {
+			t.Errorf("error should contain GCP error code 'invalid_grant', got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "Invalid JWT Signature") {
+			t.Errorf("error should contain GCP error description, got: %v", err)
+		}
+	})
+
+	t.Run("invalid credentials - unauthorized_client", func(t *testing.T) {
+		GCPHTTPClientFactory = func() GCPHTTPClient {
+			return &mockHTTPClient{
+				statusCode: 401,
+				body:       `{"error": "unauthorized_client", "error_description": "Client is unauthorized to retrieve access tokens using this method."}`,
+			}
+		}
+
+		provider := &GCPProvider{}
+		err := provider.ValidateCredentials(ctx, []byte(creds))
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !strings.Contains(err.Error(), "unauthorized_client") {
+			t.Errorf("error should contain GCP error code, got: %v", err)
+		}
+	})
+}
+
+// generateTestRSAPrivateKeyPEM generates a test RSA private key in PEM format.
+func generateTestRSAPrivateKeyPEM(t *testing.T) string {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("failed to generate test RSA key: %v", err)
+	}
+	keyBytes, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatalf("failed to marshal test RSA key: %v", err)
+	}
+	pemBlock := &pem.Block{
+		Type:  "PRIVATE KEY",
+		Bytes: keyBytes,
+	}
+	return string(pem.EncodeToMemory(pemBlock))
+}
+
+// ----------------------------------------------------------------------------
+// Mock Helpers
+// ----------------------------------------------------------------------------
+
+type mockSTSClient struct {
+	returnErr error
+}
+
+func (m *mockSTSClient) GetCallerIdentity(ctx context.Context, params *sts.GetCallerIdentityInput, optFns ...func(*sts.Options)) (*sts.GetCallerIdentityOutput, error) {
+	if m.returnErr != nil {
+		return nil, m.returnErr
+	}
+	account := "123456789012"
+	arn := "arn:aws:iam::123456789012:user/test"
+	userID := "AIDAEXAMPLE"
+	return &sts.GetCallerIdentityOutput{
+		Account: &account,
+		Arn:     &arn,
+		UserId:  &userID,
+	}, nil
+}
+
+type mockHTTPClient struct {
+	statusCode int
+	body       string
+	err        error
+}
+
+func (m *mockHTTPClient) Do(req *http.Request) (*http.Response, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	return &http.Response{
+		StatusCode: m.statusCode,
+		Body:       io.NopCloser(strings.NewReader(m.body)),
+		Header:     make(http.Header),
+	}, nil
 }

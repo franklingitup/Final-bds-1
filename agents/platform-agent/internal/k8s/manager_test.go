@@ -15,6 +15,22 @@ import (
 	"github.com/bdsplatform/platform/agents/platform-agent/internal/controlplane"
 )
 
+func TestManager_EnsureNamespace(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	manager := NewManager(client, "platform-agent", "proj-")
+
+	require.NoError(t, manager.EnsureNamespace(context.Background(), "proj-payments"))
+	namespace, err := client.CoreV1().Namespaces().Get(
+		context.Background(),
+		"proj-payments",
+		metav1.GetOptions{},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, LabelManagedByValue, namespace.Labels[LabelManagedBy])
+
+	require.Error(t, manager.EnsureNamespace(context.Background(), "platform-agent"))
+}
+
 func TestManager_ApplyDeployment_Create(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	manager := NewManager(client, "default")
@@ -46,6 +62,12 @@ func TestManager_ApplyDeployment_Create(t *testing.T) {
 	assert.Equal(t, "dep-1", dep.Labels[LabelDeploymentID])
 	assert.Equal(t, "1", dep.Annotations[AnnotationRevision])
 	assert.Equal(t, "rel-1", dep.Annotations[AnnotationReleaseID])
+
+	// Verify pod template also has the deployment-id label.
+	// This is critical for metrics collector and log shipper to attribute
+	// pods back to their owning deployments.
+	assert.Equal(t, "dep-1", dep.Spec.Template.Labels[LabelDeploymentID],
+		"pod template must carry deployment-id label for metrics/log attribution")
 }
 
 func TestManager_ApplyDeployment_Update(t *testing.T) {
@@ -289,7 +311,7 @@ func TestManager_GetDeploymentStatus(t *testing.T) {
 	_, err := client.AppsV1().Deployments("default").Create(ctx, dep, metav1.CreateOptions{})
 	require.NoError(t, err)
 
-	status, err := manager.GetDeploymentStatus(ctx, "my-app")
+	status, err := manager.GetDeploymentStatus(ctx, "default", "my-app")
 
 	require.NoError(t, err)
 	require.NotNil(t, status)
@@ -306,7 +328,7 @@ func TestManager_GetDeploymentStatus_NotFound(t *testing.T) {
 	manager := NewManager(client, "default")
 
 	ctx := context.Background()
-	status, err := manager.GetDeploymentStatus(ctx, "nonexistent")
+	status, err := manager.GetDeploymentStatus(ctx, "default", "nonexistent")
 
 	require.NoError(t, err)
 	assert.Nil(t, status)
@@ -442,4 +464,17 @@ func TestDeploymentSpec_ResourceName(t *testing.T) {
 	}
 
 	assert.Equal(t, "my-awesome-app", spec.ResourceName())
+}
+
+// TestLabelDeploymentID_MatchesCollectorExpectation verifies the deployment-id
+// label key constant matches the exact string the metrics collector and log
+// shipper query for. A mismatch would silently break pod-to-deployment
+// attribution without any runtime error.
+func TestLabelDeploymentID_MatchesCollectorExpectation(t *testing.T) {
+	// This is the exact label key the metricscollector and logshipper use:
+	//   pod.Labels["bdsplatform.io/deployment-id"]
+	expectedKey := "bdsplatform.io/deployment-id"
+
+	assert.Equal(t, expectedKey, LabelDeploymentID,
+		"LabelDeploymentID constant must match the exact key used by metrics/log collectors")
 }

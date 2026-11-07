@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
-	"net/url"
 	"strings"
 	"time"
 
@@ -22,6 +21,7 @@ type Deps struct {
 	BuildArtifacts BuildArtifactStore
 	BuildQueue     BuildQueueStore
 	OrgMembers     authz.OrgMemberStore
+	ProjectMembers authz.ProjectMemberStore
 	Outbox         events.Outbox
 	Tenant         TenantRunner
 	Logger         *slog.Logger
@@ -51,6 +51,10 @@ func NewService(d Deps) *Service {
 	if d.Now == nil {
 		d.Now = time.Now
 	}
+	authSvc := authz.NewAuthorizationService(d.Tenant, d.OrgMembers, nil)
+	if d.ProjectMembers != nil {
+		authSvc = authSvc.WithProjectMembers(d.ProjectMembers)
+	}
 	return &Service{
 		repos:      d.Repositories,
 		builds:     d.Builds,
@@ -60,7 +64,7 @@ func NewService(d Deps) *Service {
 		orgMembers: d.OrgMembers,
 		outbox:     d.Outbox,
 		tenant:     d.Tenant,
-		authSvc:    authz.NewAuthorizationService(d.Tenant, d.OrgMembers, nil),
+		authSvc:    authSvc,
 		log:        d.Logger,
 		now:        d.Now,
 	}
@@ -71,8 +75,9 @@ func NewService(d Deps) *Service {
 // ----------------------------------------------------------------------------
 
 // CreateRepository registers a new Git repository.
+// SECURITY: Requires org admin/owner OR project membership with deploy privileges.
 func (s *Service) CreateRepository(ctx context.Context, orgID, projectID, userID string, req CreateRepositoryRequest) (*GitRepository, error) {
-	if _, err := s.authSvc.AuthorizeOrgMember(ctx, orgID, userID, authz.ActionDeploy); err != nil {
+	if _, err := s.authSvc.AuthorizeProjectMember(ctx, orgID, projectID, userID, authz.ActionDeploy); err != nil {
 		return nil, err
 	}
 
@@ -85,8 +90,8 @@ func (s *Service) CreateRepository(ctx context.Context, orgID, projectID, userID
 	if repoURL == "" {
 		return nil, errURLRequired
 	}
-	if !isValidGitURL(repoURL) {
-		return nil, errInvalidGitURL
+	if err := ValidateGitURL(ctx, repoURL); err != nil {
+		return nil, err
 	}
 
 	defaultBranch := strings.TrimSpace(req.DefaultBranch)
@@ -134,22 +139,14 @@ func (s *Service) CreateRepository(ctx context.Context, orgID, projectID, userID
 
 // GetRepository returns a repository by ID.
 func (s *Service) GetRepository(ctx context.Context, orgID, userID, repoID string) (*GitRepository, error) {
-	if _, err := s.authSvc.AuthorizeOrgRead(ctx, orgID, userID); err != nil {
-		return nil, err
-	}
-
-	var repo *GitRepository
-	err := s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
-		var err error
-		repo, err = s.repos.GetByID(ctx, repoID)
-		return err
-	})
-	return repo, err
+	return s.authorizeRepository(ctx, orgID, userID, repoID, authz.ActionReadDeployment)
 }
 
 // ListRepositories returns repositories for a project.
+// ListRepositories returns repositories for a project.
+// SECURITY: Requires org admin/owner OR project membership with read privileges.
 func (s *Service) ListRepositories(ctx context.Context, orgID, userID, projectID string, page database.PageRequest) (database.Page[GitRepository], error) {
-	if _, err := s.authSvc.AuthorizeOrgRead(ctx, orgID, userID); err != nil {
+	if _, err := s.authSvc.AuthorizeProjectMember(ctx, orgID, projectID, userID, authz.ActionReadDeployment); err != nil {
 		return database.Page[GitRepository]{}, err
 	}
 
@@ -164,7 +161,7 @@ func (s *Service) ListRepositories(ctx context.Context, orgID, userID, projectID
 
 // UpdateRepository updates a repository.
 func (s *Service) UpdateRepository(ctx context.Context, orgID, userID, repoID string, req UpdateRepositoryRequest) (*GitRepository, error) {
-	if _, err := s.authSvc.AuthorizeOrgMember(ctx, orgID, userID, authz.ActionDeploy); err != nil {
+	if _, err := s.authorizeRepository(ctx, orgID, userID, repoID, authz.ActionDeploy); err != nil {
 		return nil, err
 	}
 
@@ -188,8 +185,8 @@ func (s *Service) UpdateRepository(ctx context.Context, orgID, userID, repoID st
 			if repoURL == "" {
 				return errURLRequired
 			}
-			if !isValidGitURL(repoURL) {
-				return errInvalidGitURL
+			if err := ValidateGitURL(ctx, repoURL); err != nil {
+				return err
 			}
 			repo.URL = repoURL
 		}
@@ -219,7 +216,7 @@ func (s *Service) UpdateRepository(ctx context.Context, orgID, userID, repoID st
 
 // DeleteRepository deletes a repository.
 func (s *Service) DeleteRepository(ctx context.Context, orgID, userID, repoID string) error {
-	if _, err := s.authSvc.AuthorizeOrgMember(ctx, orgID, userID, authz.ActionDeploy); err != nil {
+	if _, err := s.authorizeRepository(ctx, orgID, userID, repoID, authz.ActionDeploy); err != nil {
 		return err
 	}
 
@@ -241,8 +238,15 @@ func (s *Service) DeleteRepository(ctx context.Context, orgID, userID, repoID st
 
 // CreateBuild triggers a new build.
 func (s *Service) CreateBuild(ctx context.Context, orgID, userID string, req CreateBuildRequest) (*Build, error) {
-	if _, err := s.authSvc.AuthorizeOrgMember(ctx, orgID, userID, authz.ActionDeploy); err != nil {
-		return nil, err
+	if req.RepositoryID != nil {
+		if _, err := s.authorizeRepository(ctx, orgID, userID, *req.RepositoryID, authz.ActionDeploy); err != nil {
+			return nil, err
+		}
+	} else {
+		// Direct-URL builds are org-scoped because they have no project identity.
+		if _, err := s.authSvc.AuthorizeOrgMember(ctx, orgID, userID, authz.ActionDeploy); err != nil {
+			return nil, err
+		}
 	}
 
 	// Validate source
@@ -258,9 +262,11 @@ func (s *Service) CreateBuild(ctx context.Context, orgID, userID string, req Cre
 		return nil, errInvalidRegistry
 	}
 
-	// Validate git URL if provided directly
-	if req.GitURL != nil && !isValidGitURL(*req.GitURL) {
-		return nil, errInvalidGitURL
+	// Validate git URL if provided directly (SSRF-safe: DNS resolution included)
+	if req.GitURL != nil {
+		if err := ValidateGitURL(ctx, *req.GitURL); err != nil {
+			return nil, err
+		}
 	}
 
 	// Set defaults
@@ -372,17 +378,11 @@ func (s *Service) CreateBuild(ctx context.Context, orgID, userID string, req Cre
 
 // GetBuild returns a build by ID.
 func (s *Service) GetBuild(ctx context.Context, orgID, userID, buildID string) (*Build, error) {
-	if _, err := s.authSvc.AuthorizeOrgRead(ctx, orgID, userID); err != nil {
+	b, err := s.authorizeBuild(ctx, orgID, userID, buildID, authz.ActionReadDeployment)
+	if err != nil {
 		return nil, err
 	}
-
-	var b *Build
-	err := s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
-		var err error
-		b, err = s.builds.GetByID(ctx, buildID)
-		return err
-	})
-	return b, err
+	return b, nil
 }
 
 // ListBuilds returns builds for the organization.
@@ -402,7 +402,7 @@ func (s *Service) ListBuilds(ctx context.Context, orgID, userID string, page dat
 
 // CancelBuild cancels a queued or running build.
 func (s *Service) CancelBuild(ctx context.Context, orgID, userID, buildID string) (*Build, error) {
-	if _, err := s.authSvc.AuthorizeOrgMember(ctx, orgID, userID, authz.ActionDeploy); err != nil {
+	if _, err := s.authorizeBuild(ctx, orgID, userID, buildID, authz.ActionDeploy); err != nil {
 		return nil, err
 	}
 
@@ -443,7 +443,7 @@ func (s *Service) CancelBuild(ctx context.Context, orgID, userID, buildID string
 
 // RetryBuild retries a failed build.
 func (s *Service) RetryBuild(ctx context.Context, orgID, userID, buildID string, req RetryBuildRequest) (*Build, error) {
-	if _, err := s.authSvc.AuthorizeOrgMember(ctx, orgID, userID, authz.ActionDeploy); err != nil {
+	if _, err := s.authorizeBuild(ctx, orgID, userID, buildID, authz.ActionDeploy); err != nil {
 		return nil, err
 	}
 
@@ -508,7 +508,7 @@ func (s *Service) RetryBuild(ctx context.Context, orgID, userID, buildID string,
 
 // GetBuildLogs returns logs for a build.
 func (s *Service) GetBuildLogs(ctx context.Context, orgID, userID, buildID string, page database.PageRequest) (database.Page[BuildLog], error) {
-	if _, err := s.authSvc.AuthorizeOrgRead(ctx, orgID, userID); err != nil {
+	if _, err := s.authorizeBuild(ctx, orgID, userID, buildID, authz.ActionReadLogs); err != nil {
 		return database.Page[BuildLog]{}, err
 	}
 
@@ -523,7 +523,7 @@ func (s *Service) GetBuildLogs(ctx context.Context, orgID, userID, buildID strin
 
 // GetBuildArtifact returns the artifact for a build.
 func (s *Service) GetBuildArtifact(ctx context.Context, orgID, userID, buildID string) (*BuildArtifact, error) {
-	if _, err := s.authSvc.AuthorizeOrgRead(ctx, orgID, userID); err != nil {
+	if _, err := s.authorizeBuild(ctx, orgID, userID, buildID, authz.ActionReadDeployment); err != nil {
 		return nil, err
 	}
 
@@ -714,6 +714,12 @@ func (s *Service) TriggerBuildFromWebhook(ctx context.Context, orgID string, req
 	if req.GitURL == "" {
 		return "", errInvalidSource
 	}
+	// SSRF check on the webhook-supplied URL. Lower-risk than direct API calls
+	// (URL comes from a pre-registered repository), but applied for consistency
+	// and defence in depth.
+	if err := ValidateGitURL(ctx, req.GitURL); err != nil {
+		return "", err
+	}
 	if req.TargetImage == "" {
 		return "", errInvalidTargetImage
 	}
@@ -773,17 +779,49 @@ func (s *Service) TriggerBuildFromWebhook(ctx context.Context, orgID string, req
 // Helpers
 // ----------------------------------------------------------------------------
 
-func isValidGitURL(rawURL string) bool {
-	// Handle SSH URLs
-	if strings.HasPrefix(rawURL, "git@") {
-		return strings.Contains(rawURL, ":")
+func (s *Service) authorizeRepository(ctx context.Context, orgID, userID, repoID string, action authz.Action) (*GitRepository, error) {
+	if _, err := s.authSvc.AuthorizeOrgRead(ctx, orgID, userID); err != nil {
+		return nil, err
 	}
-
-	// Handle HTTP(S) URLs
-	u, err := url.Parse(rawURL)
+	var repo *GitRepository
+	err := s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
+		var err error
+		repo, err = s.repos.GetByID(ctx, repoID)
+		return err
+	})
 	if err != nil {
-		return false
+		return nil, err
 	}
-
-	return (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
+	if _, err := s.authSvc.AuthorizeProjectMember(ctx, orgID, repo.ProjectID, userID, action); err != nil {
+		return nil, err
+	}
+	return repo, nil
 }
+
+func (s *Service) authorizeBuild(ctx context.Context, orgID, userID, buildID string, action authz.Action) (*Build, error) {
+	if _, err := s.authSvc.AuthorizeOrgRead(ctx, orgID, userID); err != nil {
+		return nil, err
+	}
+	var build *Build
+	err := s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
+		var err error
+		build, err = s.builds.GetByID(ctx, buildID)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	if build.RepositoryID != nil {
+		if _, err := s.authorizeRepository(ctx, orgID, userID, *build.RepositoryID, action); err != nil {
+			return nil, err
+		}
+		return build, nil
+	}
+	if _, err := s.authSvc.AuthorizeOrgMember(ctx, orgID, userID, action); err != nil {
+		return nil, err
+	}
+	return build, nil
+}
+
+// isValidGitURL has been removed. Use ValidateGitURL (ssrf.go) instead —
+// it performs both syntactic validation and a DNS-resolution SSRF check.

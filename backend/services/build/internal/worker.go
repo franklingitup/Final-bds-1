@@ -146,51 +146,100 @@ func (w *Worker) poll(ctx context.Context) {
 
 func (w *Worker) executeBuild(ctx context.Context, build *Build) {
 	startTime := time.Now()
-	
+
+	// logCtx is used exclusively for AppendBuildLog calls. It is intentionally
+	// detached from the build's cancellable context so that failure log entries
+	// are always written even when:
+	//   • the build times out (ctx is context.DeadlineExceeded), or
+	//   • the worker is shutting down (ctx is context.Canceled), or
+	//   • the deferred cancel() in the caller goroutine fires before the final
+	//     log entry is committed (see Bug B in the runCommand comment).
+	//
+	// A 30-second hard deadline ensures we don't block forever if the database
+	// is unreachable.
+	logCtx, stopLogCtx := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer stopLogCtx()
+
+	logEntry := func(level, stream, message string) {
+		if err := w.svc.AppendBuildLog(logCtx, build.OrgID, build.ID, level, stream, message, nil); err != nil {
+			// Escalate to the worker logger so operators can see it even when
+			// the build log itself is unavailable.
+			w.log.Error("failed to write build log entry",
+				"buildId", build.ID,
+				"level", level,
+				"stream", stream,
+				"message", message,
+				"error", err)
+		}
+	}
+
 	job := &BuildJob{
 		Build:    build,
 		OrgID:    build.OrgID,
 		WorkerID: w.cfg.WorkerID,
 		LogWriter: func(level, stream, message string, metadata map[string]any) {
-			if err := w.svc.AppendBuildLog(ctx, build.OrgID, build.ID, level, stream, message, metadata); err != nil {
-				w.log.Warn("failed to append build log", "buildId", build.ID, "error", err)
-			}
+			logEntry(level, stream, message)
 		},
 		OnProgress: func(stage string) {
 			w.log.Debug("build progress", "buildId", build.ID, "stage", stage)
 		},
 	}
 
-	// Mark build as started
+	// Mark build as started. If this fails the build is stuck in StatusQueued
+	// forever, so transition it to failed immediately.
 	if err := w.svc.MarkBuildStarted(ctx, build.OrgID, build.ID, w.cfg.WorkerID, nil); err != nil {
 		w.log.Error("failed to mark build started", "buildId", build.ID, "error", err)
+		// Persist the failure so the build doesn't stay in "queued" permanently.
+		logEntry(LevelError, StreamSystem, fmt.Sprintf("Worker failed to start build: %v", err))
+		if markErr := w.svc.MarkBuildFailed(ctx, build.OrgID, build.ID, err.Error(), "start"); markErr != nil {
+			w.log.Error("failed to mark build failed after start error", "buildId", build.ID, "error", markErr)
+		}
 		return
 	}
 
 	// Log the start
-	job.LogWriter(LevelInfo, StreamSystem, fmt.Sprintf("Build started by worker %s", w.cfg.WorkerID), nil)
+	logEntry(LevelInfo, StreamSystem, fmt.Sprintf("Build started by worker %s", w.cfg.WorkerID))
 
-	// Execute the build
+	// Execute the build.
+	// runCommand (inside the builder) now uses sync.WaitGroup to ensure all
+	// real-time log entries are committed before Build() returns, so by the
+	// time we reach the error-handling block below every streamed Docker/git
+	// line is already in the database.
 	err := w.builder.Build(ctx, job)
 	durationMs := time.Since(startTime).Milliseconds()
 
 	if err != nil {
 		stage := "building"
+		var logMsg string
+
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			job.LogWriter(LevelError, StreamSystem, fmt.Sprintf("Build cancelled or timed out: %v", err), nil)
+			logMsg = fmt.Sprintf("Build cancelled or timed out after %dms: %v", durationMs, err)
 			stage = "timeout"
 		} else {
-			job.LogWriter(LevelError, StreamSystem, fmt.Sprintf("Build failed: %v", err), nil)
+			// err.Error() now includes any captured stderr from runCommand, so
+			// this single line gives operators the full picture: exit code +
+			// the actual command output that explains why the build failed.
+			logMsg = fmt.Sprintf("Build failed after %dms: %v", durationMs, err)
 		}
-		
+
+		// UNCONDITIONAL: always write the failure entry, regardless of whether
+		// the build context was cancelled. logCtx is detached from ctx, so this
+		// write succeeds even after ctx is done.
+		logEntry(LevelError, StreamSystem, logMsg)
+		w.log.Error("build failed",
+			"buildId", build.ID,
+			"durationMs", durationMs,
+			"stage", stage,
+			"error", err)
+
 		if markErr := w.svc.MarkBuildFailed(ctx, build.OrgID, build.ID, err.Error(), stage); markErr != nil {
 			w.log.Error("failed to mark build failed", "buildId", build.ID, "error", markErr)
 		}
 		return
 	}
 
-	// Build succeeded - artifact should have been created by the builder
-	job.LogWriter(LevelInfo, StreamSystem, fmt.Sprintf("Build completed in %dms", durationMs), nil)
+	// Build succeeded - artifact should have been created by the builder.
+	logEntry(LevelInfo, StreamSystem, fmt.Sprintf("Build completed in %dms", durationMs))
 	w.log.Info("build succeeded", "buildId", build.ID, "durationMs", durationMs)
 }
 

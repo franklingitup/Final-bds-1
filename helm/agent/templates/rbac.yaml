@@ -15,6 +15,16 @@ metadata:
   labels:
     {{- include "agent.labels" . | nindent 4 }}
 rules:
+  # Customer project namespace lifecycle
+  - apiGroups: [""]
+    resources:
+      - namespaces
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+
   # Workloads
   - apiGroups: ["apps"]
     resources:
@@ -35,6 +45,7 @@ rules:
       - services
       - secrets
       - configmaps
+      - persistentvolumeclaims
       - pods
       - pods/log
     verbs:
@@ -45,6 +56,14 @@ rules:
       - update
       - patch
       - delete
+
+  # Pod resource usage from metrics-server
+  - apiGroups: ["metrics.k8s.io"]
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
 
   # Cluster inventory (required during registration)
   - apiGroups: [""]

@@ -29,6 +29,7 @@ type TenantRunner interface {
 type UserStore interface {
 	Create(ctx context.Context, u *User) error
 	GetByID(ctx context.Context, id string) (*User, error)
+	GetByIDs(ctx context.Context, ids []string) ([]User, error)
 	GetByEmail(ctx context.Context, email string) (*User, error)
 	Update(ctx context.Context, u *User) error
 }
@@ -126,6 +127,13 @@ func (r *userRepo) GetByID(ctx context.Context, id string) (*User, error) {
 		return nil, err
 	}
 	return &u, nil
+}
+
+func (r *userRepo) GetByIDs(ctx context.Context, ids []string) ([]User, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	return database.QueryAll[User](ctx, r.db.Conn(ctx), "SELECT * FROM users WHERE id = ANY($1::uuid[])", ids)
 }
 
 func (r *userRepo) GetByEmail(ctx context.Context, email string) (*User, error) {

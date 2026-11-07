@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,6 +42,11 @@ func (c *fakeDeploymentClient) GetDesiredState(ctx context.Context, creds contro
 	if c.getError != nil {
 		return nil, c.getError
 	}
+	for i := range c.deployments {
+		if c.deployments[i].ProjectSlug == "" && c.deployments[i].ProjectID == "" {
+			c.deployments[i].ProjectSlug = "project-1"
+		}
+	}
 	return c.deployments, nil
 }
 
@@ -73,10 +79,12 @@ func (c *fakeDeploymentClient) lastProgress(releaseID string) (controlplane.Depl
 // ----------------------------------------------------------------------------
 
 type fakeResourceManager struct {
-	deployments    map[string]*k8s.DeploymentStatus
-	appliedSpecs   map[string]k8s.DeploymentSpec // keyed by deployment ID for uniqueness
-	applyError     error
-	deleteError    error
+	deployments       map[string]*k8s.DeploymentStatus
+	appliedSpecs      map[string]k8s.DeploymentSpec // keyed by deployment ID for uniqueness
+	namespaces        map[string]bool
+	legacyDeployments map[string]bool
+	applyError        error
+	deleteError       error
 
 	// ConfigMap state.
 	configMaps        map[string]k8s.ConfigMapSpec // applied configmaps by name
@@ -108,6 +116,8 @@ func newFakeResourceManager() *fakeResourceManager {
 	return &fakeResourceManager{
 		deployments:       make(map[string]*k8s.DeploymentStatus),
 		appliedSpecs:      make(map[string]k8s.DeploymentSpec),
+		namespaces:        make(map[string]bool),
+		legacyDeployments: make(map[string]bool),
 		configMaps:        make(map[string]k8s.ConfigMapSpec),
 		managedConfigMaps: make(map[string]bool),
 		pvcs:              make(map[string]k8s.PVCSpec),
@@ -116,6 +126,18 @@ func newFakeResourceManager() *fakeResourceManager {
 		ingresses:         make(map[string]k8s.IngressSpec),
 		managedIngresses:  make(map[string]bool),
 	}
+}
+
+func (m *fakeResourceManager) HasLegacyDeployment(_ context.Context, name string) (bool, error) {
+	return m.legacyDeployments[name], nil
+}
+
+func (m *fakeResourceManager) EnsureNamespace(_ context.Context, namespace string) error {
+	if namespace == "" || namespace == "platform-agent" {
+		return assert.AnError
+	}
+	m.namespaces[namespace] = true
+	return nil
 }
 
 func (m *fakeResourceManager) ApplyIngress(ctx context.Context, spec k8s.IngressSpec) (*k8s.ApplyResult, error) {
@@ -138,6 +160,10 @@ func (m *fakeResourceManager) DeleteIngress(ctx context.Context, name string) er
 	if m.deleteError != nil {
 		return m.deleteError
 	}
+	_, resourceName, found := strings.Cut(name, "/")
+	if found {
+		name = resourceName
+	}
 	delete(m.ingresses, name)
 	delete(m.managedIngresses, name)
 	m.deletedIngresses = append(m.deletedIngresses, name)
@@ -147,7 +173,8 @@ func (m *fakeResourceManager) DeleteIngress(ctx context.Context, name string) er
 func (m *fakeResourceManager) ListManagedIngresses(ctx context.Context) ([]string, error) {
 	names := make([]string, 0, len(m.managedIngresses))
 	for name := range m.managedIngresses {
-		names = append(names, name)
+		spec := m.ingresses[name]
+		names = append(names, k8s.ResourceKey(spec.Namespace, name))
 	}
 	return names, nil
 }
@@ -181,6 +208,10 @@ func (m *fakeResourceManager) DeletePVC(ctx context.Context, name string) error 
 	if m.deleteError != nil {
 		return m.deleteError
 	}
+	_, resourceName, found := strings.Cut(name, "/")
+	if found {
+		name = resourceName
+	}
 	delete(m.pvcs, name)
 	delete(m.managedPVCs, name)
 	m.deletedPVCs = append(m.deletedPVCs, name)
@@ -190,7 +221,8 @@ func (m *fakeResourceManager) DeletePVC(ctx context.Context, name string) error 
 func (m *fakeResourceManager) ListManagedPVCs(ctx context.Context) ([]string, error) {
 	names := make([]string, 0, len(m.managedPVCs))
 	for name := range m.managedPVCs {
-		names = append(names, name)
+		spec := m.pvcs[name]
+		names = append(names, k8s.ResourceKey(spec.Namespace, name))
 	}
 	return names, nil
 }
@@ -219,6 +251,10 @@ func (m *fakeResourceManager) DeleteConfigMap(ctx context.Context, name string) 
 	if m.deleteError != nil {
 		return m.deleteError
 	}
+	_, resourceName, found := strings.Cut(name, "/")
+	if found {
+		name = resourceName
+	}
 	delete(m.configMaps, name)
 	delete(m.managedConfigMaps, name)
 	m.deletedConfigMaps = append(m.deletedConfigMaps, name)
@@ -228,7 +264,8 @@ func (m *fakeResourceManager) DeleteConfigMap(ctx context.Context, name string) 
 func (m *fakeResourceManager) ListManagedConfigMaps(ctx context.Context) ([]string, error) {
 	names := make([]string, 0, len(m.managedConfigMaps))
 	for name := range m.managedConfigMaps {
-		names = append(names, name)
+		spec := m.configMaps[name]
+		names = append(names, k8s.ResourceKey(spec.Namespace, name))
 	}
 	return names, nil
 }
@@ -264,7 +301,7 @@ func (m *fakeResourceManager) ApplyService(ctx context.Context, spec k8s.Deploym
 	return &k8s.ApplyResult{NoOp: true}, nil
 }
 
-func (m *fakeResourceManager) GetPodHealth(ctx context.Context, appSlug string) (*k8s.PodHealth, error) {
+func (m *fakeResourceManager) GetPodHealth(ctx context.Context, _ string, appSlug string) (*k8s.PodHealth, error) {
 	if m.podHealthError != nil {
 		return nil, m.podHealthError
 	}
@@ -276,7 +313,7 @@ func (m *fakeResourceManager) GetPodHealth(ctx context.Context, appSlug string) 
 	return &k8s.PodHealth{}, nil
 }
 
-func (m *fakeResourceManager) GetDeploymentStatus(ctx context.Context, name string) (*k8s.DeploymentStatus, error) {
+func (m *fakeResourceManager) GetDeploymentStatus(ctx context.Context, _ string, name string) (*k8s.DeploymentStatus, error) {
 	status, ok := m.deployments[name]
 	if !ok {
 		return nil, nil
@@ -288,6 +325,10 @@ func (m *fakeResourceManager) DeleteDeployment(ctx context.Context, name string)
 	if m.deleteError != nil {
 		return m.deleteError
 	}
+	_, resourceName, found := strings.Cut(name, "/")
+	if found {
+		name = resourceName
+	}
 	delete(m.deployments, name)
 	return nil
 }
@@ -295,7 +336,18 @@ func (m *fakeResourceManager) DeleteDeployment(ctx context.Context, name string)
 func (m *fakeResourceManager) ListManagedDeployments(ctx context.Context) ([]string, error) {
 	var names []string
 	for name := range m.deployments {
-		names = append(names, name)
+		namespace := ""
+		for _, spec := range m.appliedSpecs {
+			if spec.ResourceName() == name {
+				namespace = spec.Namespace
+				break
+			}
+		}
+		if namespace == "" {
+			names = append(names, name)
+		} else {
+			names = append(names, k8s.ResourceKey(namespace, name))
+		}
 	}
 	return names, nil
 }
@@ -325,8 +377,10 @@ func (m *fakeResourceManager) MarkFailed(name string, reason, message string) {
 
 func testConfig(t *testing.T) Config {
 	return Config{
-		Interval:  100 * time.Millisecond,
-		StateFile: filepath.Join(t.TempDir(), "state.json"),
+		Interval:               100 * time.Millisecond,
+		StateFile:              filepath.Join(t.TempDir(), "state.json"),
+		Namespace:              "platform-agent",
+		ManagedNamespacePrefix: "proj-",
 		AgentCredentials: controlplane.AgentCredentials{
 			ClusterID: "cluster-1",
 			AgentID:   "agent-1",
@@ -367,6 +421,70 @@ func TestReconciler_AppliesNewDeployment(t *testing.T) {
 	assert.Equal(t, "my-app", spec.ResourceName())
 	assert.Equal(t, "nginx:1.25", spec.Image)
 	assert.Equal(t, int32(3), spec.Replicas)
+}
+
+func TestReconciler_IsolatesProjectsAndNeverUsesAgentNamespace(t *testing.T) {
+	client := newFakeDeploymentClient()
+	manager := newFakeResourceManager()
+	client.deployments = []controlplane.DesiredDeployment{
+		{
+			DeploymentID:    "dep-1",
+			ReleaseID:       "rel-1",
+			ProjectID:       "project-id-1",
+			ProjectSlug:     "payments",
+			ApplicationName: "API",
+			ApplicationSlug: "api",
+			Image:           "nginx:1.25",
+			Replicas:        1,
+			Revision:        1,
+			Status:          "pending",
+		},
+		{
+			DeploymentID:    "dep-2",
+			ReleaseID:       "rel-2",
+			ProjectID:       "project-id-2",
+			ProjectSlug:     "analytics",
+			ApplicationName: "Worker",
+			ApplicationSlug: "worker",
+			Image:           "nginx:1.25",
+			Replicas:        1,
+			Revision:        1,
+			Status:          "pending",
+		},
+	}
+
+	rec := New(client, manager, testConfig(t), slog.Default())
+	rec.reconcile(context.Background())
+
+	assert.Equal(t, "proj-payments", manager.appliedSpecs["dep-1"].Namespace)
+	assert.Equal(t, "proj-analytics", manager.appliedSpecs["dep-2"].Namespace)
+	assert.True(t, manager.namespaces["proj-payments"])
+	assert.True(t, manager.namespaces["proj-analytics"])
+	assert.False(t, manager.namespaces["platform-agent"])
+}
+
+func TestReconciler_LeavesLegacyAgentNamespaceWorkloadUntouched(t *testing.T) {
+	client := newFakeDeploymentClient()
+	manager := newFakeResourceManager()
+	manager.legacyDeployments["sample"] = true
+	client.deployments = []controlplane.DesiredDeployment{{
+		DeploymentID:    "dep-sample",
+		ReleaseID:       "rel-sample",
+		ProjectSlug:     "demo",
+		ApplicationName: "Sample",
+		ApplicationSlug: "sample",
+		Image:           "nginx:latest",
+		Replicas:        1,
+		Revision:        1,
+		Status:          "pending",
+	}}
+
+	rec := New(client, manager, testConfig(t), slog.Default())
+	rec.reconcile(context.Background())
+
+	assert.Empty(t, manager.appliedSpecs)
+	assert.Empty(t, manager.namespaces)
+	assert.True(t, manager.legacyDeployments["sample"])
 }
 
 func TestReconciler_UpdatesExistingDeployment(t *testing.T) {

@@ -41,6 +41,18 @@ func (f *fakeOrgMemberStore) addMember(userID, orgID string, role OrgRole, statu
 	}
 }
 
+type fakeProjectMemberStore struct {
+	members map[string]*ProjectMember
+}
+
+func (f *fakeProjectMemberStore) GetProjectMember(_ context.Context, projectID, userID string) (*ProjectMember, error) {
+	member, ok := f.members[projectID+"/"+userID]
+	if !ok {
+		return nil, errors.NotFound("project member not found")
+	}
+	return member, nil
+}
+
 func TestAuthorizeOrgMember_Success(t *testing.T) {
 	store := newFakeOrgMemberStore()
 	store.addMember("user-1", "org-1", OrgAdmin, "active")
@@ -143,6 +155,40 @@ func TestAuthorizeOrgRead_NotMember(t *testing.T) {
 	_, err := svc.AuthorizeOrgRead(context.Background(), "org-1", "user-1")
 	if err == nil {
 		t.Fatal("expected error for non-member")
+	}
+}
+
+func TestAuthorizeProjectMember_ProjectDeveloperCanDeploy(t *testing.T) {
+	orgs := newFakeOrgMemberStore()
+	orgs.addMember("user-1", "org-1", RoleMember, "active")
+	projects := &fakeProjectMemberStore{members: map[string]*ProjectMember{
+		"project-1/user-1": {
+			OrgID: "org-1", ProjectID: "project-1", UserID: "user-1", Role: ProjectDeveloper,
+		},
+	}}
+	svc := NewAuthorizationService(&fakeTenantRunner{}, orgs, nil).WithProjectMembers(projects)
+
+	role, err := svc.AuthorizeProjectMember(context.Background(), "org-1", "project-1", "user-1", ActionDeploy)
+	if err != nil {
+		t.Fatalf("expected project developer to deploy, got: %v", err)
+	}
+	if role != ProjectDeveloper {
+		t.Fatalf("expected project developer role, got %q", role)
+	}
+}
+
+func TestAuthorizeProjectMember_OrgAdminDoesNotNeedProjectMembership(t *testing.T) {
+	orgs := newFakeOrgMemberStore()
+	orgs.addMember("user-1", "org-1", OrgAdmin, "active")
+	svc := NewAuthorizationService(&fakeTenantRunner{}, orgs, nil).
+		WithProjectMembers(&fakeProjectMemberStore{members: map[string]*ProjectMember{}})
+
+	role, err := svc.AuthorizeProjectMember(context.Background(), "org-1", "project-1", "user-1", ActionDeploy)
+	if err != nil {
+		t.Fatalf("expected org admin to deploy without project membership, got: %v", err)
+	}
+	if role != "" {
+		t.Fatalf("expected no project role for org-only authorization, got %q", role)
 	}
 }
 

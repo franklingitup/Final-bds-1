@@ -15,4 +15,14 @@ var (
 	errInvalidImage      = apperrors.Validation("image is required")
 	errInvalidReplicas   = apperrors.Validation("replicas must be at least 1")
 	errArgoAppNotFound   = apperrors.NotFound("gitops application not found for deployment")
+
+	// Environment errors.
+	errEnvironmentNotFound          = apperrors.NotFound("environment not found")
+	errEnvironmentNameTaken         = apperrors.Conflict("an environment with that name already exists for this application")
+	errEnvironmentApplicationMismatch = apperrors.Validation("source and target environments must belong to the same application")
+	errSameEnvironment              = apperrors.Validation("source and target environment must be different")
+
+	// Promotion errors.
+	errPromotionNotFound   = apperrors.NotFound("promotion request not found")
+	errPromotionNotPending = apperrors.Conflict("promotion request is not in pending status")
 )

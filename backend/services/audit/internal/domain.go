@@ -86,6 +86,7 @@ type AuditLogView struct {
 	EventType    string          `json:"eventType"`
 	OrgID        string          `json:"organizationId"`
 	ActorID      string          `json:"actorId,omitempty"`
+	ActorName    string          `json:"actorName,omitempty"`
 	ResourceType string          `json:"resourceType,omitempty"`
 	ResourceID   string          `json:"resourceId,omitempty"`
 	Timestamp    time.Time       `json:"timestamp"`

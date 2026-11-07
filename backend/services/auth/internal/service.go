@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/bdsplatform/platform/backend/libs/authz"
 	"github.com/bdsplatform/platform/backend/libs/config"
 	"github.com/bdsplatform/platform/backend/libs/database"
@@ -126,6 +128,45 @@ func NewService(d Deps) *Service {
 		log:              d.Logger,
 		now:              d.Now,
 	}
+}
+
+const maxInternalUserIDs = 100
+
+// LookupUsers returns public display info for the given IDs. Unknown or
+// malformed IDs are omitted. The result never includes password hashes, tokens,
+// or MFA secrets.
+func (s *Service) LookupUsers(ctx context.Context, ids []string) ([]UserPublic, error) {
+	uuids := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, err := uuid.Parse(id); err != nil {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		uuids = append(uuids, id)
+		if len(uuids) >= maxInternalUserIDs {
+			break
+		}
+	}
+	if len(uuids) == 0 {
+		return []UserPublic{}, nil
+	}
+	users, err := s.users.GetByIDs(ctx, uuids)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]UserPublic, 0, len(users))
+	for _, u := range users {
+		out = append(out, toUserPublic(u))
+	}
+	return out, nil
 }
 
 // ----------------------------------------------------------------------------

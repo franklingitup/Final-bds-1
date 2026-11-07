@@ -495,6 +495,8 @@ func TestIntegration_DesiredState(t *testing.T) {
 	assert.Equal(t, app.ID, d.ApplicationID)
 	assert.Equal(t, app.Name, d.ApplicationName)
 	assert.Equal(t, app.Slug, d.ApplicationSlug)
+	assert.Equal(t, projectID, d.ProjectID)
+	assert.Equal(t, "test-project-"+projectID[:8], d.ProjectSlug)
 	assert.Equal(t, "nginx:latest", d.Image)
 	assert.Equal(t, 1, d.Revision)
 	assert.Equal(t, 2, d.Replicas)

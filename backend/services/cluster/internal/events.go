@@ -10,13 +10,13 @@ import (
 // Cluster domain event types (canonical names, version 1). The Cluster Service
 // is the single owner of the "cluster.*" namespace.
 const (
-	EventClusterCreated               = "cluster.created"
-	EventRegistrationTokenCreated     = "cluster.registration.token.created"
-	EventClusterRegistered            = "cluster.registered"
-	EventClusterRecovered             = "cluster.recovered"
-	EventClusterHeartbeatReceived     = "cluster.heartbeat.received"
-	EventClusterDisconnected          = "cluster.disconnected"
-	EventClusterDeleted               = "cluster.deleted"
+	EventClusterCreated           = "cluster.created"
+	EventRegistrationTokenCreated = "cluster.registration.token.created"
+	EventClusterRegistered        = "cluster.registered"
+	EventClusterRecovered         = "cluster.recovered"
+	EventClusterHeartbeatReceived = "cluster.heartbeat.received"
+	EventClusterDisconnected      = "cluster.disconnected"
+	EventClusterDeleted           = "cluster.deleted"
 
 	eventVersion = 1
 )
@@ -34,10 +34,12 @@ type clusterCreatedPayload struct {
 }
 
 type tokenCreatedPayload struct {
-	ClusterID   string    `json:"clusterId"`
-	TokenID     string    `json:"tokenId"`
-	ExpiresAt   time.Time `json:"expiresAt"`
-	DeliveryRef string    `json:"deliveryRef"`
+	ClusterID         string    `json:"clusterId"`
+	TokenID           string    `json:"tokenId"`
+	ExpiresAt         time.Time `json:"expiresAt"`
+	DeliveryRef       string    `json:"deliveryRef"`
+	Forced            bool      `json:"forced,omitempty"`
+	SupersededAgentID string    `json:"supersededAgentId,omitempty"`
 }
 
 type clusterRegisteredPayload struct {
@@ -62,17 +64,17 @@ type clusterRecoveredPayload struct {
 }
 
 type heartbeatReceivedPayload struct {
-	ClusterID          string `json:"clusterId"`
-	AgentID            string `json:"agentId"`
-	KubernetesVersion  string `json:"kubernetesVersion,omitempty"`
-	NodeCount          int    `json:"nodeCount,omitempty"`
-	APIServerHealthy   bool   `json:"apiServerHealthy"`
+	ClusterID         string `json:"clusterId"`
+	AgentID           string `json:"agentId"`
+	KubernetesVersion string `json:"kubernetesVersion,omitempty"`
+	NodeCount         int    `json:"nodeCount,omitempty"`
+	APIServerHealthy  bool   `json:"apiServerHealthy"`
 }
 
 type clusterDisconnectedPayload struct {
-	ClusterID          string    `json:"clusterId"`
-	LastHeartbeatAt    time.Time `json:"lastHeartbeatAt"`
-	DisconnectedAfter  string    `json:"disconnectedAfter"` // e.g., "5m"
+	ClusterID         string    `json:"clusterId"`
+	LastHeartbeatAt   time.Time `json:"lastHeartbeatAt"`
+	DisconnectedAfter string    `json:"disconnectedAfter"` // e.g., "5m"
 }
 
 type clusterDeletedPayload struct {

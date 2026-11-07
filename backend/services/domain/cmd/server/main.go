@@ -102,12 +102,20 @@ func main() {
 	// Create handler
 	handler := domain.NewHandler(svc, log)
 
-	// Create token verifier
+	// Create token verifier for user JWT auth
 	verifier := domain.NewTokenVerifier(cfg.Auth)
+
+	// Create cluster validator for agent auth
+	clusterValidator := domain.NewClusterValidator(db, log)
 
 	// Register routes
 	routeRegistrar := func(app *fiber.App) {
-		domain.RegisterRoutes(app, handler, domain.RequireAuth(verifier))
+		domain.RegisterRoutes(
+			app,
+			handler,
+			domain.RequireAuth(verifier),
+			domain.AgentAuthMiddleware(clusterValidator),
+		)
 	}
 
 	if err := httpserver.Run(cfg, routeRegistrar); err != nil {

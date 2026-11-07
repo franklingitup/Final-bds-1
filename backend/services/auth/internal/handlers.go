@@ -1,6 +1,8 @@
 package auth
 
 import (
+	"crypto/subtle"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -11,11 +13,18 @@ import (
 
 // Handler adapts the AuthService to Fiber HTTP handlers.
 type Handler struct {
-	svc *Service
+	svc           *Service
+	internalToken string
 }
 
 // NewHandler constructs an HTTP handler over the service.
 func NewHandler(svc *Service) *Handler { return &Handler{svc: svc} }
+
+// WithInternalToken sets the optional shared secret required on /internal/*.
+func (h *Handler) WithInternalToken(token string) *Handler {
+	h.internalToken = token
+	return h
+}
 
 func (h *Handler) requestMeta(c *fiber.Ctx) RequestMeta {
 	return RequestMeta{UserAgent: c.Get(fiber.HeaderUserAgent), IP: c.IP()}
@@ -350,4 +359,33 @@ func (h *Handler) DeleteSSOConfig(c *fiber.Ctx) error {
 		return err
 	}
 	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// ListInternalUsers is a service-to-service batch lookup. It is registered
+// outside /v1 so the gateway, which only mounts /v1/*, does not proxy it.
+func (h *Handler) ListInternalUsers(c *fiber.Ctx) error {
+	raw := strings.TrimSpace(c.Query("ids"))
+	var ids []string
+	if raw != "" {
+		ids = strings.Split(raw, ",")
+	}
+	users, err := h.svc.LookupUsers(c.UserContext(), ids)
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"items": users})
+}
+
+func (h *Handler) requireInternalToken() fiber.Handler {
+	want := h.internalToken
+	return func(c *fiber.Ctx) error {
+		if want == "" {
+			return c.Next()
+		}
+		got := c.Get("X-Internal-Token")
+		if subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
+			return apperrors.Unauthorized("internal token required")
+		}
+		return c.Next()
+	}
 }

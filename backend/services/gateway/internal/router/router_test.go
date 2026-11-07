@@ -1,9 +1,11 @@
 package router
 
 import (
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -188,15 +190,27 @@ func TestRouter_ProtectedRoutes(t *testing.T) {
 	router.Register(app)
 
 	// Protected endpoints should require authentication.
-	req := httptest.NewRequest(http.MethodPost, "/v1/organizations", nil)
-	resp, err := app.Test(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPost, "/v1/organizations"},
+		{http.MethodGet, "/v1/organizations/org-1/members"},
+		{http.MethodGet, "/v1/organizations/org-1/invitations"},
+		{http.MethodPost, "/v1/invitations/accept"},
+	} {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			resp, err := app.Test(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("expected 401, got %d", resp.StatusCode)
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Errorf("expected 401, got %d", resp.StatusCode)
+			}
+		})
 	}
 }
 
@@ -348,5 +362,186 @@ func TestRouter_RequestIDPropagation(t *testing.T) {
 	}
 	if len(requestID) != 36 { // UUID length.
 		t.Errorf("expected UUID, got %q", requestID)
+	}
+}
+
+func TestAgentInstallManifestDoesNotRequireBearerJWT(t *testing.T) {
+	const token = "fresh-registration-token"
+
+	clusterService := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/v1/agent-install/"+token+"/manifest.yaml" {
+			t.Errorf("upstream path = %q", req.URL.Path)
+			http.NotFound(w, req)
+			return
+		}
+		if got := req.URL.Query().Get("controlPlaneEndpoint"); got != "http://localhost:8080" {
+			t.Errorf("controlPlaneEndpoint = %q", got)
+		}
+		w.Header().Set("Content-Type", "application/yaml")
+		_, _ = io.WriteString(w, "apiVersion: v1\nkind: Namespace\n")
+	}))
+	defer clusterService.Close()
+
+	router, err := New(
+		auth.NewValidator(testAuthConfig()),
+		nil,
+		nil,
+		Config{
+			ClusterService: proxy.ServiceConfig{
+				Name:    "cluster",
+				BaseURL: clusterService.URL,
+			},
+		},
+		slog.Default(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	app := fiber.New()
+	router.Register(app)
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"/v1/agent-install/"+token+"/manifest.yaml?controlPlaneEndpoint=http%3A%2F%2Flocalhost%3A8080",
+		nil,
+	)
+	// Intentionally no Authorization header: the path token is the credential.
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "application/yaml" {
+		t.Fatalf("Content-Type = %q, want application/yaml", got)
+	}
+}
+
+// TestGitHubOAuthCallbackDoesNotRequireBearerJWT verifies that the GitHub OAuth
+// callback route is reachable without a Bearer JWT. This is a regression test
+// for the registration-order bug fixed earlier: GitHub redirects here with only
+// query params (code, state) — no Authorization header.
+func TestGitHubOAuthCallbackDoesNotRequireBearerJWT(t *testing.T) {
+	buildService := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/v1/github/oauth/callback" {
+			t.Errorf("upstream path = %q, want /v1/github/oauth/callback", req.URL.Path)
+			http.NotFound(w, req)
+			return
+		}
+		// Verify query params are forwarded.
+		if code := req.URL.Query().Get("code"); code != "gh-auth-code" {
+			t.Errorf("code = %q, want gh-auth-code", code)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"status":"ok"}`)
+	}))
+	defer buildService.Close()
+
+	router, err := New(
+		auth.NewValidator(testAuthConfig()),
+		nil,
+		nil,
+		Config{
+			BuildService: proxy.ServiceConfig{
+				Name:    "build",
+				BaseURL: buildService.URL,
+			},
+		},
+		slog.Default(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	app := fiber.New()
+	router.Register(app)
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"/v1/github/oauth/callback?code=gh-auth-code&state=random-state",
+		nil,
+	)
+	// Intentionally no Authorization header: GitHub redirects here with query params only.
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, body)
+	}
+}
+
+// TestGitHubWebhookDoesNotRequireBearerJWT verifies that the GitHub webhook
+// receiver route is reachable without a Bearer JWT. This is a regression test
+// for the registration-order bug: GitHub calls this endpoint with HMAC signature
+// verification, not a Bearer JWT.
+func TestGitHubWebhookDoesNotRequireBearerJWT(t *testing.T) {
+	const repoID = "repo-abc123"
+
+	buildService := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		expectedPath := "/v1/webhooks/github/" + repoID
+		if req.URL.Path != expectedPath {
+			t.Errorf("upstream path = %q, want %q", req.URL.Path, expectedPath)
+			http.NotFound(w, req)
+			return
+		}
+		if req.Method != http.MethodPost {
+			t.Errorf("method = %q, want POST", req.Method)
+		}
+		// Verify GitHub headers are forwarded.
+		if got := req.Header.Get("X-GitHub-Event"); got != "push" {
+			t.Errorf("X-GitHub-Event = %q, want push", got)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"received":true}`)
+	}))
+	defer buildService.Close()
+
+	router, err := New(
+		auth.NewValidator(testAuthConfig()),
+		nil,
+		nil,
+		Config{
+			BuildService: proxy.ServiceConfig{
+				Name:    "build",
+				BaseURL: buildService.URL,
+			},
+		},
+		slog.Default(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	app := fiber.New()
+	router.Register(app)
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/webhooks/github/"+repoID,
+		strings.NewReader(`{"ref":"refs/heads/main"}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-GitHub-Event", "push")
+	req.Header.Set("X-GitHub-Delivery", "delivery-123")
+	req.Header.Set("X-Hub-Signature-256", "sha256=abc123")
+	// Intentionally no Authorization header: GitHub uses HMAC signature, not JWT.
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, body)
 	}
 }

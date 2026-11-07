@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -103,6 +104,18 @@ func (f *fakeClusterStore) GetByID(_ context.Context, id string) (*Cluster, erro
 
 func (f *fakeClusterStore) GetByIDWithoutTenant(_ context.Context, id string) (*Cluster, error) {
 	return f.GetByID(context.Background(), id)
+}
+
+func (f *fakeClusterStore) ListConnectedWithoutTenant(_ context.Context) ([]Cluster, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var clusters []Cluster
+	for _, cluster := range f.clusters {
+		if cluster.Status == StatusConnected {
+			clusters = append(clusters, *cluster)
+		}
+	}
+	return clusters, nil
 }
 
 func (f *fakeClusterStore) GetBySlug(_ context.Context, slug string) (*Cluster, error) {
@@ -346,6 +359,16 @@ type testEnv struct {
 }
 
 func newTestEnv() *testEnv {
+	// Default test env uses a sensible default control plane URL so all tests
+	// that don't specifically test endpoint resolution behavior work out of the box.
+	return newTestEnvWithControlPlaneURL("https://api.test.io")
+}
+
+func newTestEnvWithoutControlPlaneURL() *testEnv {
+	return newTestEnvWithControlPlaneURL("")
+}
+
+func newTestEnvWithControlPlaneURL(controlPlaneURL string) *testEnv {
 	clusters := newFakeClusterStore()
 	tokens := newFakeTokenStore()
 	heartbeats := newFakeHeartbeatStore()
@@ -354,14 +377,15 @@ func newTestEnv() *testEnv {
 	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
 
 	svc := NewService(Deps{
-		Clusters:   clusters,
-		Tokens:     tokens,
-		Heartbeats: heartbeats,
-		OrgMembers: &fakeOrgMemberStore{},
-		Outbox:     outbox,
-		Tenant:     fakeRunner{},
-		Notifier:   notifier,
-		Now:        func() time.Time { return now },
+		Clusters:              clusters,
+		Tokens:                tokens,
+		Heartbeats:            heartbeats,
+		OrgMembers:            &fakeOrgMemberStore{},
+		Outbox:                outbox,
+		Tenant:                fakeRunner{},
+		Notifier:              notifier,
+		Now:                   func() time.Time { return now },
+		ControlPlanePublicURL: controlPlaneURL,
 	})
 
 	return &testEnv{
@@ -543,7 +567,7 @@ func TestDeleteCluster(t *testing.T) {
 }
 
 func TestGenerateRegistrationToken(t *testing.T) {
-	env := newTestEnv()
+	env := newTestEnvWithControlPlaneURL("https://api.test.io")
 	ctx := context.Background()
 	orgID := uuid.NewString()
 	userID := uuid.NewString()
@@ -578,6 +602,80 @@ func TestGenerateRegistrationToken(t *testing.T) {
 	}
 	if !found {
 		t.Error("expected cluster.registration.token.created event")
+	}
+}
+
+func TestGenerateRegistrationToken_ConnectedRequiresForce(t *testing.T) {
+	env := newTestEnvWithControlPlaneURL("https://api.test.io")
+	ctx := context.Background()
+	orgID := uuid.NewString()
+	userID := uuid.NewString()
+	cluster := env.createCluster(t, orgID, userID, "Connected", "connected")
+	initial, err := env.svc.GenerateRegistrationToken(ctx, orgID, userID, cluster.ID, GenerateTokenRequest{})
+	if err != nil {
+		t.Fatalf("generate initial token: %v", err)
+	}
+	_, err = env.svc.RegisterAgent(ctx, AgentRegisterRequest{
+		Token:             initial.Token,
+		AgentID:           "old-agent",
+		KubernetesVersion: "1.30.0",
+		NodeCount:         3,
+	})
+	if err != nil {
+		t.Fatalf("register agent: %v", err)
+	}
+
+	_, err = env.svc.GenerateRegistrationToken(ctx, orgID, userID, cluster.ID, GenerateTokenRequest{})
+	if !errors.Is(err, errConnectedClusterRequiresForce) {
+		t.Fatalf("connected without force error = %v, want errConnectedClusterRequiresForce", err)
+	}
+	if errors.Is(err, errClusterNotPending) {
+		t.Fatal("connected-without-force error must be distinct from errClusterNotPending")
+	}
+
+	forced, err := env.svc.GenerateRegistrationToken(ctx, orgID, userID, cluster.ID, GenerateTokenRequest{Force: true})
+	if err != nil {
+		t.Fatalf("connected with force: %v", err)
+	}
+	if forced.Token == "" {
+		t.Fatal("forced token is empty")
+	}
+
+	events := env.outbox.list()
+	var payload tokenCreatedPayload
+	found := false
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Type == EventRegistrationTokenCreated {
+			if err := json.Unmarshal(events[i].Payload, &payload); err != nil {
+				t.Fatalf("decode token event: %v", err)
+			}
+			found = true
+			break
+		}
+	}
+	if !found || !payload.Forced || payload.SupersededAgentID != "old-agent" {
+		t.Fatalf("forced token audit payload = %+v", payload)
+	}
+
+	reconnected, err := env.svc.RegisterAgent(ctx, AgentRegisterRequest{
+		Token:             forced.Token,
+		AgentID:           "new-agent",
+		KubernetesVersion: "1.30.0",
+		NodeCount:         3,
+	})
+	if err != nil {
+		t.Fatalf("consume forced token: %v", err)
+	}
+	if reconnected.AgentID == nil || *reconnected.AgentID != "new-agent" {
+		t.Fatalf("agent ID after forced registration = %v, want new-agent", reconnected.AgentID)
+	}
+
+	env.clusters.mu.Lock()
+	env.clusters.clusters[cluster.ID].Status = StatusDeleted
+	env.clusters.mu.Unlock()
+	_, err = env.svc.GenerateRegistrationToken(ctx, orgID, userID, cluster.ID, GenerateTokenRequest{Force: true})
+	if !errors.Is(err, errClusterNotPending) {
+		t.Fatalf("deleted cluster error = %v, want errClusterNotPending", err)
 	}
 }
 
@@ -964,14 +1062,15 @@ func TestRegisterAgent_ExpiredToken(t *testing.T) {
 	// Start with now in the past.
 	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
 	svc := NewService(Deps{
-		Clusters:   clusters,
-		Tokens:     tokens,
-		Heartbeats: heartbeats,
-		OrgMembers: &fakeOrgMemberStore{},
-		Outbox:     outbox,
-		Tenant:     fakeRunner{},
-		Notifier:   notifier,
-		Now:        func() time.Time { return now },
+		Clusters:              clusters,
+		Tokens:                tokens,
+		Heartbeats:            heartbeats,
+		OrgMembers:            &fakeOrgMemberStore{},
+		Outbox:                outbox,
+		Tenant:                fakeRunner{},
+		Notifier:              notifier,
+		Now:                   func() time.Time { return now },
+		ControlPlanePublicURL: "https://api.test.io",
 	})
 
 	ctx := context.Background()
@@ -1049,14 +1148,15 @@ func TestTokenAuth_UniformClientMessages(t *testing.T) {
 	tokens := newFakeTokenStore()
 	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
 	svc := NewService(Deps{
-		Clusters:   clusters,
-		Tokens:     tokens,
-		Heartbeats: newFakeHeartbeatStore(),
-		OrgMembers: &fakeOrgMemberStore{},
-		Outbox:     &fakeOutbox{},
-		Tenant:     fakeRunner{},
-		Notifier:   &fakeNotifier{},
-		Now:        func() time.Time { return now },
+		Clusters:              clusters,
+		Tokens:                tokens,
+		Heartbeats:            newFakeHeartbeatStore(),
+		OrgMembers:            &fakeOrgMemberStore{},
+		Outbox:                &fakeOutbox{},
+		Tenant:                fakeRunner{},
+		Notifier:              &fakeNotifier{},
+		Now:                   func() time.Time { return now },
+		ControlPlanePublicURL: "https://api.test.io",
 	})
 	cExp, _ := svc.CreateCluster(ctx, orgID, userID, CreateClusterRequest{Name: "Exp", Slug: "exp"})
 	tokExp, _ := svc.GenerateRegistrationToken(ctx, orgID, userID, cExp.ID, GenerateTokenRequest{ExpiresIn: "1h"})
@@ -1189,7 +1289,7 @@ func TestMarkDisconnected(t *testing.T) {
 	env.clusters.clusters[c.ID].LastHeartbeatAt = &stale
 	env.clusters.mu.Unlock()
 
-	count, err := env.svc.MarkDisconnected(ctx, orgID, 5*time.Minute)
+	count, err := env.svc.MarkDisconnected(ctx, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("MarkDisconnected: %v", err)
 	}

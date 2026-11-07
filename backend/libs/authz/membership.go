@@ -43,9 +43,10 @@ type TenantRunner interface {
 
 // AuthorizationService provides reusable authorization methods.
 type AuthorizationService struct {
-	tenant     TenantRunner
-	orgMembers OrgMemberStore
-	authorizer Authorizer
+	tenant         TenantRunner
+	orgMembers     OrgMemberStore
+	projectMembers ProjectMemberStore
+	authorizer     Authorizer
 }
 
 // NewAuthorizationService creates a new authorization service.
@@ -58,6 +59,12 @@ func NewAuthorizationService(tenant TenantRunner, orgMembers OrgMemberStore, aut
 		orgMembers: orgMembers,
 		authorizer: authorizer,
 	}
+}
+
+// WithProjectMembers adds project member lookup capability.
+func (s *AuthorizationService) WithProjectMembers(pm ProjectMemberStore) *AuthorizationService {
+	s.projectMembers = pm
+	return s
 }
 
 // AuthorizeOrgMember verifies the caller is a member of the organization and has
@@ -142,6 +149,86 @@ func (s *AuthorizationService) AuthorizeOrgRead(ctx context.Context, orgID, user
 	}
 
 	return member.Role, nil
+}
+
+// AuthorizeProjectMember verifies the caller can perform the action on a project.
+// It checks org-level roles first (OrgOwner/OrgAdmin can access any project), then
+// falls back to project-level roles if the user has project membership.
+//
+// Returns the user's project role (empty string if authorized via org role only).
+//
+// This is the primary authorization entry point for project-scoped operations.
+// It enforces:
+//  1. Caller is an org member (membership check within tenant context)
+//  2. Caller has sufficient org role OR project role for the action (RBAC check)
+//  3. Tenant isolation (orgID matches throughout)
+func (s *AuthorizationService) AuthorizeProjectMember(ctx context.Context, orgID, projectID, userID string, action Action) (ProjectRole, error) {
+	if orgID == "" {
+		return "", errors.Validation("organization ID is required")
+	}
+	if projectID == "" {
+		return "", errors.Validation("project ID is required")
+	}
+	if userID == "" {
+		return "", errors.Validation("user ID is required")
+	}
+
+	var orgMember *OrgMember
+	var projectMember *ProjectMember
+	err := s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
+		// Get org membership (required)
+		m, err := s.orgMembers.GetOrgMember(ctx, userID)
+		if err != nil {
+			if database.IsNotFound(err) {
+				return errors.Forbidden("not a member of this organization")
+			}
+			return err
+		}
+		orgMember = m
+
+		// Get project membership (optional - OrgOwner/OrgAdmin don't need it)
+		if s.projectMembers != nil {
+			pm, err := s.projectMembers.GetProjectMember(ctx, projectID, userID)
+			if err != nil && !database.IsNotFound(err) {
+				return err
+			}
+			projectMember = pm // nil if not a project member
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+
+	// Verify org member status is active
+	if orgMember.Status != "active" {
+		return "", errors.Forbidden("membership is suspended")
+	}
+
+	// Build principal with org roles and project roles (if any)
+	principal := Principal{
+		UserID:   userID,
+		OrgID:    orgID,
+		OrgRoles: []OrgRole{orgMember.Role},
+	}
+	if projectMember != nil {
+		principal.ProjectRoles = map[string]ProjectRole{projectID: projectMember.Role}
+	}
+
+	// Authorize - PolicyAuthorizer checks org roles first, then project roles
+	if err := s.authorizer.Authorize(ctx, principal, AccessRequest{
+		Action:    action,
+		OrgID:     orgID,
+		ProjectID: projectID,
+	}); err != nil {
+		return "", err
+	}
+
+	// Return project role (empty if authorized via org role only)
+	if projectMember != nil {
+		return projectMember.Role, nil
+	}
+	return "", nil
 }
 
 // OrgMemberRepo implements OrgMemberStore using PostgreSQL.

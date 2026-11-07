@@ -25,6 +25,8 @@ type Config struct {
 	DomainService        proxy.ServiceConfig
 	NotificationService  proxy.ServiceConfig
 	ProvisioningService  proxy.ServiceConfig
+	BuildService         proxy.ServiceConfig
+	ObservabilityService proxy.ServiceConfig
 }
 
 // DefaultConfig returns configuration for local development.
@@ -70,6 +72,14 @@ func DefaultConfig() Config {
 			Name:    "provisioning",
 			BaseURL: "http://localhost:8090",
 		},
+		BuildService: proxy.ServiceConfig{
+			Name:    "build",
+			BaseURL: "http://localhost:8091",
+		},
+		ObservabilityService: proxy.ServiceConfig{
+			Name:    "observability",
+			BaseURL: "http://localhost:8092",
+		},
 	}
 }
 
@@ -107,6 +117,8 @@ func New(validator *auth.Validator, revoker *middleware.RevocationChecker, rateL
 		cfg.DomainService,
 		cfg.NotificationService,
 		cfg.ProvisioningService,
+		cfg.BuildService,
+		cfg.ObservabilityService,
 	}
 
 	for _, svcCfg := range serviceConfigs {
@@ -125,6 +137,15 @@ func New(validator *auth.Validator, revoker *middleware.RevocationChecker, rateL
 }
 
 // Register mounts all routes onto the Fiber app.
+//
+// Adding a new backend service route?
+//   1. Register it in the service's routes.go (e.g. services/deployment/internal/routes.go).
+//   2. Add a proxy rule in the appropriate register*Routes function below IN THE SAME PR.
+//   3. Add the concrete URL to the corresponding TestGatewayCoverage* test in coverage_test.go.
+//   4. Run: go run ./tools/check-gateway-coverage (from backend/) to verify counts match.
+//
+// Skipping step 2 causes a silent 404 for every request to that route — this has
+// happened four times.  The convention and tests above are the automated guard.
 func (r *Router) Register(app *fiber.App) {
 	// Global middleware.
 	app.Use(middleware.RequestID())
@@ -141,14 +162,18 @@ func (r *Router) Register(app *fiber.App) {
 	// Agent registration route (public, capability-based).
 	r.registerAgentRoutes(v1)
 
-	// Authenticated routes.
-	authenticated := v1.Group("", middleware.Authentication(r.validator, r.revoker))
-
-	// Tenant routes.
-	r.registerTenantRoutes(authenticated)
+	// Tenant routes apply authentication to their concrete path groups. Do not
+	// mount authentication on v1.Group(""), because Fiber treats that as a
+	// blanket /v1 middleware and it intercepts capability-based routes such as
+	// /v1/agent-install/:token/manifest.yaml.
+	r.registerTenantRoutes(v1)
 
 	// Organization-scoped routes.
-	orgs := authenticated.Group("/organizations/:orgId", middleware.OrgScope())
+	orgs := v1.Group(
+		"/organizations/:orgId",
+		middleware.Authentication(r.validator, r.revoker),
+		middleware.OrgScope(),
+	)
 
 	// Project routes.
 	r.registerProjectRoutes(orgs)
@@ -156,13 +181,15 @@ func (r *Router) Register(app *fiber.App) {
 	// Audit routes.
 	r.registerAuditRoutes(orgs)
 
-	// Cluster, Deployment, Secrets, Domain, Notification, Provisioning routes.
+	// Cluster, Deployment, Secrets, Domain, Notification, Provisioning, Build, Observability routes.
 	r.registerClusterRoutes(orgs)
 	r.registerDeploymentRoutes(orgs)
 	r.registerSecretsRoutes(orgs)
 	r.registerDomainRoutes(v1, orgs)
 	r.registerNotificationRoutes(orgs)
 	r.registerProvisioningRoutes(v1, orgs)
+	r.registerBuildRoutes(v1, orgs)
+	r.registerObservabilityRoutes(v1, orgs)
 }
 
 // registerAuthRoutes mounts auth service routes.
@@ -215,6 +242,17 @@ func (r *Router) registerAuthRoutes(g fiber.Router) {
 	)
 	apiTokens.Get("", svc.Handler())
 	apiTokens.Delete("/:tokenId", svc.Handler())
+
+	// SSO configuration (org-scoped). Allows org admins to configure SAML/OIDC
+	// identity providers. Maps to PUT/GET/DELETE /v1/organizations/:orgId/sso/config
+	// in the auth service.
+	ssoConfig := g.Group("/organizations/:orgId/sso",
+		middleware.Authentication(r.validator, r.revoker),
+		middleware.OrgScope(),
+	)
+	ssoConfig.Put("/config", svc.Handler())
+	ssoConfig.Get("/config", svc.Handler())
+	ssoConfig.Delete("/config", svc.Handler())
 }
 
 // registerTenantRoutes mounts tenant service routes.
@@ -224,29 +262,39 @@ func (r *Router) registerTenantRoutes(g fiber.Router) {
 		return
 	}
 
+	requireAuth := middleware.Authentication(r.validator, r.revoker)
+
 	// Organization management.
-	orgs := g.Group("/organizations")
-	orgs.Get("", svc.Handler())                             // API-CRIT-01: List user's orgs
+	orgs := g.Group("/organizations", requireAuth)
+	orgs.Get("", svc.Handler()) // API-CRIT-01: List user's orgs
 	orgs.Post("", svc.Handler())
-	orgs.Get("/by-slug/:slug", svc.Handler())               // API-CRIT-02: Get by slug
+	orgs.Get("/by-slug/:slug", svc.Handler()) // API-CRIT-02: Get by slug
 	orgs.Get("/:orgId", middleware.OrgScope(), svc.Handler())
 	orgs.Patch("/:orgId", middleware.OrgScope(), svc.Handler())
 	orgs.Delete("/:orgId", middleware.OrgScope(), svc.Handler())
 
 	// Member management.
-	members := g.Group("/organizations/:orgId/members", middleware.OrgScope())
+	members := g.Group(
+		"/organizations/:orgId/members",
+		requireAuth,
+		middleware.OrgScope(),
+	)
 	members.Get("", svc.Handler())
 	members.Patch("/:userId", svc.Handler())
 	members.Delete("/:userId", svc.Handler())
 
 	// Invitation management.
-	invitations := g.Group("/organizations/:orgId/invitations", middleware.OrgScope())
+	invitations := g.Group(
+		"/organizations/:orgId/invitations",
+		requireAuth,
+		middleware.OrgScope(),
+	)
 	invitations.Post("", svc.Handler())
 	invitations.Get("", svc.Handler())
 	invitations.Delete("/:id", svc.Handler())
 
 	// Accept invitation (cross-tenant, token-based).
-	g.Post("/invitations/accept", svc.Handler())
+	g.Post("/invitations/accept", requireAuth, svc.Handler())
 }
 
 // registerProjectRoutes mounts project service routes.
@@ -291,6 +339,8 @@ func (r *Router) registerAuditRoutes(orgs fiber.Router) {
 func (r *Router) registerAgentRoutes(v1 fiber.Router) {
 	// Agent registration (cluster service, capability-based via registration token).
 	if svc, ok := r.services["cluster"]; ok {
+		// Existing-cluster install manifest (registration-token capability).
+		v1.Get("/agent-install/:token/manifest.yaml", svc.Handler())
 		v1.Post("/agent/register", svc.Handler())
 		// Agent recovery (cluster service, capability-based via installation token
 		// header). Lets an agent rebuild lost local state without re-issuing a token.
@@ -308,6 +358,8 @@ func (r *Router) registerAgentRoutes(v1 fiber.Router) {
 		agent.Get("/clusters/:clusterId/desired-state", svc.Handler())
 		// Status reporting endpoint for deployment updates.
 		agent.Post("/deployments/:deploymentId/releases/:releaseId/status", svc.Handler())
+		// Rich rollout progress snapshots.
+		agent.Post("/deployments/:deploymentId/releases/:releaseId/progress", svc.Handler())
 	}
 
 	// Agent secrets routes (secrets service, credential-based via X-Cluster-ID/X-Agent-ID).
@@ -343,6 +395,12 @@ func (r *Router) registerClusterRoutes(orgs fiber.Router) {
 }
 
 // registerDeploymentRoutes mounts deployment service routes.
+//
+// CONVENTION: every route registered in services/deployment/internal/routes.go
+// MUST have a corresponding proxy call here in the same PR.  The automated
+// check is TestGatewayCoverageDeploymentRoutes in coverage_test.go and the
+// source-level count tool in backend/tools/check-gateway-coverage/main.go.
+// Forgetting to update this function is the single most common gateway bug.
 func (r *Router) registerDeploymentRoutes(orgs fiber.Router) {
 	svc, ok := r.services["deployment"]
 	if !ok {
@@ -361,16 +419,36 @@ func (r *Router) registerDeploymentRoutes(orgs fiber.Router) {
 	app.Delete("", svc.Handler())
 	app.Get("/deployments", svc.Handler())
 
+	// Environments (scoped to an application — mirrors deployment service routes.go).
+	appEnvs := app.Group("/environments")
+	appEnvs.Post("", svc.Handler())
+	appEnvs.Get("", svc.Handler())
+
+	// Single environment operations (org-scoped).
+	singleEnv := orgs.Group("/environments/:environmentId")
+	singleEnv.Get("", svc.Handler())
+	singleEnv.Patch("", svc.Handler())
+	singleEnv.Delete("", svc.Handler())
+
+	// Promotions (list at application scope; create/get/approve/reject at org scope).
+	app.Get("/promotions", svc.Handler())
+
+	promos := orgs.Group("/promotions")
+	promos.Post("", svc.Handler())
+	promos.Get("/:promotionId", svc.Handler())
+	promos.Post("/:promotionId/approve", svc.Handler())
+	promos.Post("/:promotionId/reject", svc.Handler())
+
 	// Deployments at org level.
 	deployments := orgs.Group("/deployments")
-	deployments.Get("", svc.Handler())     // API-CRIT-03: List org deployments
+	deployments.Get("", svc.Handler()) // API-CRIT-03: List org deployments
 	deployments.Post("", svc.Handler())
 
 	// Single deployment operations.
 	dep := deployments.Group("/:deploymentId")
 	dep.Get("", svc.Handler())
 	dep.Patch("", svc.Handler())
-	dep.Delete("", svc.Handler())          // API-CRIT-04: Delete deployment
+	dep.Delete("", svc.Handler()) // API-CRIT-04: Delete deployment
 	dep.Post("/rollback", svc.Handler())
 
 	// Releases for a deployment.
@@ -488,13 +566,16 @@ func (r *Router) registerProvisioningRoutes(v1, orgs fiber.Router) {
 		return
 	}
 
-	// Public bootstrap endpoints (token-based auth).
-	bootstrap := v1.Group("/bootstrap")
-	bootstrap.Get("/:token/manifest.yaml", svc.Handler())
-	bootstrap.Post("/:token/agent", svc.Handler())
+	// Public install script endpoint (session ID in URL, token in env).
+	v1.Get("/install/:sessionId", svc.Handler())
 
-	// Session step updates (token-based auth).
+	// NOTE: The old /v1/bootstrap/* endpoints are removed.
+	// Agents now use the cluster service's /v1/agent-install/:token/manifest.yaml
+	// endpoint for agent installation.
+
+	// Session bundle and step updates (token-based auth).
 	sessions := v1.Group("/sessions")
+	sessions.Get("/:sessionToken/bundle", svc.Handler())
 	sessions.Post("/:sessionToken/steps/:stepNumber", svc.Handler())
 
 	// Cloud credentials.
@@ -526,6 +607,136 @@ func (r *Router) registerProvisioningRoutes(v1, orgs fiber.Router) {
 	providers.Get("/:provider/regions", svc.Handler())
 	providers.Get("/:provider/machine-types", svc.Handler())
 	providers.Get("/:provider/kubernetes-versions", svc.Handler())
+}
+
+// registerBuildRoutes mounts build service routes.
+func (r *Router) registerBuildRoutes(v1, orgs fiber.Router) {
+	svc, ok := r.services["build"]
+	if !ok {
+		return
+	}
+
+	// Public routes (NO auth required - GitHub redirects/calls these).
+	// These must NOT be wrapped in Authentication middleware.
+	v1.Get("/github/oauth/callback", svc.Handler())
+	v1.Post("/webhooks/github/:repositoryId", svc.Handler())
+
+	// --- Authenticated routes (org-scoped) ---
+
+	// Git Repositories (scoped to org/project).
+	repos := orgs.Group("/projects/:projectId/repositories", middleware.ProjectScope())
+	repos.Post("", svc.Handler())
+	repos.Get("", svc.Handler())
+
+	// Single repository operations.
+	singleRepo := orgs.Group("/repositories/:repoId")
+	singleRepo.Get("", svc.Handler())
+	singleRepo.Patch("", svc.Handler())
+	singleRepo.Delete("", svc.Handler())
+
+	// Builds at org level.
+	builds := orgs.Group("/builds")
+	builds.Post("", svc.Handler())
+	builds.Get("", svc.Handler())
+
+	// Single build operations.
+	build := builds.Group("/:buildId")
+	build.Get("", svc.Handler())
+	build.Post("/cancel", svc.Handler())
+	build.Post("/retry", svc.Handler())
+	build.Get("/logs", svc.Handler())
+	build.Get("/artifact", svc.Handler())
+
+	// --- GitHub integration routes (org-scoped) ---
+
+	// OAuth initiation.
+	orgs.Get("/github/oauth/authorize", svc.Handler())
+
+	// Connections.
+	connections := orgs.Group("/github/connections")
+	connections.Post("", svc.Handler())
+	connections.Get("", svc.Handler())
+
+	// Single connection operations.
+	singleConn := connections.Group("/:connectionId")
+	singleConn.Get("", svc.Handler())
+	singleConn.Delete("", svc.Handler())
+	singleConn.Post("/validate", svc.Handler())
+	singleConn.Get("/repositories", svc.Handler())
+
+	// Connected GitHub repositories.
+	ghRepos := orgs.Group("/github/repositories")
+	ghRepos.Post("", svc.Handler())
+	ghRepos.Get("", svc.Handler())
+
+	// Single GitHub repository operations.
+	singleGHRepo := ghRepos.Group("/:repositoryId")
+	singleGHRepo.Get("", svc.Handler())
+	singleGHRepo.Delete("", svc.Handler())
+	singleGHRepo.Post("/sync", svc.Handler())
+	singleGHRepo.Get("/branches", svc.Handler())
+	singleGHRepo.Get("/commits", svc.Handler())
+	singleGHRepo.Get("/default-branch", svc.Handler())
+	singleGHRepo.Post("/webhook", svc.Handler())
+
+	// Webhook operations.
+	webhooks := orgs.Group("/github/webhooks/:webhookId")
+	webhooks.Get("", svc.Handler())
+	webhooks.Delete("", svc.Handler())
+	webhooks.Get("/deliveries", svc.Handler())
+}
+
+// registerObservabilityRoutes mounts observability service routes.
+func (r *Router) registerObservabilityRoutes(v1, orgs fiber.Router) {
+	svc, ok := r.services["observability"]
+	if !ok {
+		return
+	}
+
+	// Metrics.
+	metrics := orgs.Group("/metrics")
+	metrics.Get("/query", svc.Handler())
+	metrics.Post("/query", svc.Handler())
+	metrics.Get("/query_instant", svc.Handler())
+	metrics.Get("/:resourceType/:resourceId", svc.Handler())
+
+	// Logs.
+	logs := orgs.Group("/logs")
+	logs.Get("/query", svc.Handler())
+	logs.Post("/query", svc.Handler())
+	logs.Get("/streams", svc.Handler())
+
+	// Dashboards.
+	dashboards := orgs.Group("/dashboards")
+	dashboards.Post("", svc.Handler())
+	dashboards.Get("", svc.Handler())
+	dashboards.Get("/:dashboardId", svc.Handler())
+	dashboards.Put("/:dashboardId", svc.Handler())
+	dashboards.Delete("/:dashboardId", svc.Handler())
+
+	// Health checks.
+	health := orgs.Group("/health")
+	health.Get("/summary", svc.Handler())
+	health.Get("/:resourceType/:resourceId", svc.Handler())
+
+	// Events.
+	events := orgs.Group("/events")
+	events.Get("", svc.Handler())
+
+	// Alerts.
+	alerts := orgs.Group("/alerts")
+	alerts.Post("/rules", svc.Handler())
+	alerts.Get("/rules", svc.Handler())
+	alerts.Get("/firing", svc.Handler())
+
+	// Observability overview.
+	orgs.Get("/observability/overview", svc.Handler())
+
+	// Agent ingest endpoints (credential-based, no user auth).
+	agent := v1.Group("/agent")
+	agent.Post("/metrics", svc.Handler())
+	agent.Post("/logs", svc.Handler())
+	agent.Post("/health", svc.Handler())
 }
 
 // Services returns the map of registered backend services.

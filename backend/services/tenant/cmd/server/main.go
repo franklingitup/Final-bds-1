@@ -13,6 +13,7 @@ import (
 	"github.com/bdsplatform/platform/backend/libs/database"
 	"github.com/bdsplatform/platform/backend/libs/events"
 	"github.com/bdsplatform/platform/backend/libs/httpserver"
+	"github.com/bdsplatform/platform/backend/libs/internalapi"
 	"github.com/bdsplatform/platform/backend/libs/logger"
 	"github.com/bdsplatform/platform/backend/migrations"
 	tenant "github.com/bdsplatform/platform/backend/services/tenant/internal"
@@ -43,12 +44,19 @@ func main() {
 	defer closeEvents()
 
 	outbox := events.NewPostgresOutbox(db, "outbox")
+	authURL := os.Getenv("AUTH_SERVICE_URL")
+	if authURL == "" {
+		authURL = "http://localhost:8081"
+	}
+	users := internalapi.NewAuthClient(authURL)
+	users.InternalToken = os.Getenv("INTERNAL_API_TOKEN")
 	svc := tenant.NewService(tenant.Deps{
 		Orgs:        tenant.NewOrganizationStore(db),
 		Members:     tenant.NewMemberStore(db),
 		Invitations: tenant.NewInvitationStore(db),
 		Outbox:      outbox,
 		Tenant:      db,
+		Users:       users,
 		Logger:      log,
 	})
 	handler := tenant.NewHandler(svc, tenant.NewTokenVerifier(cfg.Auth))

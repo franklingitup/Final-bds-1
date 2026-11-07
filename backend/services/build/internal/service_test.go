@@ -3,10 +3,14 @@ package build
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/bdsplatform/platform/backend/libs/authz"
 	"github.com/bdsplatform/platform/backend/libs/database"
+	apperrors "github.com/bdsplatform/platform/backend/libs/errors"
+	"github.com/bdsplatform/platform/backend/libs/events"
 )
 
 // mockRepositoryStore implements RepositoryStore for testing.
@@ -304,6 +308,35 @@ func (m *mockTenant) WithTenant(ctx context.Context, orgID string, fn database.T
 	return fn(ctx)
 }
 
+type testOrgMemberStore struct {
+	orgID string
+	role  authz.OrgRole
+}
+
+func (s testOrgMemberStore) GetOrgMember(_ context.Context, userID string) (*authz.OrgMember, error) {
+	return &authz.OrgMember{OrgID: s.orgID, UserID: userID, Role: s.role, Status: "active"}, nil
+}
+
+type testProjectMemberStore struct {
+	members map[string]authz.ProjectRole
+}
+
+func (s testProjectMemberStore) GetProjectMember(_ context.Context, projectID, userID string) (*authz.ProjectMember, error) {
+	role, ok := s.members[projectID+"/"+userID]
+	if !ok {
+		return nil, apperrors.NotFound("project member not found")
+	}
+	return &authz.ProjectMember{ProjectID: projectID, UserID: userID, Role: role}, nil
+}
+
+type testOutbox struct{}
+
+func (testOutbox) Enqueue(context.Context, events.Envelope) error { return nil }
+func (testOutbox) FetchUnpublished(context.Context, int) ([]events.OutboxRecord, error) {
+	return nil, nil
+}
+func (testOutbox) MarkPublished(context.Context, []string) error { return nil }
+
 func TestBuild_IsTerminal(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -378,27 +411,166 @@ func TestBuild_CanCancel(t *testing.T) {
 	}
 }
 
-func TestIsValidGitURL(t *testing.T) {
-	tests := []struct {
-		name string
-		url  string
-		want bool
-	}{
-		{"https url", "https://github.com/org/repo.git", true},
-		{"http url", "http://github.com/org/repo.git", true},
-		{"ssh url", "git@github.com:org/repo.git", true},
-		{"invalid scheme", "ftp://github.com/repo.git", false},
-		{"invalid url", "not-a-url", false},
-		{"empty", "", false},
+func TestProjectDeveloperCanCreateAndCancelRepositoryBuild(t *testing.T) {
+	const (
+		orgID     = "org-1"
+		projectID = "project-1"
+		userID    = "user-1"
+		repoID    = "repo-1"
+	)
+	repos := newMockRepositoryStore()
+	repos.repos[repoID] = &GitRepository{
+		ProjectID:     projectID,
+		Name:          "app",
+		URL:           "https://github.com/acme/app.git",
+		DefaultBranch: "main",
 	}
+	repos.repos[repoID].ID = repoID
+	repos.repos[repoID].OrgID = orgID
+
+	svc := NewService(Deps{
+		Repositories:   repos,
+		Builds:         newMockBuildStore(),
+		BuildLogs:      newMockBuildLogStore(),
+		BuildArtifacts: newMockBuildArtifactStore(),
+		BuildQueue:     newMockBuildQueueStore(),
+		OrgMembers:     testOrgMemberStore{orgID: orgID, role: authz.RoleMember},
+		ProjectMembers: testProjectMemberStore{members: map[string]authz.ProjectRole{
+			projectID + "/" + userID: authz.ProjectDeveloper,
+		}},
+		Outbox: testOutbox{},
+		Tenant: &mockTenant{},
+	})
+
+	build, err := svc.CreateBuild(context.Background(), orgID, userID, CreateBuildRequest{
+		RepositoryID:   ptr(repoID),
+		TargetImage:    "acme/app",
+		TargetRegistry: "registry.example.com",
+	})
+	if err != nil {
+		t.Fatalf("project developer should create repository build: %v", err)
+	}
+
+	if _, err := svc.CancelBuild(context.Background(), orgID, userID, build.ID); err != nil {
+		t.Fatalf("project developer should cancel repository build: %v", err)
+	}
+}
+
+func ptr[T any](value T) *T { return &value }
+
+// TestValidateGitURL_ServiceLayer exercises ValidateGitURL from the perspective
+// of the service callers. It uses a stubbed LookupHostFunc so the tests never
+// hit real DNS and pass in offline / CI environments.
+func TestValidateGitURL_ServiceLayer(t *testing.T) {
+	const pubIP = "140.82.121.4" // representative public GitHub IP
+
+	tests := []struct {
+		name    string
+		url     string
+		lookup  map[string][]string // nil ⇒ no stub needed (raw IP in URL)
+		wantOK  bool
+	}{
+		{
+			name:   "https with public hostname",
+			url:    "https://github.com/org/repo.git",
+			lookup: map[string][]string{"github.com": {pubIP}},
+			wantOK: true,
+		},
+		{
+			name:   "http with public hostname",
+			url:    "http://github.com/org/repo.git",
+			lookup: map[string][]string{"github.com": {pubIP}},
+			wantOK: true,
+		},
+		{
+			name:   "ssh shorthand with public hostname",
+			url:    "git@github.com:org/repo.git",
+			lookup: map[string][]string{"github.com": {pubIP}},
+			wantOK: true,
+		},
+		{
+			name:    "raw public IP",
+			url:     "http://8.8.8.8/repo.git",
+			lookup:  nil,
+			wantOK:  true,
+		},
+		{
+			name:    "invalid scheme ftp",
+			url:     "ftp://github.com/repo.git",
+			lookup:  nil,
+			wantOK:  false,
+		},
+		{
+			name:    "not a URL",
+			url:     "not-a-url",
+			lookup:  nil,
+			wantOK:  false,
+		},
+		{
+			name:    "empty",
+			url:     "",
+			lookup:  nil,
+			wantOK:  false,
+		},
+		{
+			name:    "loopback raw IP",
+			url:     "http://127.0.0.1/repo.git",
+			lookup:  nil,
+			wantOK:  false,
+		},
+		{
+			name:    "cloud metadata endpoint raw IP",
+			url:     "http://169.254.169.254/latest/meta-data/",
+			lookup:  nil,
+			wantOK:  false,
+		},
+		{
+			name:    "RFC1918 raw IP",
+			url:     "http://10.0.0.1/repo.git",
+			lookup:  nil,
+			wantOK:  false,
+		},
+		{
+			name:   "hostname resolving to private IP",
+			url:    "https://evil.internal.example.com/repo.git",
+			lookup: map[string][]string{"evil.internal.example.com": {"192.168.1.1"}},
+			wantOK: false,
+		},
+	}
+
+	orig := LookupHostFunc
+	defer func() { LookupHostFunc = orig }()
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := isValidGitURL(tt.url); got != tt.want {
-				t.Errorf("isValidGitURL(%q) = %v, want %v", tt.url, got, tt.want)
+			if tt.lookup != nil {
+				LookupHostFunc = func(_ context.Context, host string) ([]string, error) {
+					if ips, ok := tt.lookup[host]; ok {
+						return ips, nil
+					}
+					return nil, fmt.Errorf("stubLookup: no record for %q", host)
+				}
+			} else {
+				// Reset to a stub that panics if called — raw IP tests must
+				// not trigger DNS.
+				LookupHostFunc = func(_ context.Context, host string) ([]string, error) {
+					t.Errorf("DNS lookup unexpectedly called for host %q in test %q", host, tt.name)
+					return nil, fmt.Errorf("unexpected lookup")
+				}
+			}
+
+			err := ValidateGitURL(context.Background(), tt.url)
+			if tt.wantOK && err != nil {
+				t.Errorf("ValidateGitURL(%q) returned unexpected error: %v", tt.url, err)
+			}
+			if !tt.wantOK && err == nil {
+				t.Errorf("ValidateGitURL(%q) should have returned an error but did not", tt.url)
 			}
 		})
 	}
+
+	// Restore after the loop (the defer above also handles this, but be explicit).
+	LookupHostFunc = orig
 }
 
 func TestToBuildView(t *testing.T) {
@@ -406,7 +578,7 @@ func TestToBuildView(t *testing.T) {
 	finished := now.Add(5 * time.Minute)
 	repoID := "repo-123"
 	gitURL := "https://github.com/org/repo.git"
-	
+
 	b := &Build{
 		RepositoryID:   &repoID,
 		GitURL:         &gitURL,

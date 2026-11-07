@@ -14,6 +14,7 @@ import (
 	"github.com/bdsplatform/platform/backend/libs/database"
 	"github.com/bdsplatform/platform/backend/libs/events"
 	"github.com/bdsplatform/platform/backend/libs/httpserver"
+	"github.com/bdsplatform/platform/backend/libs/internalapi"
 	"github.com/bdsplatform/platform/backend/libs/logger"
 	"github.com/bdsplatform/platform/backend/migrations"
 	audit "github.com/bdsplatform/platform/backend/services/audit/internal"
@@ -40,6 +41,7 @@ func main() {
 		Store:      audit.NewAuditLogStore(db),
 		OrgMembers: authz.NewOrgMemberRepo(db), // For org membership authorization
 		Tenant:     db,
+		Users:      newAuthUsers(),
 		Logger:     log,
 	})
 
@@ -105,4 +107,14 @@ func newSubscriber(ctx context.Context, cfg config.Config, log *slog.Logger) (ev
 		return nil, nil, err
 	}
 	return client, client.Close, nil
+}
+
+func newAuthUsers() *internalapi.AuthClient {
+	authURL := os.Getenv("AUTH_SERVICE_URL")
+	if authURL == "" {
+		authURL = "http://localhost:8081"
+	}
+	c := internalapi.NewAuthClient(authURL)
+	c.InternalToken = os.Getenv("INTERNAL_API_TOKEN")
+	return c
 }

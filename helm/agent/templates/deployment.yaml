@@ -95,6 +95,9 @@ spec:
             - name: NAMESPACE
               value: {{ .Values.namespace | quote }}
 
+            - name: MANAGED_NAMESPACE_PREFIX
+              value: {{ .Values.managedNamespacePrefix | quote }}
+
             - name: RECONCILER_ENABLED
               value: "true"
 
@@ -106,6 +109,27 @@ spec:
 
             - name: RECONCILE_INTERVAL
               value: "30s"
+
+            #
+            # Metrics collector (resource metrics from metrics-server).
+            #
+            - name: METRICS_COLLECTOR_ENABLED
+              value: {{ .Values.metricsCollector.enabled | quote }}
+
+            - name: METRICS_INTERVAL
+              value: {{ .Values.metricsCollector.interval | quote }}
+
+            #
+            # Log shipper (tail pod logs and ship to control plane).
+            #
+            - name: LOG_SHIPPER_ENABLED
+              value: {{ .Values.logShipper.enabled | quote }}
+
+            - name: LOG_SHIPPER_BATCH_INTERVAL
+              value: {{ .Values.logShipper.batchInterval | quote }}
+
+            - name: MAX_TAILED_PODS
+              value: {{ .Values.logShipper.maxTailedPods | quote }}
 
             #
             # Health + metrics HTTP server. Liveness/readiness/metrics are all

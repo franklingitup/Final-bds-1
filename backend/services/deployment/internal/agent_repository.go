@@ -36,6 +36,11 @@ func NewDesiredStateStore(db *database.DB) DesiredStateStore {
 // 2. Explicitly filtering by org_id as a defense-in-depth measure
 //
 // This addresses CRIT-001: RLS Bypass in Agent Desired State Query.
+//
+// Namespace handling:
+// - Deployments bound to an environment get namespace from environments.namespace.
+// - Unbound (legacy) deployments get namespace="" so the agent's own fallback
+//   continues to apply, preserving pre-environment behaviour exactly.
 func (r *desiredStateRepo) GetDesiredState(ctx context.Context, orgID, clusterID string) ([]DesiredDeployment, error) {
 	var results []DesiredDeployment
 
@@ -48,6 +53,10 @@ func (r *desiredStateRepo) GetDesiredState(ctx context.Context, orgID, clusterID
 		// Only active deployments (not deleted) with pending/deploying releases are returned.
 		//
 		// SECURITY: Explicit org_id filter provides defense-in-depth beyond RLS.
+		//
+		// LEFT JOIN environments: unbound deployments (environment_id IS NULL) produce
+		// COALESCE(e.namespace, '') = "" — the agent applies its own default, preserving
+		// pre-existing behaviour for every deployment created before this migration.
 		const sql = `
 SELECT DISTINCT ON (d.id)
     d.id AS deployment_id,
@@ -55,6 +64,8 @@ SELECT DISTINCT ON (d.id)
     a.id AS application_id,
     a.name AS application_name,
     a.slug AS application_slug,
+    p.id AS project_id,
+    p.slug AS project_slug,
     r.image AS image,
     r.revision AS revision,
     d.replicas AS replicas,
@@ -64,10 +75,13 @@ SELECT DISTINCT ON (d.id)
     d.cpu_limit AS cpu_limit,
     d.memory_request AS memory_request,
     d.memory_limit AS memory_limit,
-    COALESCE(r.status, d.status) AS status
+    COALESCE(r.status, d.status) AS status,
+    COALESCE(e.namespace, '') AS namespace
 FROM deployments d
 INNER JOIN applications a ON a.id = d.application_id
+INNER JOIN projects p ON p.id = a.project_id
 INNER JOIN releases r ON r.deployment_id = d.id
+LEFT  JOIN environments e ON e.id = d.environment_id
 WHERE d.cluster_id = $1
   AND d.org_id = $2
   AND d.status NOT IN ('deleted', 'deleting')
@@ -88,6 +102,8 @@ ORDER BY d.id, r.revision DESC`
 				&row.ApplicationID,
 				&row.ApplicationName,
 				&row.ApplicationSlug,
+				&row.ProjectID,
+				&row.ProjectSlug,
 				&row.Image,
 				&row.Revision,
 				&row.Replicas,
@@ -98,13 +114,12 @@ ORDER BY d.id, r.revision DESC`
 				&row.MemoryRequest,
 				&row.MemoryLimit,
 				&row.Status,
+				&row.Namespace,
 			); err != nil {
 				return database.MapError(err)
 			}
 
-			// Use the application slug as the default namespace.
-			namespace := row.ApplicationSlug
-			results = append(results, row.toDesiredDeployment(namespace))
+			results = append(results, row.toDesiredDeployment(row.Namespace))
 		}
 
 		return rows.Err()

@@ -44,35 +44,41 @@ type TerraformConfig struct {
 
 // AWSConfig holds AWS-specific configuration.
 type AWSConfig struct {
-	VPCCidr         string
+	VPCCidr           string
+	ServiceCidr       string
 	AvailabilityZones []string
-	EnableNATGateway bool
-	PrivateCluster   bool
+	EnableNATGateway  bool
+	PrivateCluster    bool
 }
 
 // AzureConfig holds Azure-specific configuration.
 type AzureConfig struct {
-	ResourceGroup    string
-	VNetCidr         string
-	DNSPrefix        string
-	PrivateCluster   bool
+	ResourceGroup  string
+	VNetCidr       string
+	PodCidr        string
+	ServiceCidr    string
+	DNSPrefix      string
+	PrivateCluster bool
 }
 
 // GCPConfig holds GCP-specific configuration.
 type GCPConfig struct {
-	ProjectID       string
-	Network         string
-	Subnetwork      string
-	PrivateCluster  bool
-	MasterIPv4CIDR  string
+	ProjectID      string
+	Network        string
+	Subnetwork     string
+	SubnetCidr     string
+	PodCidr        string
+	ServiceCidr    string
+	PrivateCluster bool
+	MasterIPv4CIDR string
 }
 
 // GeneratedTerraform is the output of Terraform generation.
 type GeneratedTerraform struct {
-	MainTF     string                 `json:"mainTf"`
-	VariablesTF string                `json:"variablesTf"`
-	OutputsTF  string                 `json:"outputsTf"`
-	TFVars     map[string]interface{} `json:"tfVars"`
+	MainTF      string                 `json:"mainTf"`
+	VariablesTF string                 `json:"variablesTf"`
+	OutputsTF   string                 `json:"outputsTf"`
+	TFVars      map[string]interface{} `json:"tfVars"`
 }
 
 // Generate generates Terraform configuration for the given provider.
@@ -142,20 +148,26 @@ func (g *TerraformGenerator) generateOutputs(provider string) string {
 
 func (g *TerraformGenerator) generateTFVars(provider string, cfg TerraformConfig) map[string]interface{} {
 	vars := map[string]interface{}{
-		"cluster_name":    cfg.ClusterName,
-		"region":          cfg.Region,
+		"cluster_name":       cfg.ClusterName,
+		"region":             cfg.Region,
 		"kubernetes_version": cfg.K8sVersion,
 	}
 
 	// Add node pools
 	nodePoolsJSON, _ := json.Marshal(cfg.NodePools)
 	vars["node_pools"] = string(nodePoolsJSON)
+	addons := make(map[string]bool)
+	for _, addon := range cfg.Addons {
+		addons[addon.Name] = addon.Enabled
+	}
+	vars["addons"] = addons
 
 	// Add provider-specific vars
 	switch provider {
 	case ProviderAWS:
 		if cfg.AWS != nil {
 			vars["vpc_cidr"] = cfg.AWS.VPCCidr
+			vars["service_cidr"] = cfg.AWS.ServiceCidr
 			if len(cfg.AWS.AvailabilityZones) > 0 {
 				vars["availability_zones"] = cfg.AWS.AvailabilityZones
 			}
@@ -166,6 +178,8 @@ func (g *TerraformGenerator) generateTFVars(provider string, cfg TerraformConfig
 		if cfg.Azure != nil {
 			vars["resource_group"] = cfg.Azure.ResourceGroup
 			vars["vnet_cidr"] = cfg.Azure.VNetCidr
+			vars["pod_cidr"] = cfg.Azure.PodCidr
+			vars["service_cidr"] = cfg.Azure.ServiceCidr
 			vars["dns_prefix"] = cfg.Azure.DNSPrefix
 			vars["private_cluster"] = cfg.Azure.PrivateCluster
 		}
@@ -174,6 +188,9 @@ func (g *TerraformGenerator) generateTFVars(provider string, cfg TerraformConfig
 			vars["project_id"] = cfg.GCP.ProjectID
 			vars["network"] = cfg.GCP.Network
 			vars["subnetwork"] = cfg.GCP.Subnetwork
+			vars["subnet_cidr"] = cfg.GCP.SubnetCidr
+			vars["pod_cidr"] = cfg.GCP.PodCidr
+			vars["service_cidr"] = cfg.GCP.ServiceCidr
 			vars["private_cluster"] = cfg.GCP.PrivateCluster
 			vars["master_ipv4_cidr"] = cfg.GCP.MasterIPv4CIDR
 		}
@@ -250,6 +267,11 @@ module "eks" {
 
   cluster_endpoint_public_access  = !var.private_cluster
   cluster_endpoint_private_access = true
+  cluster_service_ipv4_cidr       = var.service_cidr
+
+  cluster_addons = {
+    for name, enabled in var.addons : name => {} if enabled
+  }
 
   eks_managed_node_groups = {
 {{- range $i, $pool := .NodePools }}
@@ -308,6 +330,12 @@ variable "enable_nat_gateway" {
   default     = true
 }
 
+variable "service_cidr" {
+  description = "Kubernetes service CIDR"
+  type        = string
+  default     = "10.96.0.0/12"
+}
+
 variable "private_cluster" {
   description = "Make cluster private"
   type        = bool
@@ -318,6 +346,12 @@ variable "node_pools" {
   description = "Node pool configuration (JSON)"
   type        = string
   default     = "[]"
+}
+
+variable "addons" {
+  description = "Enabled EKS managed addons"
+  type        = map(bool)
+  default     = {}
 }
 `
 
@@ -437,7 +471,12 @@ resource "azurerm_kubernetes_cluster" "main" {
     network_plugin    = "azure"
     load_balancer_sku = "standard"
     network_policy    = "azure"
+    pod_cidr          = var.pod_cidr
+    service_cidr      = var.service_cidr
+    dns_service_ip    = cidrhost(var.service_cidr, 10)
   }
+
+  azure_policy_enabled = lookup(var.addons, "azure-policy", false)
 
   tags = {
     "managed-by" = "bds-platform"
@@ -501,6 +540,18 @@ variable "dns_prefix" {
   type        = string
 }
 
+variable "pod_cidr" {
+  description = "Kubernetes pod CIDR"
+  type        = string
+  default     = "10.244.0.0/16"
+}
+
+variable "service_cidr" {
+  description = "Kubernetes service CIDR"
+  type        = string
+  default     = "10.96.0.0/12"
+}
+
 variable "private_cluster" {
   description = "Make cluster private"
   type        = bool
@@ -511,6 +562,12 @@ variable "node_pools" {
   description = "Node pool configuration (JSON)"
   type        = string
   default     = "[]"
+}
+
+variable "addons" {
+  description = "Enabled AKS addons"
+  type        = map(bool)
+  default     = {}
 }
 `
 
@@ -565,18 +622,18 @@ resource "google_compute_network" "main" {
 
 resource "google_compute_subnetwork" "main" {
   name          = "{{.ClusterName}}-subnet"
-  ip_cidr_range = "10.0.0.0/20"
+  ip_cidr_range = var.subnet_cidr
   region        = var.region
   network       = google_compute_network.main.id
 
   secondary_ip_range {
     range_name    = "pods"
-    ip_cidr_range = "10.1.0.0/16"
+    ip_cidr_range = var.pod_cidr
   }
 
   secondary_ip_range {
     range_name    = "services"
-    ip_cidr_range = "10.2.0.0/20"
+    ip_cidr_range = var.service_cidr
   }
 }
 
@@ -587,9 +644,6 @@ resource "google_container_cluster" "main" {
 
   network    = google_compute_network.main.name
   subnetwork = google_compute_subnetwork.main.name
-
-  # Autopilot mode or Standard
-  enable_autopilot = false
 
   # We can't create a cluster with no node pool, but we want to use
   # separately managed node pools. So we create the smallest possible
@@ -602,6 +656,15 @@ resource "google_container_cluster" "main" {
   ip_allocation_policy {
     cluster_secondary_range_name  = "pods"
     services_secondary_range_name = "services"
+  }
+
+  addons_config {
+    horizontal_pod_autoscaling {
+      disabled = !lookup(var.addons, "horizontal-pod-autoscaling", true)
+    }
+    http_load_balancing {
+      disabled = !lookup(var.addons, "http-load-balancing", true)
+    }
   }
 
   private_cluster_config {
@@ -681,6 +744,24 @@ variable "network" {
   default     = ""
 }
 
+variable "subnet_cidr" {
+  description = "Primary subnet CIDR"
+  type        = string
+  default     = "10.0.0.0/20"
+}
+
+variable "pod_cidr" {
+  description = "Secondary pod CIDR"
+  type        = string
+  default     = "10.1.0.0/16"
+}
+
+variable "service_cidr" {
+  description = "Secondary service CIDR"
+  type        = string
+  default     = "10.2.0.0/20"
+}
+
 variable "subnetwork" {
   description = "VPC subnetwork name"
   type        = string
@@ -703,6 +784,12 @@ variable "node_pools" {
   description = "Node pool configuration (JSON)"
   type        = string
   default     = "[]"
+}
+
+variable "addons" {
+  description = "Enabled GKE addons"
+  type        = map(bool)
+  default     = {}
 }
 `
 

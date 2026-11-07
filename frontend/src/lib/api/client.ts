@@ -1,6 +1,6 @@
 import type { ApiError } from "@/types/api";
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "";
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "";
 
 export class ApiClientError extends Error {
   constructor(
@@ -117,6 +117,16 @@ class ApiClient {
   }
 
   private buildUrl(path: string, params?: Record<string, string | number | boolean | undefined>): string {
+    // Guard: all backend routes are versioned under /v1/. Throw immediately so
+    // a missing-prefix bug is discovered the first time the call is exercised
+    // in development rather than producing a confusing 404 at runtime.
+    if (!path.startsWith("/v1/")) {
+      throw new Error(
+        `[ApiClient] API path missing /v1 prefix: "${path}". ` +
+        `All backend routes are versioned – use /v1/... (e.g. /v1/organizations/...). ` +
+        `If you see this, fix the path in frontend/src/lib/api/.`
+      );
+    }
     const url = new URL(`${API_BASE_URL}${path}`);
     if (params) {
       Object.entries(params).forEach(([key, value]) => {

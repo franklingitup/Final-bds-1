@@ -65,6 +65,7 @@ type Deps struct {
 	Deployments       DeploymentReader
 	Releases          ReleaseCreator
 	OrgMembers        authz.OrgMemberStore
+	ProjectMembers    authz.ProjectMemberStore
 	Outbox            events.Outbox
 	Tenant            TenantRunner
 	Logger            *slog.Logger
@@ -91,6 +92,10 @@ func NewService(d Deps) *Service {
 	if d.Logger == nil {
 		d.Logger = slog.Default()
 	}
+	authSvc := authz.NewAuthorizationService(d.Tenant, d.OrgMembers, nil)
+	if d.ProjectMembers != nil {
+		authSvc = authSvc.WithProjectMembers(d.ProjectMembers)
+	}
 	return &Service{
 		desiredStates:  d.DesiredStates,
 		pipelineRuns:   d.PipelineRuns,
@@ -101,7 +106,7 @@ func NewService(d Deps) *Service {
 		orgMembers:     d.OrgMembers,
 		outbox:         d.Outbox,
 		tenant:         d.Tenant,
-		authSvc:        authz.NewAuthorizationService(d.Tenant, d.OrgMembers, nil),
+		authSvc:        authSvc,
 		generator:      NewManifestGenerator(),
 		log:            d.Logger,
 	}
@@ -113,7 +118,7 @@ func NewService(d Deps) *Service {
 
 // TriggerPipeline starts a new deployment pipeline.
 func (s *Service) TriggerPipeline(ctx context.Context, orgID, userID string, req TriggerPipelineRequest) (*PipelineRun, error) {
-	if _, err := s.authSvc.AuthorizeOrgMember(ctx, orgID, userID, authz.ActionDeploy); err != nil {
+	if err := s.authorizeDeployment(ctx, orgID, userID, req.DeploymentID, authz.ActionDeploy); err != nil {
 		return nil, err
 	}
 
@@ -400,22 +405,16 @@ func (s *Service) logEvent(ctx context.Context, orgID, pipelineRunID, eventType,
 
 // GetPipelineRun returns a pipeline run by ID.
 func (s *Service) GetPipelineRun(ctx context.Context, orgID, userID, pipelineID string) (*PipelineRun, error) {
-	if _, err := s.authSvc.AuthorizeOrgRead(ctx, orgID, userID); err != nil {
+	pr, err := s.authorizePipeline(ctx, orgID, userID, pipelineID, authz.ActionReadDeployment)
+	if err != nil {
 		return nil, err
 	}
-
-	var pr *PipelineRun
-	err := s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
-		var err error
-		pr, err = s.pipelineRuns.GetByID(ctx, pipelineID)
-		return err
-	})
-	return pr, err
+	return pr, nil
 }
 
 // ListPipelineRuns returns pipeline runs for a deployment.
 func (s *Service) ListPipelineRuns(ctx context.Context, orgID, userID, deploymentID string, page database.PageRequest) (database.Page[PipelineRun], error) {
-	if _, err := s.authSvc.AuthorizeOrgRead(ctx, orgID, userID); err != nil {
+	if err := s.authorizeDeployment(ctx, orgID, userID, deploymentID, authz.ActionReadDeployment); err != nil {
 		return database.Page[PipelineRun]{}, err
 	}
 
@@ -430,7 +429,7 @@ func (s *Service) ListPipelineRuns(ctx context.Context, orgID, userID, deploymen
 
 // GetPipelineEvents returns events for a pipeline run.
 func (s *Service) GetPipelineEvents(ctx context.Context, orgID, userID, pipelineID string, page database.PageRequest) (database.Page[PipelineEvent], error) {
-	if _, err := s.authSvc.AuthorizeOrgRead(ctx, orgID, userID); err != nil {
+	if _, err := s.authorizePipeline(ctx, orgID, userID, pipelineID, authz.ActionReadDeployment); err != nil {
 		return database.Page[PipelineEvent]{}, err
 	}
 
@@ -445,7 +444,7 @@ func (s *Service) GetPipelineEvents(ctx context.Context, orgID, userID, pipeline
 
 // CancelPipeline cancels an active pipeline.
 func (s *Service) CancelPipeline(ctx context.Context, orgID, userID, pipelineID string) error {
-	if _, err := s.authSvc.AuthorizeOrgMember(ctx, orgID, userID, authz.ActionDeploy); err != nil {
+	if _, err := s.authorizePipeline(ctx, orgID, userID, pipelineID, authz.ActionDeploy); err != nil {
 		return err
 	}
 
@@ -519,14 +518,14 @@ func (s *Service) ReportSync(ctx context.Context, orgID string, req ReportSyncRe
 func (s *Service) ReportMetrics(ctx context.Context, orgID string, req ReportMetricsRequest) error {
 	return s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
 		dm := &DeploymentMetrics{
-			OrgID:               orgID,
-			DeploymentID:        req.DeploymentID,
-			AvailableReplicas:   req.AvailableReplicas,
-			ReadyReplicas:       req.ReadyReplicas,
-			UpdatedReplicas:     req.UpdatedReplicas,
-			CPUUsageMillicores:  req.CPUUsageMillicores,
-			MemoryUsageBytes:    req.MemoryUsageBytes,
-			HealthStatus:        req.HealthStatus,
+			OrgID:              orgID,
+			DeploymentID:       req.DeploymentID,
+			AvailableReplicas:  req.AvailableReplicas,
+			ReadyReplicas:      req.ReadyReplicas,
+			UpdatedReplicas:    req.UpdatedReplicas,
+			CPUUsageMillicores: req.CPUUsageMillicores,
+			MemoryUsageBytes:   req.MemoryUsageBytes,
+			HealthStatus:       req.HealthStatus,
 		}
 		if dm.HealthStatus == "" {
 			dm.HealthStatus = HealthUnknown
@@ -538,7 +537,7 @@ func (s *Service) ReportMetrics(ctx context.Context, orgID string, req ReportMet
 
 // GetDesiredState returns the desired state for a deployment.
 func (s *Service) GetDesiredState(ctx context.Context, orgID, userID, deploymentID string) (*DesiredState, error) {
-	if _, err := s.authSvc.AuthorizeOrgRead(ctx, orgID, userID); err != nil {
+	if err := s.authorizeDeployment(ctx, orgID, userID, deploymentID, authz.ActionReadDeployment); err != nil {
 		return nil, err
 	}
 
@@ -553,7 +552,7 @@ func (s *Service) GetDesiredState(ctx context.Context, orgID, userID, deployment
 
 // GetDeploymentMetrics returns metrics for a deployment.
 func (s *Service) GetDeploymentMetrics(ctx context.Context, orgID, userID, deploymentID string) (*DeploymentMetrics, error) {
-	if _, err := s.authSvc.AuthorizeOrgRead(ctx, orgID, userID); err != nil {
+	if err := s.authorizeDeployment(ctx, orgID, userID, deploymentID, authz.ActionReadDeployment); err != nil {
 		return nil, err
 	}
 
@@ -572,7 +571,7 @@ func (s *Service) GetDeploymentMetrics(ctx context.Context, orgID, userID, deplo
 
 // TriggerRollback triggers a rollback to a previous release.
 func (s *Service) TriggerRollback(ctx context.Context, orgID, userID, deploymentID string, targetRevision *int) (*PipelineRun, error) {
-	if _, err := s.authSvc.AuthorizeOrgMember(ctx, orgID, userID, authz.ActionDeploy); err != nil {
+	if err := s.authorizeDeployment(ctx, orgID, userID, deploymentID, authz.ActionDeploy); err != nil {
 		return nil, err
 	}
 
@@ -629,4 +628,47 @@ func (s *Service) QuickDeploy(ctx context.Context, orgID, userID, deploymentID, 
 		SourceType:   SourceTypeImage,
 		SourceRef:    image,
 	})
+}
+
+func (s *Service) authorizeDeployment(ctx context.Context, orgID, userID, deploymentID string, action authz.Action) error {
+	if _, err := s.authSvc.AuthorizeOrgRead(ctx, orgID, userID); err != nil {
+		return err
+	}
+	var projectID string
+	err := s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
+		dep, err := s.deployments.GetDeployment(ctx, deploymentID)
+		if err != nil {
+			return err
+		}
+		app, err := s.deployments.GetApplication(ctx, dep.ApplicationID)
+		if err != nil {
+			return err
+		}
+		projectID = app.ProjectID
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	_, err = s.authSvc.AuthorizeProjectMember(ctx, orgID, projectID, userID, action)
+	return err
+}
+
+func (s *Service) authorizePipeline(ctx context.Context, orgID, userID, pipelineID string, action authz.Action) (*PipelineRun, error) {
+	if _, err := s.authSvc.AuthorizeOrgRead(ctx, orgID, userID); err != nil {
+		return nil, err
+	}
+	var pr *PipelineRun
+	err := s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
+		var err error
+		pr, err = s.pipelineRuns.GetByID(ctx, pipelineID)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := s.authorizeDeployment(ctx, orgID, userID, pr.DeploymentID, action); err != nil {
+		return nil, err
+	}
+	return pr, nil
 }

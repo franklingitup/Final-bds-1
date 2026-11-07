@@ -8,14 +8,20 @@ import (
 
 func TestParseTimeRange(t *testing.T) {
 	tests := []struct {
-		name      string
-		start     string
-		end       string
-		wantErr   bool
+		name    string
+		start   string
+		end     string
+		wantErr bool
 	}{
 		{
 			name:    "duration format",
 			start:   "1h",
+			end:     "",
+			wantErr: false,
+		},
+		{
+			name:    "negative relative duration format",
+			start:   "-1h",
 			end:     "",
 			wantErr: false,
 		},
@@ -46,6 +52,50 @@ func TestParseTimeRange(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestAggregateLatestMetricSamples(t *testing.T) {
+	now := time.Now()
+	labels := func(pod, container string) json.RawMessage {
+		value, err := json.Marshal(map[string]string{
+			"namespace": "proj-example",
+			"pod":       pod,
+			"container": container,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+
+	samples := []MetricSample{
+		{
+			Labels:    labels("pod-a", "app"),
+			Value:     0.5,
+			Timestamp: now,
+		},
+		{
+			Labels:    labels("pod-a", "app"),
+			Value:     99,
+			Timestamp: now.Add(-time.Minute),
+		},
+		{
+			Labels:    labels("pod-b", "app"),
+			Value:     0.25,
+			Timestamp: now.Add(-time.Second),
+		},
+	}
+
+	value, updatedAt, ok := aggregateLatestMetricSamples(samples)
+	if !ok {
+		t.Fatal("expected samples to be aggregated")
+	}
+	if value != 0.75 {
+		t.Fatalf("aggregateLatestMetricSamples() value = %v, want 0.75", value)
+	}
+	if !updatedAt.Equal(now) {
+		t.Fatalf("aggregateLatestMetricSamples() updatedAt = %v, want %v", updatedAt, now)
 	}
 }
 

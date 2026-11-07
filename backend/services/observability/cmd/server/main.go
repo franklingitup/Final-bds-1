@@ -99,12 +99,20 @@ func main() {
 	// Create handler
 	handler := observability.NewHandler(svc, log)
 
-	// Create token verifier
+	// Create token verifier for user auth
 	verifier := observability.NewTokenVerifier(cfg.Auth)
+
+	// Create cluster validator for agent auth
+	clusterValidator := observability.NewClusterValidator(db, log)
 
 	// Register routes
 	routeRegistrar := func(app *fiber.App) {
-		observability.RegisterRoutes(app, handler, observability.RequireAuth(verifier))
+		observability.RegisterRoutes(
+			app,
+			handler,
+			observability.RequireAuth(verifier),
+			observability.AgentAuthMiddleware(clusterValidator),
+		)
 	}
 
 	if err := httpserver.Run(cfg, routeRegistrar); err != nil {

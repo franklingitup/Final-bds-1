@@ -17,6 +17,8 @@ type DesiredDeployment struct {
 	ApplicationID   string `json:"applicationId"`
 	ApplicationName string `json:"applicationName"`
 	ApplicationSlug string `json:"applicationSlug"`
+	ProjectID       string `json:"projectId"`
+	ProjectSlug     string `json:"projectSlug"`
 	Namespace       string `json:"namespace,omitempty"`
 	Image           string `json:"image"`
 	Revision        int    `json:"revision"`
@@ -273,7 +275,7 @@ func (c *Client) ReportDeploymentStatusWithCreds(ctx context.Context, creds Agen
 // This method is kept for backward compatibility.
 func (c *Client) ReportDeploymentStatus(ctx context.Context, orgID, deploymentID, releaseID, accessToken string, req DeploymentStatusRequest) error {
 	creds := AgentCredentials{
-		ClusterID: orgID,     // Legacy: use orgID as clusterID
+		ClusterID: orgID,       // Legacy: use orgID as clusterID
 		AgentID:   accessToken, // Legacy: use access token as agent ID
 	}
 	return c.ReportDeploymentStatusWithCreds(ctx, creds, deploymentID, releaseID, req)

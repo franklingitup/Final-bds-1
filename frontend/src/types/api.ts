@@ -25,6 +25,8 @@ export interface User {
   email: string;
   name: string;
   avatarUrl?: string;
+  emailVerified?: boolean;
+  mfaEnabled?: boolean;
   createdAt: string;
 }
 
@@ -37,6 +39,7 @@ export interface AuthTokens {
 export interface LoginRequest {
   email: string;
   password: string;
+  mfaCode?: string;
 }
 
 export interface SignupRequest {
@@ -61,7 +64,7 @@ export interface OrganizationMember {
   userId: string;
   organizationId: string;
   role: "owner" | "admin" | "member" | "viewer";
-  user: User;
+  user?: User;
   createdAt: string;
 }
 
@@ -150,7 +153,10 @@ export interface CreateClusterRequest {
 
 export interface RegistrationToken {
   id: string;
+  clusterId: string;
   token: string;
+  manifestUrl: string;
+  installCommand: string;
   status: "active" | "used" | "expired" | "revoked";
   expiresAt: string;
   createdAt: string;
@@ -224,6 +230,8 @@ export interface Deployment {
   organizationId: string;
   applicationId: string;
   clusterId: string;
+  /** Null/absent for legacy unbound deployments (pre-Environments feature). */
+  environmentId?: string;
   image: string;
   replicas: number;
   cpuRequest?: string;
@@ -279,6 +287,58 @@ export interface Release {
 
 export interface RollbackRequest {
   targetRevision?: number;
+}
+
+// Environment types (Environments feature — Phase 1 backend, Phase 2 frontend)
+export interface Environment {
+  id: string;
+  organizationId: string;
+  applicationId: string;
+  name: string;
+  namespace: string;
+  clusterId: string;
+  orderIndex: number;
+  createdAt: string;
+}
+
+export interface CreateEnvironmentRequest {
+  name: string;
+  namespace: string;
+  clusterId: string;
+  orderIndex?: number;
+}
+
+export interface UpdateEnvironmentRequest {
+  name?: string;
+  namespace?: string;
+  orderIndex?: number;
+}
+
+// Promotion types
+export interface PromotionRequest {
+  id: string;
+  organizationId: string;
+  applicationId: string;
+  releaseId: string;
+  fromEnvironmentId: string;
+  toEnvironmentId: string;
+  requestedBy: string;
+  status: "pending" | "applied" | "rejected";
+  approvedBy?: string;
+  approvedAt?: string;
+  appliedAt?: string;
+  rejectionReason?: string;
+  createdAt: string;
+}
+
+export interface RequestPromotionRequest {
+  releaseId: string;
+  fromEnvironmentId: string;
+  toEnvironmentId: string;
+}
+
+export interface RejectPromotionRequest {
+  reason?: string;
 }
 
 // Audit types

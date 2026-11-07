@@ -17,6 +17,20 @@ namespace: platform-agent
 # Namespaces the agent is allowed to manage (workload namespaces).
 managedNamespacePrefix: "proj-"
 
+# Metrics collection (ships pod resource metrics to control plane).
+# Requires metrics-server installed in the cluster; gracefully skips if absent.
+metricsCollector:
+  enabled: true
+  interval: "60s"
+
+# Log shipping (tails pod logs and ships to control plane).
+logShipper:
+  enabled: true
+  batchInterval: "5s"
+  # Max pods to actively tail logs from at once. Prevents resource exhaustion.
+  # When exceeded, newest pods are prioritized; a warning is logged.
+  maxTailedPods: 50
+
 resources:
   requests:
     cpu: 100m

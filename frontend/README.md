@@ -29,7 +29,7 @@ npm install
 cp .env.example .env.local
 
 # Update the API URL in .env.local
-# NEXT_PUBLIC_API_URL=http://localhost:8080
+# NEXT_PUBLIC_API_BASE_URL=http://localhost:8080
 ```
 
 ### Development
@@ -195,7 +195,7 @@ shadcn/ui components are used for:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `NEXT_PUBLIC_API_URL` | Backend API URL | `http://localhost:8080` |
+| `NEXT_PUBLIC_API_BASE_URL` | Backend API URL | `http://localhost:8080` |
 | `NEXT_PUBLIC_APP_URL` | Frontend URL | `http://localhost:3000` |
 
 ## Scripts

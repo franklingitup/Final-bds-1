@@ -79,7 +79,11 @@ export function useDeleteCluster(orgId: string) {
 
 export function useGenerateRegistrationToken(orgId: string, clusterId: string) {
   return useMutation({
-    mutationFn: (params?: { expiresIn?: string }) =>
+    mutationFn: (params?: {
+      expiresIn?: string;
+      controlPlaneEndpoint?: string;
+      force?: boolean;
+    }) =>
       clustersApi.generateToken(orgId, clusterId, params),
     onError: (error) => {
       toast({

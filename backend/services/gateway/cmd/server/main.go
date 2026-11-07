@@ -15,8 +15,8 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/bdsplatform/platform/backend/libs/config"
-	libmw "github.com/bdsplatform/platform/backend/libs/middleware"
 	"github.com/bdsplatform/platform/backend/libs/logger"
+	libmw "github.com/bdsplatform/platform/backend/libs/middleware"
 	"github.com/bdsplatform/platform/backend/libs/ratelimit"
 	"github.com/bdsplatform/platform/backend/libs/security"
 	"github.com/bdsplatform/platform/backend/libs/telemetry"
@@ -30,6 +30,10 @@ func main() {
 	cfg := config.MustLoad("gateway")
 	gwCfg := gwconfig.Load()
 	log := logger.New(cfg)
+	if redisRequired(cfg) && cfg.Redis.URL == "" {
+		log.Error("REDIS_URL is required outside local development")
+		os.Exit(1)
+	}
 
 	// Initialize telemetry.
 	ctx := context.Background()
@@ -164,6 +168,10 @@ func main() {
 	}
 
 	log.Info("gateway stopped")
+}
+
+func redisRequired(cfg config.Config) bool {
+	return cfg.Environment == config.EnvProduction || cfg.Environment == config.EnvStaging
 }
 
 func registerOps(app *fiber.App, serviceName string, r *router.Router) {

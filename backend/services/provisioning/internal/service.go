@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/bdsplatform/platform/backend/libs/authz"
@@ -24,7 +25,46 @@ type Deps struct {
 	OrgMembers      authz.OrgMemberStore
 	Tenant          TenantRunner
 	Encryptor       CredentialEncryptor
+	ClusterClient   ClusterCreator // For creating clusters via internal API
 	Logger          *slog.Logger
+}
+
+// ClusterCreator creates clusters via internal API.
+// Matches internalapi.ClusterClient's interface.
+type ClusterCreator interface {
+	CreateClusterWithToken(ctx context.Context, orgID string, req ClusterCreateRequest) (*ClusterCreateResponse, error)
+	GetCluster(ctx context.Context, orgID, clusterID string) (*ClusterStatus, error)
+}
+
+// ClusterCreateRequest mirrors internalapi.CreateClusterRequest.
+type ClusterCreateRequest struct {
+	Name          string            `json:"name"`
+	Slug          string            `json:"slug"`
+	Description   string            `json:"description,omitempty"`
+	CloudProvider string            `json:"cloudProvider,omitempty"`
+	Region        string            `json:"region,omitempty"`
+	Labels        map[string]string `json:"labels,omitempty"`
+	CreatedBy     string            `json:"createdBy"`
+}
+
+// ClusterCreateResponse mirrors internalapi.CreateClusterResponse.
+type ClusterCreateResponse struct {
+	ID                string `json:"id"`
+	Name              string `json:"name"`
+	Slug              string `json:"slug"`
+	Status            string `json:"status"`
+	RegistrationToken string `json:"registrationToken"`
+	ManifestURL       string `json:"manifestUrl"`
+	InstallCommand    string `json:"installCommand"`
+	ExpiresAt         string `json:"expiresAt"`
+}
+
+// ClusterStatus is the cluster lifecycle state used to synchronize sessions.
+type ClusterStatus struct {
+	ID                string `json:"id"`
+	Status            string `json:"status"`
+	AgentID           string `json:"agentId,omitempty"`
+	KubernetesVersion string `json:"kubernetesVersion,omitempty"`
 }
 
 // CredentialEncryptor encrypts/decrypts credentials.
@@ -47,8 +87,8 @@ type Service struct {
 	authSvc         *authz.AuthorizationService
 	encryptor       CredentialEncryptor
 	tfGenerator     *TerraformGenerator
-	bootstrapGen    *BootstrapGenerator
 	providers       *ProviderRegistry
+	clusterClient   ClusterCreator
 	log             *slog.Logger
 }
 
@@ -71,8 +111,8 @@ func NewService(d Deps) *Service {
 		authSvc:         authz.NewAuthorizationService(d.Tenant, d.OrgMembers, nil),
 		encryptor:       d.Encryptor,
 		tfGenerator:     NewTerraformGenerator(),
-		bootstrapGen:    NewBootstrapGenerator("", ""),
 		providers:       NewProviderRegistry(),
+		clusterClient:   d.ClusterClient,
 		log:             d.Logger,
 	}
 }
@@ -250,6 +290,9 @@ func (s *Service) CreateProvisioningRequest(ctx context.Context, orgID, userID s
 	if req.Region == "" {
 		return nil, apperrors.Validation("region is required")
 	}
+	if req.CredentialID == nil || strings.TrimSpace(*req.CredentialID) == "" {
+		return nil, apperrors.Validation("credentialId is required")
+	}
 
 	// Set defaults
 	if req.K8sVersion == "" {
@@ -269,6 +312,10 @@ func (s *Service) CreateProvisioningRequest(ctx context.Context, orgID, userID s
 	}
 
 	nodePoolsJSON, _ := json.Marshal(req.NodePools)
+	configJSON, _ := json.Marshal(ProvisioningConfig{
+		Networking: req.Networking,
+		Addons:     req.Addons,
+	})
 
 	provReq := &ProvisioningRequest{
 		OrgID:        orgID,
@@ -277,6 +324,7 @@ func (s *Service) CreateProvisioningRequest(ctx context.Context, orgID, userID s
 		Region:       req.Region,
 		CredentialID: req.CredentialID,
 		TemplateID:   req.TemplateID,
+		Config:       configJSON,
 		K8sVersion:   req.K8sVersion,
 		NodePools:    nodePoolsJSON,
 		Status:       RequestPending,
@@ -368,30 +416,93 @@ func (s *Service) GenerateTerraform(ctx context.Context, orgID, userID, requestI
 
 	// Generate Terraform outside transaction
 	var nodePools []NodePool
-	_ = json.Unmarshal(req.NodePools, &nodePools)
+	if err := json.Unmarshal(req.NodePools, &nodePools); err != nil {
+		return nil, apperrors.Internal("invalid persisted node pool configuration")
+	}
+	var persistedConfig ProvisioningConfig
+	if err := json.Unmarshal(req.Config, &persistedConfig); err != nil {
+		return nil, apperrors.Internal("invalid persisted provisioning configuration")
+	}
+	if req.CredentialID == nil || *req.CredentialID == "" {
+		return nil, apperrors.Validation("provisioning request has no cloud credential")
+	}
+	if s.encryptor == nil {
+		return nil, apperrors.Internal("credential encryption is not configured")
+	}
+
+	// Resolve and validate the selected credential before rendering Terraform.
+	var credential *CloudCredential
+	err = s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
+		var err error
+		credential, err = s.credentials.GetByID(ctx, *req.CredentialID)
+		return err
+	})
+	if err != nil {
+		return nil, apperrors.Validation("selected cloud credential was not found")
+	}
+	if credential.Provider != req.Provider {
+		return nil, apperrors.Validation("selected cloud credential does not match provisioning provider")
+	}
+	credentialJSON, err := s.encryptor.Decrypt(credential.Credentials)
+	if err != nil {
+		return nil, apperrors.Internal("failed to decrypt selected cloud credential")
+	}
+	provider, err := s.providers.Get(req.Provider)
+	if err != nil {
+		return nil, apperrors.Validation(err.Error())
+	}
+	if err := provider.ValidateCredentials(ctx, credentialJSON); err != nil {
+		return nil, apperrors.Validation("selected cloud credential is invalid: " + err.Error())
+	}
 
 	tfCfg := TerraformConfig{
 		ClusterName: req.Name,
 		Region:      req.Region,
 		K8sVersion:  req.K8sVersion,
 		NodePools:   nodePools,
+		Networking:  persistedConfig.Networking,
+		Addons:      persistedConfig.Addons,
 	}
 
 	// Set provider-specific config
+	networking := persistedConfig.Networking
+	if networking == nil {
+		networking = &NetworkingConfig{
+			VPCCidr:        "10.0.0.0/16",
+			PodCidr:        "10.244.0.0/16",
+			ServiceCidr:    "10.96.0.0/12",
+			NATGateway:     true,
+			PrivateCluster: false,
+		}
+	}
 	switch req.Provider {
 	case ProviderAWS:
 		tfCfg.AWS = &AWSConfig{
-			VPCCidr:          "10.0.0.0/16",
-			EnableNATGateway: true,
+			VPCCidr:          defaultString(networking.VPCCidr, "10.0.0.0/16"),
+			ServiceCidr:      defaultString(networking.ServiceCidr, "10.96.0.0/12"),
+			EnableNATGateway: networking.NATGateway,
+			PrivateCluster:   networking.PrivateCluster,
 		}
 	case ProviderAzure:
 		tfCfg.Azure = &AzureConfig{
-			ResourceGroup: req.Name + "-rg",
-			VNetCidr:      "10.0.0.0/16",
-			DNSPrefix:     req.Name,
+			ResourceGroup:  req.Name + "-rg",
+			VNetCidr:       defaultString(networking.VPCCidr, "10.0.0.0/16"),
+			PodCidr:        defaultString(networking.PodCidr, "10.244.0.0/16"),
+			ServiceCidr:    defaultString(networking.ServiceCidr, "10.96.0.0/12"),
+			DNSPrefix:      req.Name,
+			PrivateCluster: networking.PrivateCluster,
 		}
 	case ProviderGCP:
+		var gcpCreds GCPCredentials
+		if err := json.Unmarshal(credentialJSON, &gcpCreds); err != nil {
+			return nil, apperrors.Validation("invalid GCP credential payload")
+		}
 		tfCfg.GCP = &GCPConfig{
+			ProjectID:      gcpCreds.ProjectID,
+			SubnetCidr:     defaultString(networking.VPCCidr, "10.0.0.0/20"),
+			PodCidr:        defaultString(networking.PodCidr, "10.1.0.0/16"),
+			ServiceCidr:    defaultString(networking.ServiceCidr, "10.2.0.0/20"),
+			PrivateCluster: networking.PrivateCluster,
 			MasterIPv4CIDR: "172.16.0.0/28",
 		}
 	}
@@ -438,40 +549,84 @@ func (s *Service) GenerateTerraform(ctx context.Context, orgID, userID, requestI
 }
 
 // StartProvisioning starts the provisioning process.
+// It first creates a cluster record + registration token via the cluster service,
+// then creates the install session for Terraform provisioning.
 func (s *Service) StartProvisioning(ctx context.Context, orgID, userID, requestID string) (*InstallSession, error) {
 	if _, err := s.authSvc.AuthorizeOrgMember(ctx, orgID, userID, authz.ActionManageOrg); err != nil {
 		return nil, err
 	}
 
+	// Verify cluster client is configured
+	if s.clusterClient == nil {
+		return nil, apperrors.Internal("cluster service client not configured")
+	}
+
 	var req *ProvisioningRequest
 	var session *InstallSession
 
+	// First, get the provisioning request and validate it
 	err := s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
 		var err error
 		req, err = s.requests.GetByID(ctx, requestID)
-		if err != nil {
-			return err
-		}
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	if req.Status != RequestReady {
+		return nil, apperrors.Validation("request must be in 'ready' status to start provisioning")
+	}
 
-		if req.Status != RequestReady {
-			return apperrors.Validation("request must be in 'ready' status to start provisioning")
+	// Create slug from name (lowercase, replace spaces with hyphens)
+	slug := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(req.Name), " ", "-"))
+	// Remove any non-alphanumeric characters except hyphens
+	slug = strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			return r
 		}
+		return -1
+	}, slug)
+	// Ensure slug is valid (2-64 chars, starts/ends with alphanumeric)
+	if len(slug) < 2 {
+		slug = "cluster-" + requestID[:8]
+	}
+	if len(slug) > 64 {
+		slug = slug[:64]
+	}
 
-		// Generate bootstrap token
-		token, tokenHash, err := GenerateBootstrapToken()
-		if err != nil {
-			return err
-		}
+	// Step 1: Create cluster + registration token via cluster service (BEFORE any Terraform work).
+	// This validates name/slug availability early, before any cloud costs are incurred.
+	clusterReq := ClusterCreateRequest{
+		Name:          req.Name,
+		Slug:          slug,
+		Description:   fmt.Sprintf("Provisioned via Terraform (request: %s)", requestID),
+		CloudProvider: req.Provider,
+		Region:        req.Region,
+		CreatedBy:     userID,
+	}
 
-		// Generate session token
+	clusterResp, err := s.clusterClient.CreateClusterWithToken(ctx, orgID, clusterReq)
+	if err != nil {
+		// If cluster creation fails (e.g., slug already taken), fail immediately
+		// before any expensive Terraform work begins
+		s.log.ErrorContext(ctx, "failed to create cluster via cluster service",
+			"error", err,
+			"request_id", requestID,
+			"cluster_name", req.Name,
+		)
+		return nil, apperrors.Wrap(err, apperrors.CodeInternal, "failed to create cluster record")
+	}
+
+	s.log.InfoContext(ctx, "created cluster via cluster service",
+		"cluster_id", clusterResp.ID,
+		"cluster_name", clusterResp.Name,
+		"manifest_url", clusterResp.ManifestURL,
+	)
+
+	// Step 2: Create install session with the real registration token
+	err = s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
+		// Generate session token for CLI/script authentication
 		sessionToken, _, err := GenerateBootstrapToken()
-		if err != nil {
-			return err
-		}
-
-		// Generate bootstrap command
-		expiresAt := time.Now().Add(24 * time.Hour)
-		bootstrapCmd, err := s.bootstrapGen.GenerateCommand(req.Name, token, expiresAt)
 		if err != nil {
 			return err
 		}
@@ -479,8 +634,9 @@ func (s *Service) StartProvisioning(ctx context.Context, orgID, userID, requestI
 		// Create steps JSON
 		stepsJSON, _ := json.Marshal(DefaultInstallSteps)
 
-		// Create install session
+		// Create install session with the REAL registration token from cluster service
 		now := time.Now()
+		expiresAt := time.Now().Add(24 * time.Hour)
 		session = &InstallSession{
 			OrgID:            orgID,
 			RequestID:        requestID,
@@ -490,28 +646,13 @@ func (s *Service) StartProvisioning(ctx context.Context, orgID, userID, requestI
 			CompletedSteps:   0,
 			Steps:            stepsJSON,
 			Status:           SessionActive,
-			BootstrapToken:   &token,
-			BootstrapCommand: &bootstrapCmd.Command,
+			BootstrapToken:   &clusterResp.RegistrationToken, // Real cluster service token
+			BootstrapCommand: &clusterResp.InstallCommand,    // Real kubectl apply command
 			ExpiresAt:        expiresAt,
 			StartedAt:        &now,
 		}
 
 		if err := s.sessions.Create(ctx, session); err != nil {
-			return err
-		}
-
-		// Create bootstrap token record
-		bootstrapToken := &BootstrapToken{
-			OrgID:     orgID,
-			RequestID: &requestID,
-			SessionID: &session.ID,
-			TokenHash: tokenHash,
-			MaxUses:   1,
-			Status:    TokenActive,
-			ExpiresAt: expiresAt,
-		}
-
-		if err := s.bootstrapTokens.Create(ctx, bootstrapToken); err != nil {
 			return err
 		}
 
@@ -529,9 +670,10 @@ func (s *Service) StartProvisioning(ctx context.Context, orgID, userID, requestI
 			}
 		}
 
-		// Update request status
+		// Update request status and link to cluster
 		req.Status = RequestProvisioning
 		req.StartedAt = &now
+		req.ClusterID = &clusterResp.ID
 		if err := s.requests.Update(ctx, req); err != nil {
 			return err
 		}
@@ -543,7 +685,7 @@ func (s *Service) StartProvisioning(ctx context.Context, orgID, userID, requestI
 			SessionID: &session.ID,
 			EventType: "provisioning.started",
 			Severity:  SeverityInfo,
-			Message:   fmt.Sprintf("Provisioning started for cluster '%s'", req.Name),
+			Message:   fmt.Sprintf("Provisioning started for cluster '%s' (cluster_id: %s)", req.Name, clusterResp.ID),
 			ActorType: strPtr(ActorUser),
 			ActorID:   &userID,
 		})
@@ -573,8 +715,32 @@ func (s *Service) GetInstallSession(ctx context.Context, orgID, userID, sessionI
 		steps, err = s.steps.ListBySession(ctx, sessionID)
 		return err
 	})
+	if err == nil {
+		s.syncAgentConnection(ctx, session)
+	}
 
 	return session, steps, err
+}
+
+// ValidateSessionForInstall checks if a session exists and is valid for install script serving.
+// Returns the session if valid, or an error if not found/expired.
+// This is used by the public /install/:sessionId endpoint.
+func (s *Service) ValidateSessionForInstall(ctx context.Context, sessionID string) (*InstallSession, error) {
+	session, err := s.sessions.GetByID(ctx, sessionID)
+	if err != nil {
+		return nil, apperrors.NotFound("session not found")
+	}
+	if time.Now().After(session.ExpiresAt) {
+		// Return 410 Gone for expired sessions
+		return nil, apperrors.NewWithStatus("SESSION_EXPIRED", 410, "session has expired")
+	}
+	if session.Status == SessionCompleted {
+		return nil, apperrors.Validation("session is already completed")
+	}
+	if session.Status == SessionCancelled {
+		return nil, apperrors.Validation("session has been cancelled")
+	}
+	return session, nil
 }
 
 // GetSessionBundle returns the generated installer inputs using the opaque
@@ -600,6 +766,7 @@ func (s *Service) GetSessionBundle(ctx context.Context, sessionToken string) (*S
 	if req.TerraformConfig == nil || len(req.TerraformVars) == 0 {
 		return nil, apperrors.Validation("terraform configuration is not ready")
 	}
+	s.syncAgentConnection(ctx, session)
 
 	var steps []StepInfo
 	if err := json.Unmarshal(session.Steps, &steps); err != nil {
@@ -609,6 +776,10 @@ func (s *Service) GetSessionBundle(ctx context.Context, sessionToken string) (*S
 	if session.BootstrapToken != nil {
 		bootstrapToken = *session.BootstrapToken
 	}
+	credentialEnv, err := s.sessionCredentialEnvironment(ctx, session.OrgID, req)
+	if err != nil {
+		return nil, err
+	}
 
 	return &SessionBundle{
 		SessionID:       session.ID,
@@ -616,6 +787,7 @@ func (s *Service) GetSessionBundle(ctx context.Context, sessionToken string) (*S
 		Provider:        req.Provider,
 		TerraformConfig: *req.TerraformConfig,
 		TerraformVars:   append(json.RawMessage(nil), req.TerraformVars...),
+		CredentialEnv:   credentialEnv,
 		SessionToken:    session.SessionToken,
 		BootstrapToken:  bootstrapToken,
 		Steps:           steps,
@@ -624,6 +796,105 @@ func (s *Service) GetSessionBundle(ctx context.Context, sessionToken string) (*S
 		AgentVersion:    session.AgentVersion,
 		ExpiresAt:       session.ExpiresAt.Format(time.RFC3339),
 	}, nil
+}
+
+func (s *Service) sessionCredentialEnvironment(ctx context.Context, orgID string, req *ProvisioningRequest) (map[string]string, error) {
+	if req == nil || req.CredentialID == nil || *req.CredentialID == "" {
+		return nil, nil
+	}
+	if s.encryptor == nil {
+		return nil, apperrors.Internal("credential encryption is not configured")
+	}
+
+	var credential *CloudCredential
+	err := s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
+		var err error
+		credential, err = s.credentials.GetByID(ctx, *req.CredentialID)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	plaintext, err := s.encryptor.Decrypt(credential.Credentials)
+	if err != nil {
+		return nil, apperrors.Internal("failed to decrypt selected cloud credential")
+	}
+
+	env := make(map[string]string)
+	switch req.Provider {
+	case ProviderAWS:
+		var creds AWSCredentials
+		if err := json.Unmarshal(plaintext, &creds); err != nil {
+			return nil, apperrors.Internal("invalid stored AWS credential")
+		}
+		env["AWS_ACCESS_KEY_ID"] = creds.AccessKeyID
+		env["AWS_SECRET_ACCESS_KEY"] = creds.SecretAccessKey
+		if creds.SessionToken != "" {
+			env["AWS_SESSION_TOKEN"] = creds.SessionToken
+		}
+	case ProviderAzure:
+		var creds AzureCredentials
+		if err := json.Unmarshal(plaintext, &creds); err != nil {
+			return nil, apperrors.Internal("invalid stored Azure credential")
+		}
+		env["ARM_SUBSCRIPTION_ID"] = creds.SubscriptionID
+		env["ARM_TENANT_ID"] = creds.TenantID
+		env["ARM_CLIENT_ID"] = creds.ClientID
+		env["ARM_CLIENT_SECRET"] = creds.ClientSecret
+	case ProviderGCP:
+		var creds GCPCredentials
+		if err := json.Unmarshal(plaintext, &creds); err != nil {
+			return nil, apperrors.Internal("invalid stored GCP credential")
+		}
+		env["GOOGLE_PROJECT"] = creds.ProjectID
+		env["GOOGLE_CREDENTIALS"] = creds.ServiceAccountJSON
+	}
+	return env, nil
+}
+
+// syncAgentConnection mirrors the real cluster service registration state into
+// the install session. The installer polls GetSessionBundle, so this replaces
+// the removed provisioning-specific ReportAgentConnection callback.
+func (s *Service) syncAgentConnection(ctx context.Context, session *InstallSession) {
+	if session == nil || session.AgentConnected || s.clusterClient == nil {
+		return
+	}
+
+	var req *ProvisioningRequest
+	if err := s.tenant.WithTenant(ctx, session.OrgID, func(ctx context.Context) error {
+		var err error
+		req, err = s.requests.GetByID(ctx, session.RequestID)
+		return err
+	}); err != nil || req == nil || req.ClusterID == nil || *req.ClusterID == "" {
+		return
+	}
+
+	cluster, err := s.clusterClient.GetCluster(ctx, session.OrgID, *req.ClusterID)
+	if err != nil {
+		s.log.WarnContext(ctx, "failed to synchronize agent registration",
+			"cluster_id", *req.ClusterID,
+			"session_id", session.ID,
+			"error", err)
+		return
+	}
+	if cluster.Status != "connected" {
+		return
+	}
+
+	now := time.Now()
+	session.AgentConnected = true
+	session.AgentConnectedAt = &now
+	if cluster.KubernetesVersion != "" {
+		session.AgentVersion = &cluster.KubernetesVersion
+	}
+	if err := s.tenant.WithTenant(ctx, session.OrgID, func(ctx context.Context) error {
+		return s.sessions.Update(ctx, session)
+	}); err != nil {
+		s.log.WarnContext(ctx, "failed to persist synchronized agent registration",
+			"cluster_id", *req.ClusterID,
+			"session_id", session.ID,
+			"error", err)
+	}
 }
 
 // UpdateStep updates a step in an install session.
@@ -712,79 +983,9 @@ func (s *Service) UpdateStep(ctx context.Context, sessionToken string, stepNumbe
 	return step, err
 }
 
-// ReportAgentConnection reports agent connection from bootstrap.
-func (s *Service) ReportAgentConnection(ctx context.Context, bootstrapToken string, req ReportAgentRequest, ip string) error {
-	hash := HashToken(bootstrapToken)
-
-	var token *BootstrapToken
-
-	// Find token (no tenant context needed for bootstrap)
-	token, err := s.bootstrapTokens.GetByHash(ctx, hash)
-	if err != nil {
-		return apperrors.Unauthorized("invalid or expired bootstrap token")
-	}
-
-	return s.tenant.WithTenant(ctx, token.OrgID, func(ctx context.Context) error {
-		// Use the token
-		if err := s.bootstrapTokens.Use(ctx, hash, ip, nil); err != nil {
-			return err
-		}
-
-		// Update session
-		if token.SessionID != nil {
-			session, err := s.sessions.GetByID(ctx, *token.SessionID)
-			if err == nil {
-				now := time.Now()
-				session.AgentConnected = true
-				session.AgentConnectedAt = &now
-				session.AgentVersion = &req.Version
-				_ = s.sessions.Update(ctx, session)
-			}
-		}
-
-		// Log event
-		return s.events.Create(ctx, &ProvisioningEvent{
-			OrgID:     token.OrgID,
-			RequestID: token.RequestID,
-			SessionID: token.SessionID,
-			EventType: "provisioning.agent.connected",
-			Severity:  SeverityInfo,
-			Message:   fmt.Sprintf("Platform agent connected (version: %s)", req.Version),
-			Details:   marshalJSON(map[string]string{"version": req.Version, "ip": ip}),
-			ActorType: strPtr(ActorAgent),
-		})
-	})
-}
-
-// GetBootstrapManifest returns the bootstrap manifest for a token.
-func (s *Service) GetBootstrapManifest(ctx context.Context, bootstrapToken string) (string, error) {
-	hash := HashToken(bootstrapToken)
-
-	token, err := s.bootstrapTokens.GetByHash(ctx, hash)
-	if err != nil {
-		return "", apperrors.NotFound("invalid or expired bootstrap token")
-	}
-
-	var req *ProvisioningRequest
-	err = s.tenant.WithTenant(ctx, token.OrgID, func(ctx context.Context) error {
-		var err error
-		if token.RequestID != nil {
-			req, err = s.requests.GetByID(ctx, *token.RequestID)
-		}
-		return err
-	})
-	if err != nil || req == nil {
-		return "", apperrors.NotFound("provisioning request not found")
-	}
-
-	// Generate manifest
-	cmd, err := s.bootstrapGen.GenerateCommand(req.Name, bootstrapToken, token.ExpiresAt)
-	if err != nil {
-		return "", err
-	}
-
-	return cmd.Manifest, nil
-}
+// NOTE: ReportAgentConnection and GetBootstrapManifest methods removed.
+// Agents now use the cluster service's /v1/agent/register endpoint directly,
+// and the install script fetches manifests from /v1/agent-install/:token/manifest.yaml.
 
 // ListEvents returns events for a request or session.
 func (s *Service) ListEvents(ctx context.Context, orgID, userID string, requestID, sessionID *string, page database.PageRequest) (database.Page[ProvisioningEvent], error) {
@@ -851,7 +1052,7 @@ func (s *Service) ListMachineTypes(ctx context.Context, orgID, userID, provider,
 }
 
 // ListKubernetesVersions returns K8s versions for a provider.
-func (s *Service) ListKubernetesVersions(ctx context.Context, orgID, userID, provider string) ([]string, error) {
+func (s *Service) ListKubernetesVersions(ctx context.Context, orgID, userID, provider string) ([]K8sVersion, error) {
 	if _, err := s.authSvc.AuthorizeOrgRead(ctx, orgID, userID); err != nil {
 		return nil, err
 	}
@@ -866,6 +1067,13 @@ func (s *Service) ListKubernetesVersions(ctx context.Context, orgID, userID, pro
 
 // Helper functions
 func strPtr(s string) *string { return &s }
+
+func defaultString(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
+}
 
 func getDefaultMachineType(provider string) string {
 	switch provider {

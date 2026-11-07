@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +17,22 @@ import (
 	"github.com/bdsplatform/platform/backend/libs/events"
 	build "github.com/bdsplatform/platform/backend/services/build/internal"
 )
+
+// TestMain stubs the DNS resolver used by build.ValidateGitURL for the entire
+// builder test suite. Without this stub every call to buildKanikoJobSpec (which
+// now includes a second-layer SSRF check) would hit real DNS, making the tests
+// fragile in offline / sandboxed CI environments.
+//
+// The stub always returns a single public IP (a real GitHub address) so the
+// SSRF check passes. Tests that need to exercise the rejection path should
+// replace build.LookupHostFunc locally within their own t.Cleanup block.
+func TestMain(m *testing.M) {
+	// Stub DNS: every host resolves to a real public IP.
+	build.LookupHostFunc = func(_ context.Context, _ string) ([]string, error) {
+		return []string{"140.82.121.4"}, nil // github.com — publicly routable
+	}
+	os.Exit(m.Run())
+}
 
 // ----------------------------------------------------------------------------
 // Pure helper tests

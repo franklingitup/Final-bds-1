@@ -8,10 +8,11 @@ import "github.com/gofiber/fiber/v2"
 // routes require authentication; per-operation authorization is enforced in the
 // service layer via libs/authz against the caller's project membership role.
 func RegisterRoutes(app *fiber.App, h *Handler) {
-	v1 := app.Group("/v1", h.RequireAuth())
+	v1 := app.Group("/v1")
 
-	// Projects scoped under organizations.
-	projects := v1.Group("/organizations/:orgId/projects")
+	// Projects scoped under organizations. Auth is scoped to this path,
+	// not the entire /v1 prefix, to avoid intercepting any future public routes.
+	projects := v1.Group("/organizations/:orgId/projects", h.RequireAuth())
 	projects.Post("", h.CreateProject)
 	projects.Get("", h.ListProjects)
 	// Lookup by slug must be registered before the :projectId param route so

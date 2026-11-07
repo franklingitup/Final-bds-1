@@ -5,9 +5,12 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/bdsplatform/platform/backend/libs/authz"
 	"github.com/bdsplatform/platform/backend/libs/database"
 	"github.com/bdsplatform/platform/backend/libs/events"
+	"github.com/bdsplatform/platform/backend/libs/internalapi"
 )
 
 // Deps are the audit service dependencies. The store is an interface so the
@@ -16,6 +19,7 @@ type Deps struct {
 	Store      AuditLogStore
 	OrgMembers authz.OrgMemberStore // For org membership authorization
 	Tenant     TenantRunner
+	Users      internalapi.UserLookup
 	Logger     *slog.Logger
 	Now        func() time.Time
 }
@@ -27,6 +31,7 @@ type Service struct {
 	orgMembers authz.OrgMemberStore
 	tenant     TenantRunner
 	authSvc    *authz.AuthorizationService
+	users      internalapi.UserLookup
 	log        *slog.Logger
 	now        func() time.Time
 }
@@ -44,6 +49,7 @@ func NewService(d Deps) *Service {
 		orgMembers: d.OrgMembers,
 		tenant:     d.Tenant,
 		authSvc:    authz.NewAuthorizationService(d.Tenant, d.OrgMembers, nil),
+		users:      d.Users,
 		log:        d.Logger,
 		now:        d.Now,
 	}
@@ -92,6 +98,48 @@ func (s *Service) ListLogs(ctx context.Context, orgID, userID string, f AuditFil
 		return err
 	})
 	return out, err
+}
+
+func (s *Service) auditLogViews(ctx context.Context, logs []AuditLog) []AuditLogView {
+	views := make([]AuditLogView, 0, len(logs))
+	ids := make([]string, 0, len(logs))
+	seen := make(map[string]struct{})
+	for _, a := range logs {
+		v := toAuditLogView(a)
+		views = append(views, v)
+		id := v.ActorID
+		if id == "" {
+			continue
+		}
+		if _, err := uuid.Parse(id); err != nil {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if s.users == nil || len(ids) == 0 {
+		return views
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, internalapi.DefaultTimeout)
+	defer cancel()
+	resolved, err := s.users.GetUsers(lookupCtx, ids)
+	if err != nil {
+		s.log.Warn("auth user lookup failed; returning audit logs without actor names", "error", err)
+		return views
+	}
+	for i := range views {
+		if u, ok := resolved[views[i].ActorID]; ok {
+			if u.Name != "" {
+				views[i].ActorName = u.Name
+			} else {
+				views[i].ActorName = u.Email
+			}
+		}
+	}
+	return views
 }
 
 // GetLog returns a single audit record by source event id within an org.

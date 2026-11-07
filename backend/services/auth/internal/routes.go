@@ -43,4 +43,7 @@ func RegisterRoutes(app *fiber.App, h *Handler) {
 	orgs.Put("/sso/config", h.PutSSOConfig)
 	orgs.Get("/sso/config", h.GetSSOConfig)
 	orgs.Delete("/sso/config", h.DeleteSSOConfig)
+
+	internal := app.Group("/internal", h.requireInternalToken())
+	internal.Get("/users", h.ListInternalUsers)
 }

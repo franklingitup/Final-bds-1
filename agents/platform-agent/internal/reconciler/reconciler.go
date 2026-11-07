@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,8 +28,11 @@ type Config struct {
 	Interval time.Duration
 	// StateFile path for persisting applied revisions.
 	StateFile string
-	// Namespace to deploy workloads to.
+	// Namespace is the agent's own operational namespace and must never receive
+	// customer workloads.
 	Namespace string
+	// ManagedNamespacePrefix is prepended to the deployment project slug.
+	ManagedNamespacePrefix string
 	// AgentCredentials for authenticating with the Deployment Service.
 	AgentCredentials controlplane.AgentCredentials
 	// IsLeader gates reconciliation on leadership. When nil (the default, and
@@ -40,9 +45,10 @@ type Config struct {
 // DefaultConfig returns a default configuration.
 func DefaultConfig() Config {
 	return Config{
-		Interval:  30 * time.Second,
-		StateFile: "/var/lib/platform-agent/reconciler-state.json",
-		Namespace: "default",
+		Interval:               30 * time.Second,
+		StateFile:              "/var/lib/platform-agent/reconciler-state.json",
+		Namespace:              "default",
+		ManagedNamespacePrefix: "proj-",
 	}
 }
 
@@ -69,10 +75,12 @@ type DeploymentClient interface {
 
 // ResourceManager manages Kubernetes resources.
 type ResourceManager interface {
+	EnsureNamespace(ctx context.Context, namespace string) error
+	HasLegacyDeployment(ctx context.Context, name string) (bool, error)
 	ApplyDeployment(ctx context.Context, spec k8s.DeploymentSpec) (*k8s.ApplyResult, error)
 	ApplyService(ctx context.Context, spec k8s.DeploymentSpec) (*k8s.ApplyResult, error)
-	GetDeploymentStatus(ctx context.Context, name string) (*k8s.DeploymentStatus, error)
-	GetPodHealth(ctx context.Context, appSlug string) (*k8s.PodHealth, error)
+	GetDeploymentStatus(ctx context.Context, namespace, name string) (*k8s.DeploymentStatus, error)
+	GetPodHealth(ctx context.Context, namespace, appSlug string) (*k8s.PodHealth, error)
 	DeleteDeployment(ctx context.Context, name string) error
 	ListManagedDeployments(ctx context.Context) ([]string, error)
 
@@ -177,16 +185,55 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 			continue // Skip deleted deployments
 		}
 
+		namespace, err := r.targetNamespace(d)
+		if err != nil {
+			r.log.Error("invalid workload namespace",
+				"deployment_id", d.DeploymentID,
+				"project_id", d.ProjectID,
+				"project_slug", d.ProjectSlug,
+				"error", err)
+			continue
+		}
+		legacy, err := r.manager.HasLegacyDeployment(ctx, d.ApplicationSlug)
+		if err != nil {
+			r.log.Error("failed to check for legacy workload",
+				"deployment_id", d.DeploymentID,
+				"application", d.ApplicationSlug,
+				"error", err)
+			continue
+		}
+		if legacy {
+			r.log.Warn("legacy workload requires explicit namespace migration; leaving it untouched",
+				"deployment_id", d.DeploymentID,
+				"application", d.ApplicationSlug,
+				"legacy_namespace", r.cfg.Namespace,
+				"target_namespace", namespace)
+			continue
+		}
+		if err := r.manager.EnsureNamespace(ctx, namespace); err != nil {
+			r.log.Error("failed to ensure workload namespace",
+				"deployment_id", d.DeploymentID,
+				"namespace", namespace,
+				"error", err)
+			continue
+		}
+		d.Namespace = namespace
+		for i := range d.PersistentVolumeClaims {
+			d.PersistentVolumeClaims[i].Namespace = namespace
+		}
+		for i := range d.Ingresses {
+			d.Ingresses[i].Namespace = namespace
+		}
 		spec := k8s.FromDesiredDeployment(d)
-		desiredNames[spec.ResourceName()] = true
+		desiredNames[k8s.ResourceKey(namespace, spec.ResourceName())] = true
 		for _, cm := range d.ConfigMaps {
-			desiredConfigMaps[cm.Name] = true
+			desiredConfigMaps[k8s.ResourceKey(namespace, cm.Name)] = true
 		}
 		for _, pvc := range d.PersistentVolumeClaims {
-			desiredPVCs[pvc.Name] = true
+			desiredPVCs[k8s.ResourceKey(namespace, pvc.Name)] = true
 		}
 		for _, ing := range d.Ingresses {
-			desiredIngresses[ing.Name] = true
+			desiredIngresses[k8s.ResourceKey(namespace, ing.Name)] = true
 		}
 
 		if err := r.reconcileDeployment(ctx, d, spec); err != nil {
@@ -221,6 +268,28 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 	if err := r.saveState(); err != nil {
 		r.log.Warn("failed to save reconciler state", "error", err)
 	}
+}
+
+var invalidNamespaceCharacters = regexp.MustCompile(`[^a-z0-9-]+`)
+
+func (r *Reconciler) targetNamespace(d controlplane.DesiredDeployment) (string, error) {
+	project := d.ProjectSlug
+	if project == "" {
+		project = d.ProjectID
+	}
+	project = strings.Trim(invalidNamespaceCharacters.ReplaceAllString(strings.ToLower(project), "-"), "-")
+	if project == "" {
+		return "", fmt.Errorf("desired deployment has no usable project identity")
+	}
+	namespace := strings.Trim(strings.ToLower(r.cfg.ManagedNamespacePrefix)+project, "-")
+	namespace = invalidNamespaceCharacters.ReplaceAllString(namespace, "-")
+	if len(namespace) > 63 {
+		namespace = strings.TrimRight(namespace[:63], "-")
+	}
+	if namespace == "" || namespace == r.cfg.Namespace {
+		return "", fmt.Errorf("derived namespace %q conflicts with agent namespace", namespace)
+	}
+	return namespace, nil
 }
 
 // reconcileDeployment reconciles a single deployment.
@@ -274,7 +343,7 @@ func (r *Reconciler) reconcileDeployment(ctx context.Context, desired controlpla
 	}
 
 	// Check current status.
-	status, err := r.manager.GetDeploymentStatus(ctx, spec.ResourceName())
+	status, err := r.manager.GetDeploymentStatus(ctx, spec.Namespace, spec.ResourceName())
 	if err != nil {
 		log.Warn("failed to get deployment status", "error", err)
 		return nil
@@ -351,7 +420,7 @@ func (r *Reconciler) reportProgress(ctx context.Context, d controlplane.DesiredD
 	// CrashLoopBackOff, Unschedulable) rather than waiting for the deadline.
 	// Pod inspection is best-effort: an error leaves PodIssue empty.
 	var podIssue, podMessage string
-	if ph, err := r.manager.GetPodHealth(ctx, spec.ApplicationSlug); err != nil {
+	if ph, err := r.manager.GetPodHealth(ctx, spec.Namespace, spec.ApplicationSlug); err != nil {
 		r.log.Debug("pod health inspection failed", "application", d.ApplicationName, "error", err)
 	} else if ph != nil {
 		podIssue = ph.Issue

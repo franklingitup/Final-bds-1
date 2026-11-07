@@ -23,8 +23,11 @@ test: ## Run all tests
 	go test ./... -race
 
 .PHONY: lint
-lint: ## Run golangci-lint
+lint: ## Run golangci-lint and custom analyzers
 	golangci-lint run ./...
+	@echo "==> checking for blanket auth middleware patterns"
+	go install ./tools/noblanketscopeauth/cmd/noblanketscopeauth
+	go vet -vettool=$$(go env GOPATH)/bin/noblanketscopeauth ./...
 
 .PHONY: tidy
 tidy: ## Sync dependencies

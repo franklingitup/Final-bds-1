@@ -2,6 +2,7 @@ package tenant
 
 import (
 	"context"
+	stderrors "errors"
 	"testing"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/bdsplatform/platform/backend/libs/database"
 	"github.com/bdsplatform/platform/backend/libs/errors"
 	"github.com/bdsplatform/platform/backend/libs/events"
+	"github.com/bdsplatform/platform/backend/libs/internalapi"
 )
 
 // ----------------------------------------------------------------------------
@@ -567,5 +569,69 @@ func TestRemoveMember_Rules(t *testing.T) {
 	// The last owner cannot be removed.
 	if err := e.svc.RemoveMember(context.Background(), "owner-1", org.ID, "owner-1"); err != errLastOwner {
 		t.Errorf("expected errLastOwner, got %v", err)
+	}
+}
+
+type fakeUserLookup struct {
+	users map[string]internalapi.UserSummary
+	err   error
+	calls int
+}
+
+func (f *fakeUserLookup) GetUsers(_ context.Context, ids []string) (map[string]internalapi.UserSummary, error) {
+	f.calls++
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := make(map[string]internalapi.UserSummary)
+	for _, id := range ids {
+		if u, ok := f.users[id]; ok {
+			out[id] = u
+		}
+	}
+	return out, nil
+}
+
+func TestMemberViews_EnrichesInOneCall(t *testing.T) {
+	e := newTestEnv()
+	lookup := &fakeUserLookup{users: map[string]internalapi.UserSummary{
+		"owner-1": {ID: "owner-1", Name: "Ada", Email: "ada@example.com"},
+	}}
+	e.svc.users = lookup
+	org := mustCreateOrg(t, e, "owner-1")
+	page, err := e.svc.ListMembers(context.Background(), "owner-1", org.ID, database.PageRequest{})
+	if err != nil {
+		t.Fatalf("ListMembers: %v", err)
+	}
+	views := e.svc.memberViews(context.Background(), page.Items)
+	if lookup.calls != 1 {
+		t.Fatalf("GetUsers calls = %d, want 1", lookup.calls)
+	}
+	if len(views) != 1 || views[0].User == nil || views[0].User.Name != "Ada" {
+		t.Fatalf("views = %+v", views)
+	}
+}
+
+func TestMemberViews_DegradesWhenAuthFails(t *testing.T) {
+	e := newTestEnv()
+	lookup := &fakeUserLookup{err: stderrors.New("auth down")}
+	e.svc.users = lookup
+	org := mustCreateOrg(t, e, "owner-1")
+	page, err := e.svc.ListMembers(context.Background(), "owner-1", org.ID, database.PageRequest{})
+	if err != nil {
+		t.Fatalf("ListMembers should not fail when auth is down: %v", err)
+	}
+	views := e.svc.memberViews(context.Background(), page.Items)
+	if err != nil {
+		t.Fatal("enrichment must not surface lookup errors")
+	}
+	if len(views) != 1 {
+		t.Fatalf("len(views) = %d", len(views))
+	}
+	if views[0].User != nil {
+		t.Errorf("expected nil user on degradation, got %+v", views[0].User)
+	}
+	if views[0].UserID != "owner-1" {
+		t.Errorf("userId = %s", views[0].UserID)
 	}
 }

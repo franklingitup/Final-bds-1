@@ -9,8 +9,9 @@ import "github.com/gofiber/fiber/v2"
 // Bearer access token issued by the auth service; results are RLS-scoped to the
 // organization in the path.
 func RegisterRoutes(app *fiber.App, h *Handler) {
-	v1 := app.Group("/v1", h.RequireAuth())
-	logs := v1.Group("/organizations/:orgId/audit-logs")
+	v1 := app.Group("/v1")
+	// Scope auth to the actual protected path, not the entire /v1 prefix.
+	logs := v1.Group("/organizations/:orgId/audit-logs", h.RequireAuth())
 	logs.Get("", h.ListAuditLogs)
 	logs.Get("/:eventId", h.GetAuditLog)
 }

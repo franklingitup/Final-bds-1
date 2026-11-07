@@ -840,9 +840,16 @@ components:
         applicationSlug:
           type: string
           description: URL-safe application identifier.
+        projectId:
+          type: string
+          format: uuid
+          description: ID of the project that owns the application.
+        projectSlug:
+          type: string
+          description: URL-safe project identifier used to derive the workload namespace.
         namespace:
           type: string
-          description: Kubernetes namespace for the deployment (defaults to application slug).
+          description: Optional explicit namespace; the agent derives the target from its managed namespace prefix and project slug.
         image:
           type: string
           description: Container image to deploy.
@@ -876,6 +883,8 @@ components:
         - applicationId
         - applicationName
         - applicationSlug
+        - projectId
+        - projectSlug
         - image
         - revision
         - replicas

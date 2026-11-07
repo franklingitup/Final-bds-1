@@ -71,14 +71,14 @@ type RegistrationToken struct {
 
 // Heartbeat records a single heartbeat from an agent.
 type Heartbeat struct {
-	ID                 string    `db:"id"`
-	OrgID              string    `db:"org_id"`
-	ClusterID          string    `db:"cluster_id"`
-	AgentID            string    `db:"agent_id"`
-	KubernetesVersion  *string   `db:"kubernetes_version"`
-	NodeCount          *int      `db:"node_count"`
-	APIServerHealthy   bool      `db:"api_server_healthy"`
-	ReceivedAt         time.Time `db:"received_at"`
+	ID                string    `db:"id"`
+	OrgID             string    `db:"org_id"`
+	ClusterID         string    `db:"cluster_id"`
+	AgentID           string    `db:"agent_id"`
+	KubernetesVersion *string   `db:"kubernetes_version"`
+	NodeCount         *int      `db:"node_count"`
+	APIServerHealthy  bool      `db:"api_server_healthy"`
+	ReceivedAt        time.Time `db:"received_at"`
 }
 
 // ----------------------------------------------------------------------------
@@ -101,7 +101,9 @@ type UpdateClusterRequest struct {
 }
 
 type GenerateTokenRequest struct {
-	ExpiresIn string `json:"expiresIn,omitempty"` // Duration like "24h", "7d".
+	ExpiresIn            string `json:"expiresIn,omitempty"` // Duration like "24h", "7d".
+	ControlPlaneEndpoint string `json:"controlPlaneEndpoint,omitempty"`
+	Force                bool   `json:"force,omitempty"`
 }
 
 // AgentRegisterRequest is sent by the cluster agent during registration.
@@ -116,10 +118,10 @@ type AgentRegisterRequest struct {
 
 // AgentHeartbeatRequest is sent periodically by the cluster agent.
 type AgentHeartbeatRequest struct {
-	AgentID            string `json:"agentId"`
-	KubernetesVersion  string `json:"kubernetesVersion"`
-	NodeCount          int    `json:"nodeCount"`
-	APIServerHealthy   bool   `json:"apiServerHealthy"`
+	AgentID           string `json:"agentId"`
+	KubernetesVersion string `json:"kubernetesVersion"`
+	NodeCount         int    `json:"nodeCount"`
+	APIServerHealthy  bool   `json:"apiServerHealthy"`
 }
 
 // ----------------------------------------------------------------------------
@@ -199,26 +201,64 @@ func toTokenView(t *RegistrationToken) RegistrationTokenView {
 // TokenWithSecret is returned only at token creation.
 type TokenWithSecret struct {
 	RegistrationTokenView
-	Token string `json:"token"` // Plaintext token, shown only once.
+	Token          string `json:"token"` // Plaintext token, shown only once.
+	ManifestURL    string `json:"manifestUrl,omitempty"`
+	InstallCommand string `json:"installCommand,omitempty"`
 }
 
 // HeartbeatView is the public projection of a heartbeat.
 type HeartbeatView struct {
-	ClusterID          string    `json:"clusterId"`
-	AgentID            string    `json:"agentId"`
-	KubernetesVersion  string    `json:"kubernetesVersion,omitempty"`
-	NodeCount          *int      `json:"nodeCount,omitempty"`
-	APIServerHealthy   bool      `json:"apiServerHealthy"`
-	ReceivedAt         time.Time `json:"receivedAt"`
+	ClusterID         string    `json:"clusterId"`
+	AgentID           string    `json:"agentId"`
+	KubernetesVersion string    `json:"kubernetesVersion,omitempty"`
+	NodeCount         *int      `json:"nodeCount,omitempty"`
+	APIServerHealthy  bool      `json:"apiServerHealthy"`
+	ReceivedAt        time.Time `json:"receivedAt"`
 }
 
 func toHeartbeatView(h *Heartbeat) HeartbeatView {
 	return HeartbeatView{
-		ClusterID:          h.ClusterID,
-		AgentID:            h.AgentID,
-		KubernetesVersion:  deref(h.KubernetesVersion),
-		NodeCount:          h.NodeCount,
-		APIServerHealthy:   h.APIServerHealthy,
-		ReceivedAt:         h.ReceivedAt,
+		ClusterID:         h.ClusterID,
+		AgentID:           h.AgentID,
+		KubernetesVersion: deref(h.KubernetesVersion),
+		NodeCount:         h.NodeCount,
+		APIServerHealthy:  h.APIServerHealthy,
+		ReceivedAt:        h.ReceivedAt,
 	}
+}
+
+// ----------------------------------------------------------------------------
+// Internal API Types (service-to-service)
+// ----------------------------------------------------------------------------
+
+// InternalCreateClusterRequest is used by the provisioning service to create
+// a cluster with registration token in a single atomic operation.
+type InternalCreateClusterRequest struct {
+	Name          string            `json:"name"`
+	Slug          string            `json:"slug"`
+	Description   string            `json:"description,omitempty"`
+	CloudProvider string            `json:"cloudProvider,omitempty"`
+	Region        string            `json:"region,omitempty"`
+	Labels        map[string]string `json:"labels,omitempty"`
+	CreatedBy     string            `json:"createdBy"` // User ID for audit
+}
+
+// InternalCreateClusterResponse includes the cluster and its registration token.
+type InternalCreateClusterResponse struct {
+	ID                string    `json:"id"`
+	Name              string    `json:"name"`
+	Slug              string    `json:"slug"`
+	Status            string    `json:"status"`
+	RegistrationToken string    `json:"registrationToken"`
+	ManifestURL       string    `json:"manifestUrl"`
+	InstallCommand    string    `json:"installCommand"`
+	ExpiresAt         time.Time `json:"expiresAt"`
+}
+
+// InternalClusterStatus is the lifecycle projection consumed by provisioning.
+type InternalClusterStatus struct {
+	ID                string `json:"id"`
+	Status            string `json:"status"`
+	AgentID           string `json:"agentId,omitempty"`
+	KubernetesVersion string `json:"kubernetesVersion,omitempty"`
 }

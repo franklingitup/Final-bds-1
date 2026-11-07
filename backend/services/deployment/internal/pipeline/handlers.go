@@ -7,6 +7,30 @@ import (
 	apperrors "github.com/bdsplatform/platform/backend/libs/errors"
 )
 
+// Locals keys must match deployment.AgentAuthMiddleware
+// (deployment.LocalAgentOrgID / LocalAgentClusterID / LocalAgentID).
+const (
+	localAgentOrgID     = "deployment_agent_org_id"
+	localAgentClusterID = "deployment_agent_cluster_id"
+)
+
+type agentIdentity struct {
+	OrgID     string
+	ClusterID string
+}
+
+func requireAgent(c *fiber.Ctx) (*agentIdentity, error) {
+	org, _ := c.Locals(localAgentOrgID).(string)
+	cluster, _ := c.Locals(localAgentClusterID).(string)
+	if org == "" || cluster == "" {
+		return nil, apperrors.Unauthorized("agent authentication required")
+	}
+	if org != orgID(c) || cluster != clusterID(c) {
+		return nil, apperrors.Forbidden("cluster ID mismatch")
+	}
+	return &agentIdentity{OrgID: org, ClusterID: cluster}, nil
+}
+
 // Handler adapts the Pipeline Service to Fiber HTTP handlers.
 type Handler struct {
 	svc *Service
@@ -216,13 +240,12 @@ func (h *Handler) GetDeploymentMetrics(c *fiber.Ctx) error {
 
 // GetAgentDesiredState returns pending desired states for an agent's cluster.
 func (h *Handler) GetAgentDesiredState(c *fiber.Ctx) error {
-	org := orgID(c)
-	cluster := clusterID(c)
-	if org == "" || cluster == "" {
-		return apperrors.Validation("organization ID and cluster ID required")
+	agent, err := requireAgent(c)
+	if err != nil {
+		return err
 	}
 
-	states, err := h.svc.GetDesiredStateForAgent(c.UserContext(), org, cluster)
+	states, err := h.svc.GetDesiredStateForAgent(c.UserContext(), agent.OrgID, agent.ClusterID)
 	if err != nil {
 		return err
 	}
@@ -231,9 +254,9 @@ func (h *Handler) GetAgentDesiredState(c *fiber.Ctx) error {
 
 // ReportSync handles sync status reports from agents.
 func (h *Handler) ReportSync(c *fiber.Ctx) error {
-	org := orgID(c)
-	if org == "" {
-		return apperrors.Validation("organization ID required")
+	agent, err := requireAgent(c)
+	if err != nil {
+		return err
 	}
 
 	req, err := parseBody[ReportSyncRequest](c)
@@ -241,7 +264,7 @@ func (h *Handler) ReportSync(c *fiber.Ctx) error {
 		return err
 	}
 
-	if err := h.svc.ReportSync(c.UserContext(), org, req); err != nil {
+	if err := h.svc.ReportSync(c.UserContext(), agent.OrgID, req); err != nil {
 		return err
 	}
 	return c.SendStatus(fiber.StatusNoContent)
@@ -249,9 +272,9 @@ func (h *Handler) ReportSync(c *fiber.Ctx) error {
 
 // ReportMetrics handles metrics reports from agents.
 func (h *Handler) ReportMetrics(c *fiber.Ctx) error {
-	org := orgID(c)
-	if org == "" {
-		return apperrors.Validation("organization ID required")
+	agent, err := requireAgent(c)
+	if err != nil {
+		return err
 	}
 
 	req, err := parseBody[ReportMetricsRequest](c)
@@ -259,7 +282,7 @@ func (h *Handler) ReportMetrics(c *fiber.Ctx) error {
 		return err
 	}
 
-	if err := h.svc.ReportMetrics(c.UserContext(), org, req); err != nil {
+	if err := h.svc.ReportMetrics(c.UserContext(), agent.OrgID, req); err != nil {
 		return err
 	}
 	return c.SendStatus(fiber.StatusNoContent)

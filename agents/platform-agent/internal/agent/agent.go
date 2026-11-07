@@ -14,7 +14,9 @@ import (
 	"github.com/bdsplatform/platform/agents/platform-agent/internal/config"
 	"github.com/bdsplatform/platform/agents/platform-agent/internal/controlplane"
 	"github.com/bdsplatform/platform/agents/platform-agent/internal/inventory"
+	"github.com/bdsplatform/platform/agents/platform-agent/internal/logshipper"
 	"github.com/bdsplatform/platform/agents/platform-agent/internal/metrics"
+	"github.com/bdsplatform/platform/agents/platform-agent/internal/metricscollector"
 	"github.com/bdsplatform/platform/agents/platform-agent/internal/reconciler"
 	"github.com/bdsplatform/platform/agents/platform-agent/internal/secrets"
 )
@@ -38,6 +40,12 @@ type WorkerFactory struct {
 	// SecretsSyncerFactory creates the secrets syncer.
 	// Called with agent credentials after registration.
 	SecretsSyncerFactory func(creds controlplane.AgentCredentials) (*secrets.Syncer, error)
+	// MetricsCollectorFactory creates the metrics collector.
+	// Called with agent credentials after registration.
+	MetricsCollectorFactory func(creds controlplane.AgentCredentials) (*metricscollector.Collector, error)
+	// LogShipperFactory creates the log shipper.
+	// Called with agent credentials after registration.
+	LogShipperFactory func(creds controlplane.AgentCredentials) (*logshipper.Shipper, error)
 }
 
 // LeaderElector participates in leader election and blocks until its context is
@@ -49,15 +57,17 @@ type LeaderElector interface {
 
 // Agent is the platform agent that runs inside customer clusters.
 type Agent struct {
-	cfg           config.Config
-	client        *controlplane.Client
-	collector     InventoryCollector
-	workerFactory *WorkerFactory
-	reconciler    *reconciler.Reconciler
-	secretsSyncer *secrets.Syncer
-	leaderElector LeaderElector
-	state         *State
-	log           *slog.Logger
+	cfg              config.Config
+	client           *controlplane.Client
+	collector        InventoryCollector
+	workerFactory    *WorkerFactory
+	reconciler       *reconciler.Reconciler
+	secretsSyncer    *secrets.Syncer
+	metricsCollector *metricscollector.Collector
+	logShipper       *logshipper.Shipper
+	leaderElector    LeaderElector
+	state            *State
+	log              *slog.Logger
 
 	// ready reports whether the agent has completed registration and is serving
 	// as Ready. It is read by the /readyz probe handler from a different
@@ -172,6 +182,26 @@ func (a *Agent) Run(ctx context.Context) error {
 		}()
 	}
 
+	// Start metrics collector in background if enabled.
+	if a.metricsCollector != nil && a.cfg.MetricsCollectorEnabled {
+		go func() {
+			a.log.Info("starting metrics collector")
+			if err := a.metricsCollector.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				a.log.Error("metrics collector stopped with error", "error", err)
+			}
+		}()
+	}
+
+	// Start log shipper in background if enabled.
+	if a.logShipper != nil && a.cfg.LogShipperEnabled {
+		go func() {
+			a.log.Info("starting log shipper")
+			if err := a.logShipper.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				a.log.Error("log shipper stopped with error", "error", err)
+			}
+		}()
+	}
+
 	// Start leader election in the background if configured. The elector only
 	// flips the leadership flag consulted by the reconciler/syncer gate; the
 	// heartbeat loop below always runs so followers stay warm. On shutdown the
@@ -257,6 +287,31 @@ func (a *Agent) initializeWorkers() error {
 		a.log.Info("created secrets syncer with credentials",
 			"cluster_id", creds.ClusterID,
 			"agent_id", creds.AgentID)
+	}
+
+	// Create metrics collector if factory provided and enabled.
+	if a.workerFactory.MetricsCollectorFactory != nil && a.cfg.MetricsCollectorEnabled {
+		mc, err := a.workerFactory.MetricsCollectorFactory(creds)
+		if err != nil {
+			return fmt.Errorf("create metrics collector: %w", err)
+		}
+		a.metricsCollector = mc
+		a.log.Info("created metrics collector with credentials",
+			"cluster_id", creds.ClusterID,
+			"agent_id", creds.AgentID)
+	}
+
+	// Create log shipper if factory provided and enabled.
+	if a.workerFactory.LogShipperFactory != nil && a.cfg.LogShipperEnabled {
+		ls, err := a.workerFactory.LogShipperFactory(creds)
+		if err != nil {
+			return fmt.Errorf("create log shipper: %w", err)
+		}
+		a.logShipper = ls
+		a.log.Info("created log shipper with credentials",
+			"cluster_id", creds.ClusterID,
+			"agent_id", creds.AgentID,
+			"max_tailed_pods", a.cfg.MaxTailedPods)
 	}
 
 	return nil

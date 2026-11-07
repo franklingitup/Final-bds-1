@@ -31,6 +31,10 @@ jobs:
         with:
           working-directory: backend
           version: latest
+      - name: Check for blanket auth middleware
+        run: |
+          go install ./tools/noblanketscopeauth/cmd/noblanketscopeauth
+          go vet -vettool=$(go env GOPATH)/bin/noblanketscopeauth ./...
 
   integration:
     name: Integration tests (Go)
@@ -89,6 +93,7 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci
       - run: npm run lint
+      - run: npm run check:api-paths
       - run: npm run build
 
   helm:

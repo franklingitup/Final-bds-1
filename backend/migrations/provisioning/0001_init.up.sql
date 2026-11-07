@@ -70,10 +70,12 @@ CREATE TABLE IF NOT EXISTS cluster_templates (
     is_default      BOOLEAN NOT NULL DEFAULT false,
     
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    
-    UNIQUE (COALESCE(org_id, '00000000-0000-0000-0000-000000000000'::uuid), name)
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+    
+CREATE UNIQUE INDEX cluster_templates_org_name_idx
+    ON cluster_templates (COALESCE(org_id, '00000000-0000-0000-0000-000000000000'::uuid), name);
+
 
 CREATE INDEX IF NOT EXISTS cluster_templates_provider_idx
     ON cluster_templates (provider, is_default);

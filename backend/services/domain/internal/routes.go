@@ -5,7 +5,9 @@ package domain
 import "github.com/gofiber/fiber/v2"
 
 // RegisterRoutes mounts domain routes onto the app with the given handler and auth middleware.
-func RegisterRoutes(app *fiber.App, h *Handler, auth fiber.Handler) {
+// auth: user JWT middleware for org-scoped endpoints
+// agentAuth: cluster credential middleware for agent endpoints
+func RegisterRoutes(app *fiber.App, h *Handler, auth, agentAuth fiber.Handler) {
 	v1 := app.Group("/v1")
 
 	// Domain management (requires auth)
@@ -33,8 +35,8 @@ func RegisterRoutes(app *fiber.App, h *Handler, auth fiber.Handler) {
 	// Domains by deployment
 	v1.Get("/organizations/:orgId/deployments/:deploymentId/domains", auth, h.ListDomainsByDeployment)
 
-	// Agent endpoints (use agent auth middleware instead)
-	agent := v1.Group("/agent")
+	// Agent endpoints (cluster-credential-based authentication via X-Cluster-ID/X-Agent-ID headers)
+	agent := v1.Group("/agent", agentAuth)
 	agent.Get("/clusters/:clusterId/ingresses", h.GetIngressesForAgent)
 	agent.Post("/ingresses/:ingressId/sync", h.ReportIngressSync)
 

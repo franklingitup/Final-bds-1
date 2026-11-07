@@ -3,8 +3,10 @@ package provisioning
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -68,10 +70,42 @@ func (s *bundleRequestStore) UpdateStatus(context.Context, string, string, *stri
 }
 func (s *bundleRequestStore) Delete(context.Context, string) error { return nil }
 
+type bundleCredentialStore struct {
+	credential *CloudCredential
+}
+
+func (s *bundleCredentialStore) Create(context.Context, *CloudCredential) error { return nil }
+func (s *bundleCredentialStore) GetByID(context.Context, string) (*CloudCredential, error) {
+	return s.credential, nil
+}
+func (s *bundleCredentialStore) GetByName(context.Context, string) (*CloudCredential, error) {
+	return nil, database.ErrNotFound
+}
+func (s *bundleCredentialStore) List(context.Context, string) ([]CloudCredential, error) {
+	return nil, nil
+}
+func (s *bundleCredentialStore) ListByProvider(context.Context, string, string) ([]CloudCredential, error) {
+	return nil, nil
+}
+func (s *bundleCredentialStore) Update(context.Context, *CloudCredential) error { return nil }
+func (s *bundleCredentialStore) Delete(context.Context, string) error           { return nil }
+
 type bundleTenantRunner struct{}
 
 func (bundleTenantRunner) WithTenant(ctx context.Context, _ string, fn database.TxFunc) error {
 	return fn(ctx)
+}
+
+type bundleClusterClient struct {
+	status *ClusterStatus
+}
+
+func (c *bundleClusterClient) CreateClusterWithToken(context.Context, string, ClusterCreateRequest) (*ClusterCreateResponse, error) {
+	return nil, nil
+}
+
+func (c *bundleClusterClient) GetCluster(context.Context, string, string) (*ClusterStatus, error) {
+	return c.status, nil
 }
 
 func newBundleTestService(expiresAt time.Time) *Service {
@@ -123,6 +157,51 @@ func TestGetSessionBundleValidToken(t *testing.T) {
 	}
 }
 
+func TestGetSessionBundleSynchronizesRealAgentRegistration(t *testing.T) {
+	svc := newBundleTestService(time.Now().Add(time.Hour))
+	clusterID := "cluster-1"
+	svc.requests.(*bundleRequestStore).byID["req-1"].ClusterID = &clusterID
+	svc.clusterClient = &bundleClusterClient{status: &ClusterStatus{
+		ID:                clusterID,
+		Status:            "connected",
+		AgentID:           "agent-1",
+		KubernetesVersion: "1.30",
+	}}
+
+	bundle, err := svc.GetSessionBundle(context.Background(), "session-token")
+	if err != nil {
+		t.Fatalf("GetSessionBundle: %v", err)
+	}
+	if !bundle.AgentConnected {
+		t.Fatal("bundle did not reflect real cluster-service agent registration")
+	}
+	if bundle.AgentVersion == nil || *bundle.AgentVersion != "1.30" {
+		t.Fatalf("agentVersion = %v, want 1.30", bundle.AgentVersion)
+	}
+}
+
+func TestGetSessionBundleIncludesSelectedCredentialEnvironment(t *testing.T) {
+	svc := newBundleTestService(time.Now().Add(time.Hour))
+	credentialID := "credential-1"
+	svc.requests.(*bundleRequestStore).byID["req-1"].CredentialID = &credentialID
+	svc.credentials = &bundleCredentialStore{credential: &CloudCredential{
+		ID:          credentialID,
+		Provider:    ProviderAWS,
+		Credentials: []byte(`{"accessKeyId":"AKIA_TEST","secretAccessKey":"secret","sessionToken":"session"}`),
+	}}
+	svc.encryptor = &NoopEncryptor{}
+
+	bundle, err := svc.GetSessionBundle(context.Background(), "session-token")
+	if err != nil {
+		t.Fatalf("GetSessionBundle: %v", err)
+	}
+	if bundle.CredentialEnv["AWS_ACCESS_KEY_ID"] != "AKIA_TEST" ||
+		bundle.CredentialEnv["AWS_SECRET_ACCESS_KEY"] != "secret" ||
+		bundle.CredentialEnv["AWS_SESSION_TOKEN"] != "session" {
+		t.Fatalf("unexpected credential environment: %#v", bundle.CredentialEnv)
+	}
+}
+
 func TestGetSessionBundleExpiredTokenRejected(t *testing.T) {
 	svc := newBundleTestService(time.Now().Add(-time.Minute))
 	if _, err := svc.GetSessionBundle(context.Background(), "session-token"); err == nil {
@@ -162,5 +241,212 @@ func TestGetSessionBundleHTTPUsesSessionTokenWithoutJWT(t *testing.T) {
 	defer rejected.Body.Close()
 	if rejected.StatusCode != http.StatusNotFound {
 		t.Fatalf("JWT without valid session token status = %d, want 404", rejected.StatusCode)
+	}
+}
+
+// --- Install Script Tests ---
+
+type installSessionStore struct {
+	byID    map[string]*InstallSession
+	byToken map[string]*InstallSession
+}
+
+func (s *installSessionStore) Create(context.Context, *InstallSession) error { return nil }
+func (s *installSessionStore) GetByID(_ context.Context, id string) (*InstallSession, error) {
+	session, ok := s.byID[id]
+	if !ok {
+		return nil, database.ErrNotFound
+	}
+	return session, nil
+}
+func (s *installSessionStore) GetByToken(_ context.Context, token string) (*InstallSession, error) {
+	session, ok := s.byToken[token]
+	if !ok {
+		return nil, database.ErrNotFound
+	}
+	return session, nil
+}
+func (s *installSessionStore) GetByRequestID(context.Context, string) (*InstallSession, error) {
+	return nil, database.ErrNotFound
+}
+func (s *installSessionStore) List(context.Context, string, database.PageRequest) (database.Page[InstallSession], error) {
+	return database.Page[InstallSession]{}, nil
+}
+func (s *installSessionStore) Update(context.Context, *InstallSession) error { return nil }
+func (s *installSessionStore) UpdateStatus(context.Context, string, string) error {
+	return nil
+}
+func (s *installSessionStore) ExpireOldSessions(context.Context) (int, error) { return 0, nil }
+
+func newInstallScriptTestService(session *InstallSession) *Service {
+	return NewService(Deps{
+		Requests: &bundleRequestStore{byID: map[string]*ProvisioningRequest{}},
+		Sessions: &installSessionStore{
+			byID:    map[string]*InstallSession{session.ID: session},
+			byToken: map[string]*InstallSession{session.SessionToken: session},
+		},
+		Tenant: bundleTenantRunner{},
+	})
+}
+
+func TestGetInstallScriptValidSession(t *testing.T) {
+	session := &InstallSession{
+		ID:           "session-123",
+		OrgID:        "org-1",
+		SessionToken: "token-abc",
+		Status:       SessionActive,
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}
+	svc := newInstallScriptTestService(session)
+	app := fiber.New(fiber.Config{
+		ErrorHandler: middleware.ErrorHandler(),
+	})
+	app.Get("/v1/install/:sessionId", NewHandler(svc).GetInstallScript)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/install/session-123", nil)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	if contentType != "text/x-shellscript" {
+		t.Fatalf("expected Content-Type text/x-shellscript, got %s", contentType)
+	}
+
+	cacheControl := resp.Header.Get("Cache-Control")
+	if cacheControl != "no-store" {
+		t.Fatalf("expected Cache-Control no-store, got %s", cacheControl)
+	}
+}
+
+func TestGetInstallScriptSessionNotFound(t *testing.T) {
+	session := &InstallSession{
+		ID:           "session-123",
+		OrgID:        "org-1",
+		SessionToken: "token-abc",
+		Status:       SessionActive,
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}
+	svc := newInstallScriptTestService(session)
+	app := fiber.New(fiber.Config{
+		ErrorHandler: middleware.ErrorHandler(),
+	})
+	app.Get("/v1/install/:sessionId", NewHandler(svc).GetInstallScript)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/install/unknown-session", nil)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", resp.StatusCode)
+	}
+}
+
+func TestGetInstallScriptExpiredSession(t *testing.T) {
+	session := &InstallSession{
+		ID:           "session-123",
+		OrgID:        "org-1",
+		SessionToken: "token-abc",
+		Status:       SessionActive,
+		ExpiresAt:    time.Now().Add(-time.Hour), // Expired
+	}
+	svc := newInstallScriptTestService(session)
+	app := fiber.New(fiber.Config{
+		ErrorHandler: middleware.ErrorHandler(),
+	})
+	app.Get("/v1/install/:sessionId", NewHandler(svc).GetInstallScript)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/install/session-123", nil)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusGone {
+		t.Fatalf("expected 410 Gone, got %d", resp.StatusCode)
+	}
+}
+
+func TestGetInstallScriptCompletedSession(t *testing.T) {
+	session := &InstallSession{
+		ID:           "session-123",
+		OrgID:        "org-1",
+		SessionToken: "token-abc",
+		Status:       SessionCompleted,
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}
+	svc := newInstallScriptTestService(session)
+	app := fiber.New(fiber.Config{
+		ErrorHandler: middleware.ErrorHandler(),
+	})
+	app.Get("/v1/install/:sessionId", NewHandler(svc).GetInstallScript)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/install/session-123", nil)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	// Completed sessions should return validation error (422)
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422, got %d", resp.StatusCode)
+	}
+}
+
+func TestGetInstallScriptContainsSessionID(t *testing.T) {
+	session := &InstallSession{
+		ID:           "session-456",
+		OrgID:        "org-1",
+		SessionToken: "token-xyz",
+		Status:       SessionActive,
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}
+	svc := newInstallScriptTestService(session)
+	app := fiber.New(fiber.Config{
+		ErrorHandler: middleware.ErrorHandler(),
+	})
+	app.Get("/v1/install/:sessionId", NewHandler(svc).GetInstallScript)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/install/session-456", nil)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(body)
+
+	// The script should contain the session ID
+	if !strings.Contains(script, "session-456") {
+		t.Fatal("script should contain session ID")
+	}
+
+	// The script should NOT contain the session token (it comes from env var)
+	if strings.Contains(script, "token-xyz") {
+		t.Fatal("script should NOT embed the session token")
+	}
+	if !strings.Contains(script, "/v1/agent-install/${BOOTSTRAP_TOKEN}/manifest.yaml") {
+		t.Fatal("script should install the real cluster-service agent manifest")
+	}
+	if strings.Contains(script, "/v1/bootstrap/${BOOTSTRAP_TOKEN}/manifest.yaml") {
+		t.Fatal("script should not reference the removed provisioning bootstrap manifest")
+	}
+	if !strings.Contains(script, "configure_cloud_credentials") {
+		t.Fatal("script should configure the selected cloud credential")
 	}
 }

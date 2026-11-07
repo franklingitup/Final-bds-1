@@ -27,6 +27,10 @@ import (
 func main() {
 	cfg := config.MustLoad("auth")
 	log := logger.New(cfg)
+	if redisRequired(cfg) && cfg.Redis.URL == "" {
+		log.Error("REDIS_URL is required outside local development")
+		os.Exit(1)
+	}
 	ctx := context.Background()
 
 	db, err := database.Connect(ctx, cfg)
@@ -97,7 +101,7 @@ func main() {
 		Auth:             cfg.Auth,
 		Logger:           log,
 	})
-	handler := auth.NewHandler(svc)
+	handler := auth.NewHandler(svc).WithInternalToken(os.Getenv("INTERNAL_API_TOKEN"))
 
 	relay := events.NewRelay(db, outbox, publisher, log, events.RelayOptions{})
 	relayCtx, cancelRelay := context.WithCancel(ctx)
@@ -114,6 +118,10 @@ func main() {
 		log.Error("server exited with error", "error", err)
 		os.Exit(1)
 	}
+}
+
+func redisRequired(cfg config.Config) bool {
+	return cfg.Environment == config.EnvProduction || cfg.Environment == config.EnvStaging
 }
 
 // runMigrations applies the auth schema and the shared outbox schema, each

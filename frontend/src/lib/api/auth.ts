@@ -14,6 +14,11 @@ interface SSOExchangeRequest {
   code: string;
 }
 
+export interface MFASetupResponse {
+  secret: string;
+  otpauthUrl: string;
+}
+
 export const authApi = {
   async login(data: LoginRequest): Promise<LoginResponse> {
     const response = await apiClient.post<LoginResponse>("/v1/auth/login", data);
@@ -55,5 +60,32 @@ export const authApi = {
       ? localStorage.getItem("refreshToken") 
       : null;
     return apiClient.post<AuthTokens>("/v1/auth/refresh", { refreshToken });
+  },
+
+  // Password reset
+  async requestPasswordReset(email: string): Promise<void> {
+    await apiClient.post("/v1/auth/password-reset/request", { email });
+  },
+
+  async confirmPasswordReset(token: string, newPassword: string): Promise<void> {
+    await apiClient.post("/v1/auth/password-reset/confirm", { token, newPassword });
+  },
+
+  // Email verification
+  async verifyEmail(token: string): Promise<void> {
+    await apiClient.post("/v1/auth/verify-email", { token });
+  },
+
+  // MFA/TOTP
+  async setupMFA(): Promise<MFASetupResponse> {
+    return apiClient.post<MFASetupResponse>("/v1/auth/mfa/setup");
+  },
+
+  async enableMFA(code: string): Promise<void> {
+    await apiClient.post("/v1/auth/mfa/enable", { code });
+  },
+
+  async disableMFA(code: string): Promise<void> {
+    await apiClient.post("/v1/auth/mfa/disable", { code });
   },
 };

@@ -34,6 +34,11 @@ type Deps struct {
 	Notifier   Notifier
 	Logger     *slog.Logger
 	Now        func() time.Time
+	// ControlPlanePublicURL is the server-side default for the address agents
+	// should use to reach the control plane (e.g. "https://api.example.com" in
+	// production, "http://host.docker.internal:8080" for local Kind testing).
+	// This is NOT the browser-facing gateway URL.
+	ControlPlanePublicURL string
 }
 
 // Service implements the cluster domain logic.
@@ -48,6 +53,7 @@ type Service struct {
 	notifier   Notifier
 	log        *slog.Logger
 	now        func() time.Time
+	installGen *InstallManifestGenerator
 }
 
 // NewService wires a cluster Service.
@@ -72,6 +78,7 @@ func NewService(d Deps) *Service {
 		notifier:   d.Notifier,
 		log:        d.Logger,
 		now:        d.Now,
+		installGen: NewInstallManifestGenerator("", "", d.ControlPlanePublicURL),
 	}
 }
 
@@ -261,6 +268,19 @@ func (s *Service) GenerateRegistrationToken(ctx context.Context, orgID, userID, 
 		ttl = d
 	}
 
+	// Resolve control plane endpoint: use request value if provided, else server default.
+	// The manifest URL requires a valid endpoint — this validates early before creating the token.
+	resolvedEndpoint, err := s.installGen.ResolveControlPlaneEndpoint(req.ControlPlaneEndpoint)
+	if err != nil {
+		return nil, apperrors.Validation(err.Error())
+	}
+
+	var manifestURL string
+	manifestURL, err = s.installGen.ManifestURL(resolvedEndpoint, "token-placeholder")
+	if err != nil {
+		return nil, apperrors.Validation(err.Error())
+	}
+
 	plainToken, err := generateRegistrationToken()
 	if err != nil {
 		return nil, err
@@ -277,13 +297,23 @@ func (s *Service) GenerateRegistrationToken(ctx context.Context, orgID, userID, 
 	t.OrgID = orgID
 	t.CreatedBy = &userID
 
+	var supersededAgentID string
+	forcedConnected := false
 	err = s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
-		// Verify cluster exists and is in pending status.
+		// Pending/disconnected clusters can rotate normally. A connected cluster
+		// requires an explicit force because its current agent identity will be
+		// superseded when the new token is consumed.
 		c, err := s.clusters.GetByID(ctx, clusterID)
 		if err != nil {
 			return err
 		}
-		if c.Status != StatusPending && c.Status != StatusDisconnected {
+		if c.Status == StatusConnected {
+			if !req.Force {
+				return errConnectedClusterRequiresForce
+			}
+			forcedConnected = true
+			supersededAgentID = deref(c.AgentID)
+		} else if c.Status != StatusPending && c.Status != StatusDisconnected {
 			return errClusterNotPending
 		}
 
@@ -304,11 +334,19 @@ func (s *Service) GenerateRegistrationToken(ctx context.Context, orgID, userID, 
 			DeliveryRef: deliveryRef,
 		})
 
+		if forcedConnected {
+			s.log.WarnContext(ctx, "forcing registration token rotation for connected cluster",
+				"cluster_id", clusterID,
+				"superseded_agent_id", supersededAgentID,
+				"requested_by", userID)
+		}
 		return s.enqueue(ctx, EventRegistrationTokenCreated, orgID, tokenCreatedPayload{
-			ClusterID:   clusterID,
-			TokenID:     t.ID,
-			ExpiresAt:   t.ExpiresAt,
-			DeliveryRef: deliveryRef,
+			ClusterID:         clusterID,
+			TokenID:           t.ID,
+			ExpiresAt:         t.ExpiresAt,
+			DeliveryRef:       deliveryRef,
+			Forced:            forcedConnected,
+			SupersededAgentID: supersededAgentID,
 		}, events.WithActor(events.Actor{Type: "user", ID: userID}),
 			events.WithResource(events.Resource{Type: "cluster_registration_token", ID: t.ID}))
 	})
@@ -316,10 +354,34 @@ func (s *Service) GenerateRegistrationToken(ctx context.Context, orgID, userID, 
 		return nil, err
 	}
 
+	// Build the actual manifest URL with the real token (not placeholder).
+	manifestURL, err = s.installGen.ManifestURL(resolvedEndpoint, plainToken)
+	if err != nil {
+		return nil, apperrors.Validation(err.Error())
+	}
+	installCommand := "kubectl apply -f " + manifestURL
+
 	return &TokenWithSecret{
 		RegistrationTokenView: toTokenView(t),
 		Token:                 plainToken,
+		ManifestURL:           manifestURL,
+		InstallCommand:        installCommand,
 	}, nil
+}
+
+// GetInstallManifest validates a registration token and renders the public,
+// self-contained kubectl manifest for its installation.
+func (s *Service) GetInstallManifest(ctx context.Context, plainToken, controlPlaneEndpoint string) (string, error) {
+	token, err := s.tokens.GetByHash(ctx, hashToken(plainToken))
+	if err != nil || token.Status != TokenStatusActive || !token.ExpiresAt.After(s.now()) {
+		return "", apperrors.NotFound("invalid or expired registration token")
+	}
+
+	manifest, err := s.installGen.Generate(plainToken, controlPlaneEndpoint)
+	if err != nil {
+		return "", apperrors.Validation(err.Error())
+	}
+	return manifest, nil
 }
 
 // RevokeRegistrationToken revokes an active registration token.
@@ -403,7 +465,10 @@ func (s *Service) RegisterAgent(ctx context.Context, req AgentRegisterRequest) (
 		if err != nil {
 			return err
 		}
-		if c.Status != StatusPending && c.Status != StatusDisconnected {
+		// An active token for a connected cluster can only be issued through
+		// GenerateRegistrationToken(force=true), so consuming it is the
+		// authorized agent-supersession path.
+		if c.Status != StatusPending && c.Status != StatusDisconnected && c.Status != StatusConnected {
 			return errClusterNotPending
 		}
 
@@ -642,43 +707,185 @@ func (s *Service) GetHeartbeats(ctx context.Context, orgID, userID, clusterID st
 // Disconnection Detection (called by background job)
 // ----------------------------------------------------------------------------
 
-// MarkDisconnected marks clusters that haven't sent heartbeats as disconnected.
-// This would be called by a periodic background job.
-func (s *Service) MarkDisconnected(ctx context.Context, orgID string, timeout time.Duration) (int, error) {
+// MarkDisconnected marks connected clusters across all organizations that have
+// not sent a heartbeat within timeout. Each update and event is written inside
+// the affected cluster's tenant scope.
+func (s *Service) MarkDisconnected(ctx context.Context, timeout time.Duration) (int, error) {
 	if timeout <= 0 {
 		timeout = HeartbeatTimeout
 	}
 	cutoff := s.now().Add(-timeout)
 	count := 0
 
+	connected, err := s.clusters.ListConnectedWithoutTenant(ctx)
+	if err != nil {
+		return 0, err
+	}
+	for _, c := range connected {
+		if c.LastHeartbeatAt == nil || !c.LastHeartbeatAt.Before(cutoff) {
+			continue
+		}
+		err := s.tenant.WithTenant(ctx, c.OrgID, func(ctx context.Context) error {
+			if err := s.clusters.UpdateStatus(ctx, c.ID, StatusDisconnected); err != nil {
+				return err
+			}
+
+			return s.enqueue(ctx, EventClusterDisconnected, c.OrgID, clusterDisconnectedPayload{
+				ClusterID:         c.ID,
+				LastHeartbeatAt:   *c.LastHeartbeatAt,
+				DisconnectedAfter: timeout.String(),
+			}, events.WithResource(events.Resource{Type: "cluster", ID: c.ID}))
+		})
+		if err != nil {
+			s.log.WarnContext(ctx, "failed to mark cluster disconnected",
+				"cluster_id", c.ID, "organization_id", c.OrgID, "error", err)
+			continue
+		}
+		count++
+	}
+	return count, nil
+}
+
+// ----------------------------------------------------------------------------
+// Internal API (service-to-service)
+// ----------------------------------------------------------------------------
+
+// CreateClusterWithToken creates a cluster and registration token atomically.
+// This is used by the provisioning service to create a real cluster record
+// before starting Terraform provisioning.
+//
+// The operation is atomic: either both the cluster and token are created, or
+// neither is. This prevents orphaned clusters without valid tokens.
+//
+// SECURITY: This bypasses user authorization - it's protected by the internal
+// API token at the transport layer. The createdBy field is trusted for audit.
+func (s *Service) CreateClusterWithToken(ctx context.Context, orgID string, req InternalCreateClusterRequest) (*InternalCreateClusterResponse, error) {
+	name := strings.TrimSpace(req.Name)
+	if err := validateName(name); err != nil {
+		return nil, err
+	}
+	slug := strings.ToLower(strings.TrimSpace(req.Slug))
+	if !slugPattern.MatchString(slug) {
+		return nil, apperrors.Validation("slug must be 2-64 chars of lowercase letters, digits, or hyphens")
+	}
+
+	var cluster *Cluster
+	var tokenWithSecret *TokenWithSecret
+
 	err := s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
-		// List connected clusters with stale heartbeats.
-		page, err := s.clusters.List(ctx, database.PageRequest{Limit: 100}, StatusConnected)
+		// Create cluster
+		c := &Cluster{
+			Name:   name,
+			Slug:   slug,
+			Status: StatusPending,
+		}
+		c.OrgID = orgID
+		if req.CreatedBy != "" {
+			c.CreatedBy = &req.CreatedBy
+		}
+		if req.Description != "" {
+			c.Description = &req.Description
+		}
+		if req.CloudProvider != "" {
+			c.CloudProvider = &req.CloudProvider
+		}
+		if req.Region != "" {
+			c.Region = &req.Region
+		}
+		c.Labels = marshalLabels(req.Labels)
+
+		if err := s.clusters.Create(ctx, c); err != nil {
+			if apperrors.From(err).Code == apperrors.CodeConflict {
+				return errSlugTaken
+			}
+			return err
+		}
+		cluster = c
+
+		// Generate registration token
+		plainToken, err := generateRegistrationToken()
 		if err != nil {
 			return err
 		}
+		tokenHash := hashToken(plainToken)
 
-		for _, c := range page.Items {
-			if c.LastHeartbeatAt != nil && c.LastHeartbeatAt.Before(cutoff) {
-				if err := s.clusters.UpdateStatus(ctx, c.ID, StatusDisconnected); err != nil {
-					s.log.WarnContext(ctx, "failed to mark cluster disconnected",
-						"cluster_id", c.ID, "error", err)
-					continue
-				}
-
-				_ = s.enqueue(ctx, EventClusterDisconnected, orgID, clusterDisconnectedPayload{
-					ClusterID:         c.ID,
-					LastHeartbeatAt:   *c.LastHeartbeatAt,
-					DisconnectedAfter: timeout.String(),
-				}, events.WithResource(events.Resource{Type: "cluster", ID: c.ID}))
-
-				count++
-			}
+		t := &RegistrationToken{
+			ClusterID: c.ID,
+			TokenHash: tokenHash,
+			Status:    TokenStatusActive,
+			ExpiresAt: s.now().Add(DefaultTokenTTL),
 		}
-		return nil
-	})
+		t.OrgID = orgID
+		if req.CreatedBy != "" {
+			t.CreatedBy = &req.CreatedBy
+		}
 
-	return count, err
+		if err := s.tokens.Create(ctx, t); err != nil {
+			return err
+		}
+
+		// Resolve control plane endpoint (use server default)
+		resolvedEndpoint, err := s.installGen.ResolveControlPlaneEndpoint("")
+		if err != nil {
+			return apperrors.Validation(err.Error())
+		}
+
+		manifestURL, err := s.installGen.ManifestURL(resolvedEndpoint, plainToken)
+		if err != nil {
+			return apperrors.Validation(err.Error())
+		}
+
+		tokenWithSecret = &TokenWithSecret{
+			RegistrationTokenView: toTokenView(t),
+			Token:                 plainToken,
+			ManifestURL:           manifestURL,
+			InstallCommand:        "kubectl apply -f " + manifestURL,
+		}
+
+		// Emit event for audit
+		return s.enqueue(ctx, EventClusterCreated, orgID, clusterCreatedPayload{
+			ClusterID:     c.ID,
+			Name:          c.Name,
+			Slug:          c.Slug,
+			CloudProvider: deref(c.CloudProvider),
+			Region:        deref(c.Region),
+			CreatedBy:     req.CreatedBy,
+		}, events.WithActor(events.Actor{Type: "service", ID: "provisioning"}),
+			events.WithResource(events.Resource{Type: "cluster", ID: c.ID}))
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &InternalCreateClusterResponse{
+		ID:                cluster.ID,
+		Name:              cluster.Name,
+		Slug:              cluster.Slug,
+		Status:            cluster.Status,
+		RegistrationToken: tokenWithSecret.Token,
+		ManifestURL:       tokenWithSecret.ManifestURL,
+		InstallCommand:    tokenWithSecret.InstallCommand,
+		ExpiresAt:         tokenWithSecret.ExpiresAt,
+	}, nil
+}
+
+// GetClusterInternal returns cluster lifecycle state for trusted services.
+func (s *Service) GetClusterInternal(ctx context.Context, orgID, clusterID string) (*InternalClusterStatus, error) {
+	var cluster *Cluster
+	err := s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
+		var err error
+		cluster, err = s.clusters.GetByID(ctx, clusterID)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &InternalClusterStatus{
+		ID:                cluster.ID,
+		Status:            cluster.Status,
+		AgentID:           deref(cluster.AgentID),
+		KubernetesVersion: deref(cluster.KubernetesVersion),
+	}, nil
 }
 
 // ----------------------------------------------------------------------------

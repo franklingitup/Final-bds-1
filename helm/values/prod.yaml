@@ -1,7 +1,116 @@
 # Environment overrides for prod.
+# All security-critical variables MUST be sourced from the pre-created
+# Kubernetes Secret "bdsplatform-runtime-secrets". Never commit plaintext
+# values here.
+
 gateway:
   replicaCount: 3
+  env:
+    # Required in prod/staging: rate limiting and token revocation
+    - name: REDIS_URL
+      valueFrom:
+        secretKeyRef:
+          name: bdsplatform-runtime-secrets
+          key: REDIS_URL
+    # Backend service URLs (Kubernetes internal DNS)
+    # Replace "bdsplatform" with your actual Helm release name
+    - name: AUTH_SERVICE_URL
+      value: "http://bdsplatform-auth:8080"
+    - name: TENANT_SERVICE_URL
+      value: "http://bdsplatform-tenant:8080"
+    - name: PROJECT_SERVICE_URL
+      value: "http://bdsplatform-project:8080"
+    - name: AUDIT_SERVICE_URL
+      value: "http://bdsplatform-audit:8080"
+    - name: CLUSTER_SERVICE_URL
+      value: "http://bdsplatform-cluster:8080"
+    - name: DEPLOYMENT_SERVICE_URL
+      value: "http://bdsplatform-deployment:8080"
+    - name: SECRETS_SERVICE_URL
+      value: "http://bdsplatform-secrets:8080"
+    - name: DOMAIN_SERVICE_URL
+      value: "http://bdsplatform-domain:8080"
+    - name: NOTIFICATION_SERVICE_URL
+      value: "http://bdsplatform-notification:8080"
+    - name: PROVISIONING_SERVICE_URL
+      value: "http://bdsplatform-provisioning:8080"
+    - name: BUILD_SERVICE_URL
+      value: "http://bdsplatform-build:8080"
+    - name: OBSERVABILITY_SERVICE_URL
+      value: "http://bdsplatform-observability:8080"
   autoscaling:
     enabled: true
     minReplicas: 3
     maxReplicas: 30
+
+auth:
+  env:
+    # Required in prod/staging: session revocation before token expiry
+    - name: REDIS_URL
+      valueFrom:
+        secretKeyRef:
+          name: bdsplatform-runtime-secrets
+          key: REDIS_URL
+    # Required in prod/staging: encrypts SAML SP private keys at rest
+    - name: CERTIFICATE_ENCRYPTION_KEY
+      valueFrom:
+        secretKeyRef:
+          name: bdsplatform-runtime-secrets
+          key: CERTIFICATE_ENCRYPTION_KEY
+    # Required: shared token for internal service-to-service API calls
+    # (must match INTERNAL_API_TOKEN in cluster service)
+    - name: INTERNAL_API_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: bdsplatform-runtime-secrets
+          key: INTERNAL_API_TOKEN
+
+domain:
+  env:
+    # Required in prod/staging: encrypts TLS certificates and private keys at rest
+    - name: CERTIFICATE_ENCRYPTION_KEY
+      valueFrom:
+        secretKeyRef:
+          name: bdsplatform-runtime-secrets
+          key: CERTIFICATE_ENCRYPTION_KEY
+
+cluster:
+  env:
+    # Required in prod/staging: URL agents use to reach control plane
+    # (NOT the browser-facing gateway URL — must be reachable from customer k8s clusters)
+    - name: CONTROL_PLANE_PUBLIC_URL
+      valueFrom:
+        secretKeyRef:
+          name: bdsplatform-runtime-secrets
+          key: CONTROL_PLANE_PUBLIC_URL
+    # Required: shared token for internal service-to-service API calls
+    # (must match INTERNAL_API_TOKEN in auth service)
+    - name: INTERNAL_API_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: bdsplatform-runtime-secrets
+          key: INTERNAL_API_TOKEN
+
+provisioning:
+  env:
+    # Required in prod/staging: encrypts cloud credentials at rest (AES-256-GCM)
+    - name: CREDENTIAL_ENCRYPTION_KEY
+      valueFrom:
+        secretKeyRef:
+          name: bdsplatform-runtime-secrets
+          key: CREDENTIAL_ENCRYPTION_KEY
+    # Required for internal API calls to cluster service
+    - name: INTERNAL_API_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: bdsplatform-runtime-secrets
+          key: INTERNAL_API_TOKEN
+
+secrets:
+  env:
+    # Required ALWAYS: master key for encrypting user secrets at rest
+    - name: SECRETS_MASTER_KEY
+      valueFrom:
+        secretKeyRef:
+          name: bdsplatform-runtime-secrets
+          key: SECRETS_MASTER_KEY

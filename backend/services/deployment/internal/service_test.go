@@ -3,6 +3,7 @@ package deployment
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"testing"
 	"time"
 
@@ -96,6 +97,7 @@ func (f *fakeApplicationStore) Delete(ctx context.Context, id string) error {
 // ----------------------------------------------------------------------------
 
 type fakeDeploymentStore struct {
+	mu   sync.Mutex
 	deps map[string]*Deployment
 }
 
@@ -104,6 +106,8 @@ func newFakeDeploymentStore() *fakeDeploymentStore {
 }
 
 func (f *fakeDeploymentStore) Create(ctx context.Context, d *Deployment) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if d.ID == "" {
 		d.ID = uuid.NewString()
 	}
@@ -116,6 +120,8 @@ func (f *fakeDeploymentStore) Create(ctx context.Context, d *Deployment) error {
 }
 
 func (f *fakeDeploymentStore) GetByID(ctx context.Context, id string) (*Deployment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	d, ok := f.deps[id]
 	if !ok {
 		return nil, apperrors.NotFound("deployment not found")
@@ -124,6 +130,8 @@ func (f *fakeDeploymentStore) GetByID(ctx context.Context, id string) (*Deployme
 }
 
 func (f *fakeDeploymentStore) List(ctx context.Context, appID string, req database.PageRequest) (database.Page[Deployment], error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	var items []Deployment
 	for _, d := range f.deps {
 		if d.ApplicationID == appID {
@@ -134,6 +142,8 @@ func (f *fakeDeploymentStore) List(ctx context.Context, appID string, req databa
 }
 
 func (f *fakeDeploymentStore) ListByCluster(ctx context.Context, clusterID string, req database.PageRequest) (database.Page[Deployment], error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	var items []Deployment
 	for _, d := range f.deps {
 		if d.ClusterID == clusterID {
@@ -144,16 +154,21 @@ func (f *fakeDeploymentStore) ListByCluster(ctx context.Context, clusterID strin
 }
 
 func (f *fakeDeploymentStore) Update(ctx context.Context, d *Deployment) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if _, ok := f.deps[d.ID]; !ok {
 		return apperrors.NotFound("deployment not found")
 	}
 	d.Version++
 	d.UpdatedAt = time.Now()
-	f.deps[d.ID] = d
+	cp := *d
+	f.deps[d.ID] = &cp
 	return nil
 }
 
 func (f *fakeDeploymentStore) UpdateStatus(ctx context.Context, id, status string, readyReplicas *int, errorMsg *string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	d, ok := f.deps[id]
 	if !ok {
 		return apperrors.NotFound("deployment not found")
@@ -167,6 +182,8 @@ func (f *fakeDeploymentStore) UpdateStatus(ctx context.Context, id, status strin
 }
 
 func (f *fakeDeploymentStore) Delete(ctx context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if _, ok := f.deps[id]; !ok {
 		return apperrors.NotFound("deployment not found")
 	}
@@ -175,6 +192,8 @@ func (f *fakeDeploymentStore) Delete(ctx context.Context, id string) error {
 }
 
 func (f *fakeDeploymentStore) ListByOrg(ctx context.Context, req database.PageRequest) (database.Page[Deployment], error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	var items []Deployment
 	for _, d := range f.deps {
 		items = append(items, *d)
@@ -183,6 +202,8 @@ func (f *fakeDeploymentStore) ListByOrg(ctx context.Context, req database.PageRe
 }
 
 func (f *fakeDeploymentStore) SoftDelete(ctx context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if _, ok := f.deps[id]; !ok {
 		return apperrors.NotFound("deployment not found")
 	}
@@ -190,7 +211,26 @@ func (f *fakeDeploymentStore) SoftDelete(ctx context.Context, id string) error {
 	return nil
 }
 
+func (f *fakeDeploymentStore) GetLatestByEnvironment(ctx context.Context, envID string) (*Deployment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var latest *Deployment
+	for _, d := range f.deps {
+		if d.EnvironmentID != nil && *d.EnvironmentID == envID && d.Status != "deleted" {
+			if latest == nil || d.CreatedAt.After(latest.CreatedAt) {
+				latest = d
+			}
+		}
+	}
+	if latest == nil {
+		return nil, apperrors.NotFound("no deployment for environment")
+	}
+	return latest, nil
+}
+
 func (f *fakeDeploymentStore) ListAllActive(ctx context.Context) ([]Deployment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	var items []Deployment
 	for _, d := range f.deps {
 		if d.Status != "deleted" {
@@ -203,6 +243,7 @@ func (f *fakeDeploymentStore) ListAllActive(ctx context.Context) ([]Deployment, 
 // ----------------------------------------------------------------------------
 
 type fakeReleaseStore struct {
+	mu       sync.Mutex
 	releases map[string]*Release
 	byDep    map[string][]*Release
 }
@@ -215,16 +256,23 @@ func newFakeReleaseStore() *fakeReleaseStore {
 }
 
 func (f *fakeReleaseStore) Create(ctx context.Context, r *Release) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if r.ID == "" {
 		r.ID = uuid.NewString()
 	}
 	r.CreatedAt = time.Now()
+	// Store the original pointer so callers (and tests) that mutate the returned
+	// *Release after Create still affect the stored value. The mutex protects
+	// concurrent map writes; pointer sharing is intentional.
 	f.releases[r.ID] = r
 	f.byDep[r.DeploymentID] = append(f.byDep[r.DeploymentID], r)
 	return nil
 }
 
 func (f *fakeReleaseStore) GetByID(ctx context.Context, id string) (*Release, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	r, ok := f.releases[id]
 	if !ok {
 		return nil, apperrors.NotFound("release not found")
@@ -233,6 +281,8 @@ func (f *fakeReleaseStore) GetByID(ctx context.Context, id string) (*Release, er
 }
 
 func (f *fakeReleaseStore) GetByRevision(ctx context.Context, depID string, rev int) (*Release, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	for _, r := range f.byDep[depID] {
 		if r.Revision == rev {
 			return r, nil
@@ -242,6 +292,8 @@ func (f *fakeReleaseStore) GetByRevision(ctx context.Context, depID string, rev 
 }
 
 func (f *fakeReleaseStore) GetLatest(ctx context.Context, depID string) (*Release, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	rels := f.byDep[depID]
 	if len(rels) == 0 {
 		return nil, apperrors.NotFound("no releases")
@@ -250,6 +302,8 @@ func (f *fakeReleaseStore) GetLatest(ctx context.Context, depID string) (*Releas
 }
 
 func (f *fakeReleaseStore) GetPreviousSuccessful(ctx context.Context, depID string, beforeRev int) (*Release, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	rels := f.byDep[depID]
 	for i := len(rels) - 1; i >= 0; i-- {
 		if rels[i].Revision < beforeRev && rels[i].Status == ReleaseStatusSucceeded {
@@ -260,6 +314,8 @@ func (f *fakeReleaseStore) GetPreviousSuccessful(ctx context.Context, depID stri
 }
 
 func (f *fakeReleaseStore) List(ctx context.Context, depID string, req database.PageRequest) (database.Page[Release], error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	var items []Release
 	for _, r := range f.byDep[depID] {
 		items = append(items, *r)
@@ -268,6 +324,8 @@ func (f *fakeReleaseStore) List(ctx context.Context, depID string, req database.
 }
 
 func (f *fakeReleaseStore) UpdateStatus(ctx context.Context, id, status string, errorMsg *string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	r, ok := f.releases[id]
 	if !ok {
 		return apperrors.NotFound("release not found")
@@ -280,6 +338,8 @@ func (f *fakeReleaseStore) UpdateStatus(ctx context.Context, id, status string, 
 }
 
 func (f *fakeReleaseStore) MarkStarted(ctx context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	r, ok := f.releases[id]
 	if !ok {
 		return apperrors.NotFound("release not found")
@@ -291,6 +351,8 @@ func (f *fakeReleaseStore) MarkStarted(ctx context.Context, id string) error {
 }
 
 func (f *fakeReleaseStore) MarkFinished(ctx context.Context, id, status string, errorMsg *string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	r, ok := f.releases[id]
 	if !ok {
 		return apperrors.NotFound("release not found")
@@ -340,6 +402,27 @@ type fakeOrgMemberStoreAllow struct{}
 
 func (fakeOrgMemberStoreAllow) GetOrgMember(_ context.Context, userID string) (*authz.OrgMember, error) {
 	return &authz.OrgMember{UserID: userID, Role: authz.OrgOwner, Status: "active"}, nil
+}
+
+type fakeOrgMemberStoreRole struct {
+	orgID string
+	role  authz.OrgRole
+}
+
+func (f fakeOrgMemberStoreRole) GetOrgMember(_ context.Context, userID string) (*authz.OrgMember, error) {
+	return &authz.OrgMember{OrgID: f.orgID, UserID: userID, Role: f.role, Status: "active"}, nil
+}
+
+type fakeProjectMemberStore struct {
+	members map[string]authz.ProjectRole
+}
+
+func (f fakeProjectMemberStore) GetProjectMember(_ context.Context, projectID, userID string) (*authz.ProjectMember, error) {
+	role, ok := f.members[projectID+"/"+userID]
+	if !ok {
+		return nil, apperrors.NotFound("project member not found")
+	}
+	return &authz.ProjectMember{ProjectID: projectID, UserID: userID, Role: role}, nil
 }
 
 // ----------------------------------------------------------------------------
@@ -448,6 +531,49 @@ func TestCreateDeployment(t *testing.T) {
 	assert.Len(t, rels.releases, 1)
 	assert.Len(t, outbox.events, 1)
 	assert.Equal(t, EventDeploymentCreated, outbox.events[0].Type)
+}
+
+func TestProjectDeveloperCanCreateUpdateAndRollbackDeployment(t *testing.T) {
+	apps := newFakeApplicationStore()
+	deps := newFakeDeploymentStore()
+	rels := newFakeReleaseStore()
+	outbox := &fakeOutbox{}
+	orgID := uuid.NewString()
+	projectID := uuid.NewString()
+	userID := uuid.NewString()
+
+	svc := NewService(Deps{
+		Applications: apps,
+		Deployments:  deps,
+		Releases:     rels,
+		OrgMembers:   fakeOrgMemberStoreRole{orgID: orgID, role: authz.RoleMember},
+		ProjectMembers: fakeProjectMemberStore{members: map[string]authz.ProjectRole{
+			projectID + "/" + userID: authz.ProjectDeveloper,
+		}},
+		Outbox: outbox,
+		Tenant: &fakeTenant{},
+	})
+
+	app := &Application{ProjectID: projectID, Name: "Developer App", Slug: "developer-app"}
+	app.OrgID = orgID
+	require.NoError(t, apps.Create(context.Background(), app))
+
+	dep, firstRelease, err := svc.CreateDeployment(context.Background(), orgID, userID, CreateDeploymentRequest{
+		ApplicationID: app.ID,
+		ClusterID:     uuid.NewString(),
+		Image:         "nginx:1.0",
+		Replicas:      1,
+	})
+	require.NoError(t, err)
+	firstRelease.Status = ReleaseStatusSucceeded
+
+	image := "nginx:2.0"
+	_, _, err = svc.UpdateDeployment(context.Background(), orgID, userID, dep.ID, UpdateDeploymentRequest{Image: &image})
+	require.NoError(t, err)
+
+	rolledBack, _, err := svc.Rollback(context.Background(), orgID, userID, dep.ID, RollbackRequest{})
+	require.NoError(t, err)
+	assert.Equal(t, "nginx:1.0", rolledBack.Image)
 }
 
 func TestUpdateDeployment_CreatesNewRelease(t *testing.T) {

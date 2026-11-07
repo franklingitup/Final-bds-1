@@ -86,6 +86,16 @@ func Load() GatewayConfig {
 			BaseURL: getenv("PROVISIONING_SERVICE_URL", "http://localhost:8090"),
 			Timeout: getDuration("PROVISIONING_SERVICE_TIMEOUT", 60*time.Second),
 		},
+		BuildService: proxy.ServiceConfig{
+			Name:    "build",
+			BaseURL: getenv("BUILD_SERVICE_URL", "http://localhost:8091"),
+			Timeout: getDuration("BUILD_SERVICE_TIMEOUT", 60*time.Second),
+		},
+		ObservabilityService: proxy.ServiceConfig{
+			Name:    "observability",
+			BaseURL: getenv("OBSERVABILITY_SERVICE_URL", "http://localhost:8092"),
+			Timeout: getDuration("OBSERVABILITY_SERVICE_TIMEOUT", 60*time.Second),
+		},
 		},
 	}
 }

@@ -29,17 +29,18 @@ func argoUnavailable(msg string) error {
 
 // ArgoServiceDeps are the dependencies of the GitOps (Argo CD) service.
 type ArgoServiceDeps struct {
-	Client       argocd.Client
-	ArgoApps     ArgoApplicationStore
-	Applications ApplicationStore
-	Deployments  DeploymentStore
-	Releases     ReleaseStore
-	Rollouts     RolloutStatusStore
-	OrgMembers   authz.OrgMemberStore
-	Outbox       events.Outbox
-	Tenant       TenantRunner
-	Logger       *slog.Logger
-	Now          func() time.Time
+	Client         argocd.Client
+	ArgoApps       ArgoApplicationStore
+	Applications   ApplicationStore
+	Deployments    DeploymentStore
+	Releases       ReleaseStore
+	Rollouts       RolloutStatusStore
+	OrgMembers     authz.OrgMemberStore
+	ProjectMembers authz.ProjectMemberStore
+	Outbox         events.Outbox
+	Tenant         TenantRunner
+	Logger         *slog.Logger
+	Now            func() time.Time
 }
 
 // ArgoService owns the lifecycle of Argo CD Applications that back GitOps
@@ -71,6 +72,10 @@ func NewArgoService(d ArgoServiceDeps) *ArgoService {
 	if d.Now == nil {
 		d.Now = time.Now
 	}
+	authSvc := authz.NewAuthorizationService(d.Tenant, d.OrgMembers, nil)
+	if d.ProjectMembers != nil {
+		authSvc = authSvc.WithProjectMembers(d.ProjectMembers)
+	}
 	return &ArgoService{
 		client:   d.Client,
 		argoApps: d.ArgoApps,
@@ -80,7 +85,7 @@ func NewArgoService(d ArgoServiceDeps) *ArgoService {
 		rollouts: d.Rollouts,
 		outbox:   d.Outbox,
 		tenant:   d.Tenant,
-		authSvc:  authz.NewAuthorizationService(d.Tenant, d.OrgMembers, nil),
+		authSvc:  authSvc,
 		log:      d.Logger,
 		now:      d.Now,
 		tracer:   telemetry.Tracer("deployment-gitops"),
@@ -94,7 +99,7 @@ func NewArgoService(d ArgoServiceDeps) *ArgoService {
 //
 // SECURITY: Requires org membership with deployment write privileges.
 func (s *ArgoService) RegisterApplication(ctx context.Context, orgID, userID, deploymentID string, src GitOpsSource) (*ArgoApplication, error) {
-	if _, err := s.authSvc.AuthorizeOrgMember(ctx, orgID, userID, authz.ActionDeploy); err != nil {
+	if err := s.authorizeDeployment(ctx, orgID, userID, deploymentID, authz.ActionDeploy); err != nil {
 		return nil, err
 	}
 	if strings.TrimSpace(src.RepoURL) == "" {
@@ -158,7 +163,7 @@ func (s *ArgoService) RegisterApplication(ctx context.Context, orgID, userID, de
 //
 // SECURITY: Requires org membership with deployment write privileges.
 func (s *ArgoService) Sync(ctx context.Context, orgID, userID, deploymentID string, req ArgoSyncRequest) (*ArgoApplication, error) {
-	if _, err := s.authSvc.AuthorizeOrgMember(ctx, orgID, userID, authz.ActionDeploy); err != nil {
+	if err := s.authorizeDeployment(ctx, orgID, userID, deploymentID, authz.ActionDeploy); err != nil {
 		return nil, err
 	}
 
@@ -210,7 +215,7 @@ func (s *ArgoService) Sync(ctx context.Context, orgID, userID, deploymentID stri
 //
 // SECURITY: Requires org membership with deployment write privileges.
 func (s *ArgoService) Rollback(ctx context.Context, orgID, userID, deploymentID string, req ArgoRollbackRequest) (*ArgoApplication, error) {
-	if _, err := s.authSvc.AuthorizeOrgMember(ctx, orgID, userID, authz.ActionDeploy); err != nil {
+	if err := s.authorizeDeployment(ctx, orgID, userID, deploymentID, authz.ActionDeploy); err != nil {
 		return nil, err
 	}
 	if req.Revision == "" && req.HistoryID == nil {
@@ -249,10 +254,10 @@ func (s *ArgoService) Rollback(ctx context.Context, orgID, userID, deploymentID 
 	// Emit deployment.rollback.started (tenant-scoped, transactional outbox).
 	_ = s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
 		return s.emit(ctx, orgID, EventDeploymentRollbackStarted, deploymentID, deploymentRollbackStartedPayload{
-			DeploymentID: deploymentID,
-			FromRevision: 0,
+			DeploymentID:   deploymentID,
+			FromRevision:   0,
 			TargetRevision: 0,
-			Reason:       fmt.Sprintf("argocd rollback to revision %s (history %d)", req.Revision, historyID),
+			Reason:         fmt.Sprintf("argocd rollback to revision %s (history %d)", req.Revision, historyID),
 		})
 	})
 
@@ -264,7 +269,7 @@ func (s *ArgoService) Rollback(ctx context.Context, orgID, userID, deploymentID 
 
 // GetBinding returns the GitOps binding for a deployment (RBAC: org read).
 func (s *ArgoService) GetBinding(ctx context.Context, orgID, userID, deploymentID string) (*ArgoApplication, error) {
-	if _, err := s.authSvc.AuthorizeOrgRead(ctx, orgID, userID); err != nil {
+	if err := s.authorizeDeployment(ctx, orgID, userID, deploymentID, authz.ActionReadDeployment); err != nil {
 		return nil, err
 	}
 	var record *ArgoApplication
@@ -317,6 +322,30 @@ func (s *ArgoService) getBinding(ctx context.Context, deploymentID string) (*Arg
 		return nil, err
 	}
 	return record, nil
+}
+
+func (s *ArgoService) authorizeDeployment(ctx context.Context, orgID, userID, deploymentID string, action authz.Action) error {
+	if _, err := s.authSvc.AuthorizeOrgRead(ctx, orgID, userID); err != nil {
+		return err
+	}
+	var projectID string
+	err := s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
+		dep, err := s.deps.GetByID(ctx, deploymentID)
+		if err != nil {
+			return err
+		}
+		app, err := s.apps.GetByID(ctx, dep.ApplicationID)
+		if err != nil {
+			return err
+		}
+		projectID = app.ProjectID
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	_, err = s.authSvc.AuthorizeProjectMember(ctx, orgID, projectID, userID, action)
+	return err
 }
 
 // buildRecord assembles the persisted ArgoApplication from a deployment,

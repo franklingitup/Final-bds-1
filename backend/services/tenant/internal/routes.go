@@ -8,9 +8,11 @@ import "github.com/gofiber/fiber/v2"
 // routes require authentication; per-operation authorization is enforced in the
 // service layer via libs/authz against the caller's membership role.
 func RegisterRoutes(app *fiber.App, h *Handler) {
-	v1 := app.Group("/v1", h.RequireAuth())
+	v1 := app.Group("/v1")
 
-	orgs := v1.Group("/organizations")
+	// Organization management. Auth is scoped to this path,
+	// not the entire /v1 prefix, to avoid intercepting any future public routes.
+	orgs := v1.Group("/organizations", h.RequireAuth())
 	orgs.Get("", h.ListOrganizations)                      // API-CRIT-01
 	orgs.Post("", h.CreateOrganization)
 	orgs.Get("/by-slug/:slug", h.GetOrganizationBySlug)    // API-CRIT-02
@@ -29,5 +31,6 @@ func RegisterRoutes(app *fiber.App, h *Handler) {
 	orgs.Delete("/:orgId/invitations/:id", h.RevokeInvitation)
 
 	// Accept is keyed on the invitation token, not an org path.
-	v1.Post("/invitations/accept", h.AcceptInvite)
+	// Auth is applied directly to this route.
+	v1.Post("/invitations/accept", h.RequireAuth(), h.AcceptInvite)
 }

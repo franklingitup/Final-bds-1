@@ -10,6 +10,14 @@ import (
 	apperrors "github.com/bdsplatform/platform/backend/libs/errors"
 )
 
+// Locals keys set by AgentAuthMiddleware so other packages (e.g. pipeline)
+// can read the authenticated agent without importing this package's context key.
+const (
+	LocalAgentOrgID     = "deployment_agent_org_id"
+	LocalAgentClusterID = "deployment_agent_cluster_id"
+	LocalAgentID        = "deployment_agent_id"
+)
+
 // agentContextKey is used to store agent identity in request context.
 type agentContextKey struct{}
 
@@ -61,6 +69,10 @@ func AgentAuthMiddleware(validator ClusterValidator) fiber.Handler {
 			OrganizationID: orgID,
 			AgentID:        agentID,
 		}
+
+		c.Locals(LocalAgentOrgID, orgID)
+		c.Locals(LocalAgentClusterID, clusterID)
+		c.Locals(LocalAgentID, agentID)
 
 		ctx := context.WithValue(c.UserContext(), agentContextKey{}, identity)
 		c.SetUserContext(ctx)

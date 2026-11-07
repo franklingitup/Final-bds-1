@@ -14,7 +14,8 @@
 //   - RECONCILE_INTERVAL: How often to reconcile deployments (default: 30s)
 //   - STATE_FILE: Path to persist agent state (default: /var/lib/platform-agent/state.json)
 //   - RECONCILER_STATE_FILE: Path to persist reconciler state
-//   - NAMESPACE: Kubernetes namespace for workloads (default: default)
+//   - NAMESPACE: Agent operational namespace (default: default)
+//   - MANAGED_NAMESPACE_PREFIX: Customer project namespace prefix (default: proj-)
 //   - RECONCILER_ENABLED: Enable/disable reconciler (true/false)
 //
 // When reconciler is enabled, the agent uses its registered cluster credentials
@@ -42,7 +43,9 @@ import (
 	"github.com/bdsplatform/platform/agents/platform-agent/internal/inventory"
 	"github.com/bdsplatform/platform/agents/platform-agent/internal/k8s"
 	"github.com/bdsplatform/platform/agents/platform-agent/internal/leaderelection"
+	"github.com/bdsplatform/platform/agents/platform-agent/internal/logshipper"
 	"github.com/bdsplatform/platform/agents/platform-agent/internal/metrics"
+	"github.com/bdsplatform/platform/agents/platform-agent/internal/metricscollector"
 	"github.com/bdsplatform/platform/agents/platform-agent/internal/reconciler"
 	"github.com/bdsplatform/platform/agents/platform-agent/internal/secrets"
 )
@@ -120,7 +123,7 @@ func main() {
 	if cfg.ReconcilerEnabled {
 		log.Info("deployment reconciler enabled",
 			"interval", cfg.ReconcileInterval,
-			"namespace", cfg.Namespace)
+			"managed_namespace_prefix", cfg.ManagedNamespacePrefix)
 		workerFactory.ReconcilerFactory = makeReconcilerFactory(cfg, client, log, isLeaderFn)
 	} else {
 		log.Info("deployment reconciler disabled")
@@ -133,6 +136,25 @@ func main() {
 		workerFactory.SecretsSyncerFactory = makeSecretsSyncerFactory(cfg, client, log, isLeaderFn)
 	} else {
 		log.Info("secrets syncer disabled")
+	}
+
+	if cfg.MetricsCollectorEnabled {
+		log.Info("metrics collector enabled",
+			"interval", cfg.MetricsCollectorInterval,
+			"managed_namespace_prefix", cfg.ManagedNamespacePrefix)
+		workerFactory.MetricsCollectorFactory = makeMetricsCollectorFactory(cfg, client, log, isLeaderFn)
+	} else {
+		log.Info("metrics collector disabled")
+	}
+
+	if cfg.LogShipperEnabled {
+		log.Info("log shipper enabled",
+			"batch_interval", cfg.LogShipperBatchInterval,
+			"max_tailed_pods", cfg.MaxTailedPods,
+			"managed_namespace_prefix", cfg.ManagedNamespacePrefix)
+		workerFactory.LogShipperFactory = makeLogShipperFactory(cfg, client, log, isLeaderFn)
+	} else {
+		log.Info("log shipper disabled")
 	}
 
 	a.SetWorkerFactory(workerFactory)
@@ -194,15 +216,16 @@ func makeReconcilerFactory(cfg config.Config, client *controlplane.Client, log *
 		}
 
 		// Create Kubernetes manager.
-		manager := k8s.NewManager(k8sClient, cfg.Namespace)
+		manager := k8s.NewManager(k8sClient, cfg.Namespace, cfg.ManagedNamespacePrefix)
 
 		// Create reconciler with the provided credentials.
 		recCfg := reconciler.Config{
-			Interval:         cfg.ReconcileInterval,
-			StateFile:        cfg.ReconcilerStateFile,
-			Namespace:        cfg.Namespace,
-			AgentCredentials: creds,
-			IsLeader:         isLeader,
+			Interval:               cfg.ReconcileInterval,
+			StateFile:              cfg.ReconcilerStateFile,
+			Namespace:              cfg.Namespace,
+			ManagedNamespacePrefix: cfg.ManagedNamespacePrefix,
+			AgentCredentials:       creds,
+			IsLeader:               isLeader,
 		}
 
 		rec := reconciler.New(
@@ -213,6 +236,77 @@ func makeReconcilerFactory(cfg config.Config, client *controlplane.Client, log *
 		)
 
 		return rec, nil
+	}
+}
+
+// makeLogShipperFactory returns a factory function that creates the log shipper
+// with the provided credentials. This is called AFTER registration to ensure
+// valid credentials are available.
+func makeLogShipperFactory(cfg config.Config, client *controlplane.Client, log *slog.Logger, isLeader func() bool) func(creds controlplane.AgentCredentials) (*logshipper.Shipper, error) {
+	return func(creds controlplane.AgentCredentials) (*logshipper.Shipper, error) {
+		// Create Kubernetes client.
+		k8sConfig, err := rest.InClusterConfig()
+		if err != nil {
+			return nil, err
+		}
+
+		k8sClient, err := kubernetes.NewForConfig(k8sConfig)
+		if err != nil {
+			return nil, err
+		}
+
+		// Create shipper config.
+		shipperCfg := logshipper.Config{
+			BatchInterval:          cfg.LogShipperBatchInterval,
+			MaxTailedPods:          cfg.MaxTailedPods,
+			ManagedNamespacePrefix: cfg.ManagedNamespacePrefix,
+			AgentCredentials:       creds,
+			IsLeader:               isLeader,
+		}
+
+		shipper := logshipper.New(
+			client,
+			k8sClient,
+			shipperCfg,
+			log.With("component", "log-shipper"),
+		)
+
+		return shipper, nil
+	}
+}
+
+// makeMetricsCollectorFactory returns a factory function that creates the metrics
+// collector with the provided credentials. This is called AFTER registration to
+// ensure valid credentials are available.
+func makeMetricsCollectorFactory(cfg config.Config, client *controlplane.Client, log *slog.Logger, isLeader func() bool) func(creds controlplane.AgentCredentials) (*metricscollector.Collector, error) {
+	return func(creds controlplane.AgentCredentials) (*metricscollector.Collector, error) {
+		// Create Kubernetes client.
+		k8sConfig, err := rest.InClusterConfig()
+		if err != nil {
+			return nil, err
+		}
+
+		k8sClient, err := kubernetes.NewForConfig(k8sConfig)
+		if err != nil {
+			return nil, err
+		}
+
+		// Create collector config.
+		collectorCfg := metricscollector.Config{
+			Interval:               cfg.MetricsCollectorInterval,
+			ManagedNamespacePrefix: cfg.ManagedNamespacePrefix,
+			AgentCredentials:       creds,
+			IsLeader:               isLeader,
+		}
+
+		collector := metricscollector.New(
+			client,
+			k8sClient,
+			collectorCfg,
+			log.With("component", "metrics-collector"),
+		)
+
+		return collector, nil
 	}
 }
 

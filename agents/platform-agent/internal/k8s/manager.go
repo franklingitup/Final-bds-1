@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -33,21 +34,81 @@ const (
 	AnnotationReleaseID = "bdsplatform.io/release-id"
 )
 
+// ResourceKey uniquely identifies a namespaced Kubernetes object.
+func ResourceKey(namespace, name string) string { return namespace + "/" + name }
+
+func (m *Manager) resourceLocation(key string) (string, string) {
+	if namespace, name, ok := strings.Cut(key, "/"); ok {
+		return namespace, name
+	}
+	return m.namespace, key
+}
+
+func (m *Manager) managesNamespace(namespace string) bool {
+	return m.managedNamespacePrefix == "" || strings.HasPrefix(namespace, m.managedNamespacePrefix)
+}
+
 // Manager manages Kubernetes resources for platform deployments.
 type Manager struct {
-	client    kubernetes.Interface
-	namespace string
+	client                 kubernetes.Interface
+	namespace              string
+	managedNamespacePrefix string
 }
 
 // NewManager creates a new Kubernetes resource manager.
-func NewManager(client kubernetes.Interface, namespace string) *Manager {
+func NewManager(client kubernetes.Interface, namespace string, managedNamespacePrefix ...string) *Manager {
 	if namespace == "" {
 		namespace = "default"
 	}
-	return &Manager{
-		client:    client,
-		namespace: namespace,
+	prefix := ""
+	if len(managedNamespacePrefix) > 0 {
+		prefix = managedNamespacePrefix[0]
 	}
+	return &Manager{
+		client:                 client,
+		namespace:              namespace,
+		managedNamespacePrefix: prefix,
+	}
+}
+
+// EnsureNamespace creates a customer workload namespace when it does not exist.
+func (m *Manager) EnsureNamespace(ctx context.Context, namespace string) error {
+	if namespace == "" || namespace == m.namespace {
+		return fmt.Errorf("refusing to use agent namespace %q for customer workloads", namespace)
+	}
+	_, err := m.client.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{})
+	if err == nil {
+		return nil
+	}
+	if !errors.IsNotFound(err) {
+		return fmt.Errorf("get namespace %q: %w", namespace, err)
+	}
+	_, err = m.client.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: namespace,
+			Labels: map[string]string{
+				LabelManagedBy: LabelManagedByValue,
+			},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil && !errors.IsAlreadyExists(err) {
+		return fmt.Errorf("create namespace %q: %w", namespace, err)
+	}
+	return nil
+}
+
+// HasLegacyDeployment reports whether an existing workload still lives in the
+// agent's operational namespace. Forward-only namespace isolation leaves such
+// workloads untouched until an explicit migration is requested.
+func (m *Manager) HasLegacyDeployment(ctx context.Context, name string) (bool, error) {
+	_, err := m.client.AppsV1().Deployments(m.namespace).Get(ctx, name, metav1.GetOptions{})
+	if errors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("get legacy deployment %q: %w", name, err)
+	}
+	return true, nil
 }
 
 // DeploymentSpec represents the desired state for a Kubernetes Deployment.
@@ -56,6 +117,7 @@ type DeploymentSpec struct {
 	ReleaseID       string
 	ApplicationName string
 	ApplicationSlug string
+	Namespace       string
 	Image           string
 	Replicas        int32
 	Port            *int32
@@ -81,6 +143,7 @@ func FromDesiredDeployment(d controlplane.DesiredDeployment) DeploymentSpec {
 		ReleaseID:       d.ReleaseID,
 		ApplicationName: d.ApplicationName,
 		ApplicationSlug: d.ApplicationSlug,
+		Namespace:       d.Namespace,
 		Image:           d.Image,
 		Replicas:        int32(d.Replicas),
 		Revision:        d.Revision,
@@ -145,6 +208,10 @@ type ApplyResult struct {
 // ApplyDeployment creates or updates a Kubernetes Deployment.
 func (m *Manager) ApplyDeployment(ctx context.Context, spec DeploymentSpec) (*ApplyResult, error) {
 	name := spec.ResourceName()
+	namespace := spec.Namespace
+	if namespace == "" {
+		namespace = m.namespace
+	}
 	labels := map[string]string{
 		LabelManagedBy:       LabelManagedByValue,
 		LabelDeploymentID:    spec.DeploymentID,
@@ -167,7 +234,7 @@ func (m *Manager) ApplyDeployment(ctx context.Context, spec DeploymentSpec) (*Ap
 	desired := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        name,
-			Namespace:   m.namespace,
+			Namespace:   namespace,
 			Labels:      labels,
 			Annotations: annotations,
 		},
@@ -210,10 +277,10 @@ func (m *Manager) ApplyDeployment(ctx context.Context, spec DeploymentSpec) (*Ap
 	}
 
 	// Try to get existing deployment.
-	existing, err := m.client.AppsV1().Deployments(m.namespace).Get(ctx, name, metav1.GetOptions{})
+	existing, err := m.client.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
 	if errors.IsNotFound(err) {
 		// Create new deployment.
-		_, err := m.client.AppsV1().Deployments(m.namespace).Create(ctx, desired, metav1.CreateOptions{})
+		_, err := m.client.AppsV1().Deployments(namespace).Create(ctx, desired, metav1.CreateOptions{})
 		if err != nil {
 			return nil, fmt.Errorf("create deployment: %w", err)
 		}
@@ -235,7 +302,7 @@ func (m *Manager) ApplyDeployment(ctx context.Context, spec DeploymentSpec) (*Ap
 	existing.Spec.Template.Labels = desired.Spec.Template.Labels
 	existing.Spec.Template.Annotations = desired.Spec.Template.Annotations
 
-	_, err = m.client.AppsV1().Deployments(m.namespace).Update(ctx, existing, metav1.UpdateOptions{})
+	_, err = m.client.AppsV1().Deployments(namespace).Update(ctx, existing, metav1.UpdateOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("update deployment: %w", err)
 	}
@@ -275,6 +342,10 @@ func (m *Manager) ApplyService(ctx context.Context, spec DeploymentSpec) (*Apply
 	}
 
 	name := spec.ResourceName()
+	namespace := spec.Namespace
+	if namespace == "" {
+		namespace = m.namespace
+	}
 	labels := map[string]string{
 		LabelManagedBy:       LabelManagedByValue,
 		LabelDeploymentID:    spec.DeploymentID,
@@ -285,7 +356,7 @@ func (m *Manager) ApplyService(ctx context.Context, spec DeploymentSpec) (*Apply
 	desired := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
-			Namespace: m.namespace,
+			Namespace: namespace,
 			Labels:    labels,
 		},
 		Spec: corev1.ServiceSpec{
@@ -305,10 +376,10 @@ func (m *Manager) ApplyService(ctx context.Context, spec DeploymentSpec) (*Apply
 	}
 
 	// Try to get existing service.
-	existing, err := m.client.CoreV1().Services(m.namespace).Get(ctx, name, metav1.GetOptions{})
+	existing, err := m.client.CoreV1().Services(namespace).Get(ctx, name, metav1.GetOptions{})
 	if errors.IsNotFound(err) {
 		// Create new service.
-		_, err := m.client.CoreV1().Services(m.namespace).Create(ctx, desired, metav1.CreateOptions{})
+		_, err := m.client.CoreV1().Services(namespace).Create(ctx, desired, metav1.CreateOptions{})
 		if err != nil {
 			return nil, fmt.Errorf("create service: %w", err)
 		}
@@ -334,7 +405,7 @@ func (m *Manager) ApplyService(ctx context.Context, spec DeploymentSpec) (*Apply
 	existing.Spec.Ports = desired.Spec.Ports
 	existing.Labels = desired.Labels
 
-	_, err = m.client.CoreV1().Services(m.namespace).Update(ctx, existing, metav1.UpdateOptions{})
+	_, err = m.client.CoreV1().Services(namespace).Update(ctx, existing, metav1.UpdateOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("update service: %w", err)
 	}
@@ -342,8 +413,8 @@ func (m *Manager) ApplyService(ctx context.Context, spec DeploymentSpec) (*Apply
 }
 
 // GetDeploymentStatus returns the current status of a Kubernetes Deployment.
-func (m *Manager) GetDeploymentStatus(ctx context.Context, name string) (*DeploymentStatus, error) {
-	dep, err := m.client.AppsV1().Deployments(m.namespace).Get(ctx, name, metav1.GetOptions{})
+func (m *Manager) GetDeploymentStatus(ctx context.Context, namespace, name string) (*DeploymentStatus, error) {
+	dep, err := m.client.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
 	if errors.IsNotFound(err) {
 		return nil, nil
 	}
@@ -464,19 +535,19 @@ type PodHealth struct {
 // fatalWaitingReasons are container waiting reasons that indicate a pod will
 // not become ready without intervention (a new image, config or code fix).
 var fatalWaitingReasons = map[string]bool{
-	"ImagePullBackOff":  true,
-	"ErrImagePull":      true,
-	"CrashLoopBackOff":  true,
+	"ImagePullBackOff":           true,
+	"ErrImagePull":               true,
+	"CrashLoopBackOff":           true,
 	"CreateContainerConfigError": true,
-	"InvalidImageName":  true,
+	"InvalidImageName":           true,
 }
 
 // GetPodHealth lists the pods for a deployment (by the app=<slug> selector the
 // agent applies) and reports the first fatal issue found, if any. It never
 // returns an error for an empty pod list (a freshly-created deployment simply
 // has no pods yet) and is safe to call every reconcile cycle.
-func (m *Manager) GetPodHealth(ctx context.Context, appSlug string) (*PodHealth, error) {
-	list, err := m.client.CoreV1().Pods(m.namespace).List(ctx, metav1.ListOptions{
+func (m *Manager) GetPodHealth(ctx context.Context, namespace, appSlug string) (*PodHealth, error) {
+	list, err := m.client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: fmt.Sprintf("app=%s", appSlug),
 	})
 	if err != nil {
@@ -518,14 +589,15 @@ func (m *Manager) GetPodHealth(ctx context.Context, appSlug string) (*PodHealth,
 
 // DeleteDeployment deletes a Kubernetes Deployment and its Service.
 func (m *Manager) DeleteDeployment(ctx context.Context, name string) error {
+	namespace, name := m.resourceLocation(name)
 	// Delete deployment.
-	err := m.client.AppsV1().Deployments(m.namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	err := m.client.AppsV1().Deployments(namespace).Delete(ctx, name, metav1.DeleteOptions{})
 	if err != nil && !errors.IsNotFound(err) {
 		return fmt.Errorf("delete deployment: %w", err)
 	}
 
 	// Delete service.
-	err = m.client.CoreV1().Services(m.namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	err = m.client.CoreV1().Services(namespace).Delete(ctx, name, metav1.DeleteOptions{})
 	if err != nil && !errors.IsNotFound(err) {
 		return fmt.Errorf("delete service: %w", err)
 	}
@@ -536,7 +608,11 @@ func (m *Manager) DeleteDeployment(ctx context.Context, name string) error {
 // ListManagedDeployments returns all deployments managed by the platform agent.
 func (m *Manager) ListManagedDeployments(ctx context.Context) ([]string, error) {
 	selector := fmt.Sprintf("%s=%s", LabelManagedBy, LabelManagedByValue)
-	list, err := m.client.AppsV1().Deployments(m.namespace).List(ctx, metav1.ListOptions{
+	namespace := m.namespace
+	if m.managedNamespacePrefix != "" {
+		namespace = corev1.NamespaceAll
+	}
+	list, err := m.client.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: selector,
 	})
 	if err != nil {
@@ -545,7 +621,14 @@ func (m *Manager) ListManagedDeployments(ctx context.Context) ([]string, error) 
 
 	var names []string
 	for _, dep := range list.Items {
-		names = append(names, dep.Name)
+		if !m.managesNamespace(dep.Namespace) {
+			continue
+		}
+		if m.managedNamespacePrefix == "" {
+			names = append(names, dep.Name)
+		} else {
+			names = append(names, ResourceKey(dep.Namespace, dep.Name))
+		}
 	}
 	return names, nil
 }
@@ -699,7 +782,8 @@ func binaryDataEqual(a, b map[string][]byte) bool {
 // deletes a ConfigMap that is not platform-owned, and treats an already-absent
 // ConfigMap as success.
 func (m *Manager) DeleteConfigMap(ctx context.Context, name string) error {
-	existing, err := m.client.CoreV1().ConfigMaps(m.namespace).Get(ctx, name, metav1.GetOptions{})
+	namespace, name := m.resourceLocation(name)
+	existing, err := m.client.CoreV1().ConfigMaps(namespace).Get(ctx, name, metav1.GetOptions{})
 	if errors.IsNotFound(err) {
 		return nil
 	}
@@ -711,7 +795,7 @@ func (m *Manager) DeleteConfigMap(ctx context.Context, name string) error {
 		return fmt.Errorf("refusing to delete configmap %q not managed by %s", name, LabelManagedByValue)
 	}
 
-	err = m.client.CoreV1().ConfigMaps(m.namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	err = m.client.CoreV1().ConfigMaps(namespace).Delete(ctx, name, metav1.DeleteOptions{})
 	if err != nil && !errors.IsNotFound(err) {
 		return fmt.Errorf("delete configmap: %w", err)
 	}
@@ -722,7 +806,11 @@ func (m *Manager) DeleteConfigMap(ctx context.Context, name string) error {
 // platform agent, used for orphan garbage collection.
 func (m *Manager) ListManagedConfigMaps(ctx context.Context) ([]string, error) {
 	selector := fmt.Sprintf("%s=%s", LabelManagedBy, LabelManagedByValue)
-	list, err := m.client.CoreV1().ConfigMaps(m.namespace).List(ctx, metav1.ListOptions{
+	namespace := m.namespace
+	if m.managedNamespacePrefix != "" {
+		namespace = corev1.NamespaceAll
+	}
+	list, err := m.client.CoreV1().ConfigMaps(namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: selector,
 	})
 	if err != nil {
@@ -731,7 +819,14 @@ func (m *Manager) ListManagedConfigMaps(ctx context.Context) ([]string, error) {
 
 	names := make([]string, 0, len(list.Items))
 	for _, cm := range list.Items {
-		names = append(names, cm.Name)
+		if !m.managesNamespace(cm.Namespace) {
+			continue
+		}
+		if m.managedNamespacePrefix == "" {
+			names = append(names, cm.Name)
+		} else {
+			names = append(names, ResourceKey(cm.Namespace, cm.Name))
+		}
 	}
 	return names, nil
 }
@@ -975,7 +1070,8 @@ func accessModesEqual(a, b []corev1.PersistentVolumeAccessMode) bool {
 // DeletePVC deletes a PVC owned by the platform agent. It never deletes a PVC
 // that is not platform-owned, and treats an already-absent PVC as success.
 func (m *Manager) DeletePVC(ctx context.Context, name string) error {
-	existing, err := m.client.CoreV1().PersistentVolumeClaims(m.namespace).Get(ctx, name, metav1.GetOptions{})
+	namespace, name := m.resourceLocation(name)
+	existing, err := m.client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, name, metav1.GetOptions{})
 	if errors.IsNotFound(err) {
 		return nil
 	}
@@ -987,7 +1083,7 @@ func (m *Manager) DeletePVC(ctx context.Context, name string) error {
 		return fmt.Errorf("refusing to delete pvc %q not managed by %s", name, LabelManagedByValue)
 	}
 
-	err = m.client.CoreV1().PersistentVolumeClaims(m.namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	err = m.client.CoreV1().PersistentVolumeClaims(namespace).Delete(ctx, name, metav1.DeleteOptions{})
 	if err != nil && !errors.IsNotFound(err) {
 		return fmt.Errorf("delete pvc: %w", err)
 	}
@@ -998,7 +1094,11 @@ func (m *Manager) DeletePVC(ctx context.Context, name string) error {
 // used for orphan garbage collection.
 func (m *Manager) ListManagedPVCs(ctx context.Context) ([]string, error) {
 	selector := fmt.Sprintf("%s=%s", LabelManagedBy, LabelManagedByValue)
-	list, err := m.client.CoreV1().PersistentVolumeClaims(m.namespace).List(ctx, metav1.ListOptions{
+	namespace := m.namespace
+	if m.managedNamespacePrefix != "" {
+		namespace = corev1.NamespaceAll
+	}
+	list, err := m.client.CoreV1().PersistentVolumeClaims(namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: selector,
 	})
 	if err != nil {
@@ -1007,7 +1107,14 @@ func (m *Manager) ListManagedPVCs(ctx context.Context) ([]string, error) {
 
 	names := make([]string, 0, len(list.Items))
 	for _, pvc := range list.Items {
-		names = append(names, pvc.Name)
+		if !m.managesNamespace(pvc.Namespace) {
+			continue
+		}
+		if m.managedNamespacePrefix == "" {
+			names = append(names, pvc.Name)
+		} else {
+			names = append(names, ResourceKey(pvc.Namespace, pvc.Name))
+		}
 	}
 	return names, nil
 }
@@ -1299,7 +1406,8 @@ func stringSetEqual(a, b []string) bool {
 // an Ingress that is not platform-owned, and treats an already-absent Ingress as
 // success.
 func (m *Manager) DeleteIngress(ctx context.Context, name string) error {
-	existing, err := m.client.NetworkingV1().Ingresses(m.namespace).Get(ctx, name, metav1.GetOptions{})
+	namespace, name := m.resourceLocation(name)
+	existing, err := m.client.NetworkingV1().Ingresses(namespace).Get(ctx, name, metav1.GetOptions{})
 	if errors.IsNotFound(err) {
 		return nil
 	}
@@ -1311,7 +1419,7 @@ func (m *Manager) DeleteIngress(ctx context.Context, name string) error {
 		return fmt.Errorf("refusing to delete ingress %q not managed by %s", name, LabelManagedByValue)
 	}
 
-	err = m.client.NetworkingV1().Ingresses(m.namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	err = m.client.NetworkingV1().Ingresses(namespace).Delete(ctx, name, metav1.DeleteOptions{})
 	if err != nil && !errors.IsNotFound(err) {
 		return fmt.Errorf("delete ingress: %w", err)
 	}
@@ -1322,7 +1430,11 @@ func (m *Manager) DeleteIngress(ctx context.Context, name string) error {
 // platform agent, used for orphan garbage collection.
 func (m *Manager) ListManagedIngresses(ctx context.Context) ([]string, error) {
 	selector := fmt.Sprintf("%s=%s", LabelManagedBy, LabelManagedByValue)
-	list, err := m.client.NetworkingV1().Ingresses(m.namespace).List(ctx, metav1.ListOptions{
+	namespace := m.namespace
+	if m.managedNamespacePrefix != "" {
+		namespace = corev1.NamespaceAll
+	}
+	list, err := m.client.NetworkingV1().Ingresses(namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: selector,
 	})
 	if err != nil {
@@ -1331,7 +1443,14 @@ func (m *Manager) ListManagedIngresses(ctx context.Context) ([]string, error) {
 
 	names := make([]string, 0, len(list.Items))
 	for _, ing := range list.Items {
-		names = append(names, ing.Name)
+		if !m.managesNamespace(ing.Namespace) {
+			continue
+		}
+		if m.managedNamespacePrefix == "" {
+			names = append(names, ing.Name)
+		} else {
+			names = append(names, ResourceKey(ing.Namespace, ing.Name))
+		}
 	}
 	return names, nil
 }

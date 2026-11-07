@@ -169,6 +169,13 @@ type ClusterAddon struct {
 	Config  map[string]interface{} `json:"config,omitempty"`
 }
 
+// ProvisioningConfig stores wizard configuration not represented by dedicated
+// provisioning_requests columns.
+type ProvisioningConfig struct {
+	Networking *NetworkingConfig `json:"networking,omitempty"`
+	Addons     []ClusterAddon    `json:"addons,omitempty"`
+}
+
 // ----------------------------------------------------------------------------
 // Provisioning Request
 // ----------------------------------------------------------------------------
@@ -419,6 +426,8 @@ type ProvisioningRequestView struct {
 	Region          string                 `json:"region"`
 	K8sVersion      string                 `json:"k8sVersion"`
 	NodePools       []NodePool             `json:"nodePools"`
+	Networking      *NetworkingConfig      `json:"networking,omitempty"`
+	Addons          []ClusterAddon         `json:"addons,omitempty"`
 	Status          string                 `json:"status"`
 	ClusterID       *string                `json:"clusterId,omitempty"`
 	ErrorMessage    *string                `json:"errorMessage,omitempty"`
@@ -431,8 +440,10 @@ type ProvisioningRequestView struct {
 
 func ToProvisioningRequestView(r *ProvisioningRequest) ProvisioningRequestView {
 	var nodePools []NodePool
+	var config ProvisioningConfig
 	var tfVars map[string]interface{}
 	_ = json.Unmarshal(r.NodePools, &nodePools)
+	_ = json.Unmarshal(r.Config, &config)
 	_ = json.Unmarshal(r.TerraformVars, &tfVars)
 
 	view := ProvisioningRequestView{
@@ -442,6 +453,8 @@ func ToProvisioningRequestView(r *ProvisioningRequest) ProvisioningRequestView {
 		Region:          r.Region,
 		K8sVersion:      r.K8sVersion,
 		NodePools:       nodePools,
+		Networking:      config.Networking,
+		Addons:          config.Addons,
 		Status:          r.Status,
 		ClusterID:       r.ClusterID,
 		ErrorMessage:    r.ErrorMessage,
@@ -480,18 +493,19 @@ type InstallSessionView struct {
 // SessionBundle is the token-authenticated installer payload. It contains only
 // the generated Terraform inputs and install-session state needed by the CLI.
 type SessionBundle struct {
-	SessionID       string          `json:"sessionId"`
-	RequestID       string          `json:"requestId"`
-	Provider        string          `json:"provider"`
-	TerraformConfig string          `json:"terraformConfig"`
-	TerraformVars   json.RawMessage `json:"terraformVars"`
-	SessionToken    string          `json:"sessionToken"`
-	BootstrapToken  string          `json:"bootstrapToken"`
-	Steps           []StepInfo      `json:"steps"`
-	Status          string          `json:"status"`
-	AgentConnected  bool            `json:"agentConnected"`
-	AgentVersion    *string         `json:"agentVersion,omitempty"`
-	ExpiresAt       string          `json:"expiresAt"`
+	SessionID       string            `json:"sessionId"`
+	RequestID       string            `json:"requestId"`
+	Provider        string            `json:"provider"`
+	TerraformConfig string            `json:"terraformConfig"`
+	TerraformVars   json.RawMessage   `json:"terraformVars"`
+	CredentialEnv   map[string]string `json:"credentialEnv,omitempty"`
+	SessionToken    string            `json:"sessionToken"`
+	BootstrapToken  string            `json:"bootstrapToken"`
+	Steps           []StepInfo        `json:"steps"`
+	Status          string            `json:"status"`
+	AgentConnected  bool              `json:"agentConnected"`
+	AgentVersion    *string           `json:"agentVersion,omitempty"`
+	ExpiresAt       string            `json:"expiresAt"`
 }
 
 func ToInstallSessionView(s *InstallSession) InstallSessionView {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 
@@ -46,16 +47,33 @@ func main() {
 
 	outbox := events.NewPostgresOutbox(db, "outbox")
 	clusterStore := cluster.NewClusterStore(db)
+
+	// CONTROL_PLANE_PUBLIC_URL is the address agents should use to reach the
+	// control plane. This is NOT the browser-facing gateway URL — it's the URL
+	// reachable from inside customer Kubernetes clusters. For local Kind-based
+	// testing, use "http://host.docker.internal:8080".
+	controlPlaneURL := os.Getenv("CONTROL_PLANE_PUBLIC_URL")
+	if controlPlaneURL == "" {
+		if cfg.Environment == config.EnvProduction || cfg.Environment == config.EnvStaging {
+			log.Error("CONTROL_PLANE_PUBLIC_URL is required outside local development")
+			os.Exit(1)
+		}
+		controlPlaneURL = "http://host.docker.internal:8080"
+		log.Warn("CONTROL_PLANE_PUBLIC_URL not set; using local dev default", "url", controlPlaneURL)
+	}
+
 	svc := cluster.NewService(cluster.Deps{
-		Clusters:   clusterStore,
-		Tokens:     cluster.NewTokenStore(db),
-		Heartbeats: cluster.NewHeartbeatStore(db),
-		OrgMembers: authz.NewOrgMemberRepo(db), // For org membership authorization
-		Outbox:     outbox,
-		Tenant:     db,
-		Logger:     log,
+		Clusters:              clusterStore,
+		Tokens:                cluster.NewTokenStore(db),
+		Heartbeats:            cluster.NewHeartbeatStore(db),
+		OrgMembers:            authz.NewOrgMemberRepo(db),
+		Outbox:                outbox,
+		Tenant:                db,
+		Logger:                log,
+		ControlPlanePublicURL: controlPlaneURL,
 	})
-	handler := cluster.NewHandler(svc, cluster.NewTokenVerifier(cfg.Auth))
+	handler := cluster.NewHandler(svc, cluster.NewTokenVerifier(cfg.Auth)).
+		WithInternalToken(os.Getenv("INTERNAL_API_TOKEN"))
 
 	// Create agent handler for credential-based agent endpoints.
 	clusterValidator := cluster.NewClusterValidator(clusterStore, log)
@@ -86,12 +104,39 @@ func main() {
 		}
 	}()
 
+	// Agents heartbeat every 30s. Sweep every two minutes and retain the
+	// five-minute HeartbeatTimeout so one or several delayed beats cannot cause
+	// a false disconnect. The first sweep runs after the server is listening.
+	stalenessCtx, cancelStaleness := context.WithCancel(ctx)
+	defer cancelStaleness()
+	go runStalenessMonitor(stalenessCtx, svc, log, 2*time.Minute, cluster.HeartbeatTimeout)
+
 	if err := httpserver.Run(cfg, func(app *fiber.App) {
 		cluster.RegisterRoutes(app, handler, registrationLimiter)
 		cluster.RegisterAgentRoutes(app, agentHandler)
 	}); err != nil {
 		log.Error("server exited with error", "error", err)
 		os.Exit(1)
+	}
+}
+
+func runStalenessMonitor(ctx context.Context, svc *cluster.Service, log *slog.Logger, interval, timeout time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			count, err := svc.MarkDisconnected(ctx, timeout)
+			if err != nil {
+				log.ErrorContext(ctx, "cluster staleness sweep failed", "error", err)
+				continue
+			}
+			if count > 0 {
+				log.WarnContext(ctx, "stale clusters marked disconnected", "count", count)
+			}
+		}
 	}
 }
 

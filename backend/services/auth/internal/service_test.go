@@ -8,8 +8,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/bdsplatform/platform/backend/libs/database"
-	"github.com/bdsplatform/platform/backend/libs/events"
 	apperrors "github.com/bdsplatform/platform/backend/libs/errors"
+	"github.com/bdsplatform/platform/backend/libs/events"
 )
 
 // ----------------------------------------------------------------------------
@@ -78,6 +78,16 @@ func (f *fakeUserStore) GetByID(_ context.Context, id string) (*User, error) {
 		return u, nil
 	}
 	return nil, apperrors.NotFound("user")
+}
+
+func (f *fakeUserStore) GetByIDs(_ context.Context, ids []string) ([]User, error) {
+	out := make([]User, 0, len(ids))
+	for _, id := range ids {
+		if u, ok := f.byID[id]; ok {
+			out = append(out, *u)
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeUserStore) GetByEmail(_ context.Context, email string) (*User, error) {

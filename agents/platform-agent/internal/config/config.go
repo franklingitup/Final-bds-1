@@ -4,6 +4,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -50,8 +51,10 @@ type Config struct {
 	// ReconcilerStateFile is the path to persist reconciler state.
 	ReconcilerStateFile string
 
-	// Namespace is the Kubernetes namespace to deploy workloads into.
+	// Namespace is the agent's own operational namespace.
 	Namespace string
+	// ManagedNamespacePrefix is prepended to each deployment's project slug.
+	ManagedNamespacePrefix string
 
 	// ReconcilerEnabled controls whether deployment reconciliation is enabled.
 	// When enabled, the agent will use its registered cluster credentials to
@@ -68,6 +71,26 @@ type Config struct {
 	// SecretsSyncerStateFile is the path to persist secrets syncer state.
 	SecretsSyncerStateFile string
 
+	// MetricsCollectorEnabled controls whether resource metrics collection is enabled.
+	// When enabled, the agent will collect pod metrics from metrics-server (if available)
+	// and ship them to the control plane's observability service.
+	MetricsCollectorEnabled bool
+
+	// MetricsCollectorInterval is how often to collect and ship metrics.
+	MetricsCollectorInterval time.Duration
+
+	// LogShipperEnabled controls whether log shipping is enabled.
+	// When enabled, the agent will tail logs from managed pods and ship them
+	// to the control plane's observability service.
+	LogShipperEnabled bool
+
+	// LogShipperBatchInterval is how often to batch and ship logs.
+	LogShipperBatchInterval time.Duration
+
+	// MaxTailedPods caps how many pods the log shipper will actively tail at once.
+	// Prevents resource exhaustion on clusters with many pods.
+	MaxTailedPods int
+
 	// LeaderElectionEnabled controls whether the agent participates in
 	// Kubernetes Lease-based leader election. When false (the default) the
 	// agent behaves exactly as it did before this feature existed: every
@@ -82,7 +105,7 @@ type Config struct {
 	LeaseName string
 
 	// LeaseNamespace is the namespace that holds the Lease object. Defaults
-	// to the workload Namespace when unset.
+	// to the agent's operational Namespace when unset.
 	LeaseNamespace string
 
 	// LeaseIdentity uniquely identifies this replica as a candidate for
@@ -132,10 +155,16 @@ func DefaultConfig() Config {
 		StateFile:                    "/var/lib/platform-agent/state.json",
 		ReconcilerStateFile:          "/var/lib/platform-agent/reconciler-state.json",
 		Namespace:                    "default",
+		ManagedNamespacePrefix:       "proj-",
 		ReconcilerEnabled:            false,
 		SecretsSyncerEnabled:         false,
 		SecretsSyncInterval:          60 * time.Second,
 		SecretsSyncerStateFile:       "/var/lib/platform-agent/secrets-state.json",
+		MetricsCollectorEnabled:      false,
+		MetricsCollectorInterval:     60 * time.Second,
+		LogShipperEnabled:            false,
+		LogShipperBatchInterval:      5 * time.Second,
+		MaxTailedPods:                50,
 		LeaderElectionEnabled:        false,
 		LeaseName:                    "platform-agent-leader",
 		LeaseDuration:                15 * time.Second,
@@ -195,6 +224,9 @@ func LoadFromEnv() (Config, error) {
 	if v := os.Getenv("NAMESPACE"); v != "" {
 		cfg.Namespace = v
 	}
+	if v := os.Getenv("MANAGED_NAMESPACE_PREFIX"); v != "" {
+		cfg.ManagedNamespacePrefix = v
+	}
 
 	// Enable/disable deployment reconciliation.
 	// When enabled, the agent uses its registered cluster credentials (from state file)
@@ -222,6 +254,44 @@ func LoadFromEnv() (Config, error) {
 
 	if v := os.Getenv("SECRETS_SYNCER_STATE_FILE"); v != "" {
 		cfg.SecretsSyncerStateFile = v
+	}
+
+	// Enable/disable metrics collection.
+	if v := os.Getenv("METRICS_COLLECTOR_ENABLED"); v == "true" || v == "1" {
+		cfg.MetricsCollectorEnabled = true
+	} else if v == "false" || v == "0" {
+		cfg.MetricsCollectorEnabled = false
+	}
+
+	if v := os.Getenv("METRICS_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("invalid METRICS_INTERVAL: %w", err)
+		}
+		cfg.MetricsCollectorInterval = d
+	}
+
+	// Enable/disable log shipping.
+	if v := os.Getenv("LOG_SHIPPER_ENABLED"); v == "true" || v == "1" {
+		cfg.LogShipperEnabled = true
+	} else if v == "false" || v == "0" {
+		cfg.LogShipperEnabled = false
+	}
+
+	if v := os.Getenv("LOG_SHIPPER_BATCH_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("invalid LOG_SHIPPER_BATCH_INTERVAL: %w", err)
+		}
+		cfg.LogShipperBatchInterval = d
+	}
+
+	if v := os.Getenv("MAX_TAILED_PODS"); v != "" {
+		n, err := parsePositiveInt(v)
+		if err != nil {
+			return cfg, fmt.Errorf("invalid MAX_TAILED_PODS: %w", err)
+		}
+		cfg.MaxTailedPods = n
 	}
 
 	// Leader election.
@@ -323,4 +393,16 @@ func (c Config) validateLeaderElection() error {
 		return fmt.Errorf("RENEW_DEADLINE (%s) must be greater than RETRY_PERIOD (%s)", c.RenewDeadline, c.RetryPeriod)
 	}
 	return nil
+}
+
+// parsePositiveInt parses an integer that must be greater than zero.
+func parsePositiveInt(s string) (int, error) {
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, err
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("value must be positive, got %d", n)
+	}
+	return n, nil
 }

@@ -220,6 +220,83 @@ var (
 		Name: "agent_ingress_delete_total",
 		Help: "Total number of platform-owned Ingresses deleted by the agent.",
 	})
+
+	// ---- Metrics Collector -------------------------------------------------
+
+	// MetricsCollectorCycles counts metrics collection cycles executed.
+	MetricsCollectorCycles = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "agent_metrics_collector_cycles_total",
+		Help: "Total number of metrics collection cycles executed.",
+	})
+
+	// MetricsCollectorCycleDuration observes the duration of each collection cycle.
+	MetricsCollectorCycleDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "agent_metrics_collector_cycle_duration_seconds",
+		Help:    "Duration of metrics collection cycles in seconds.",
+		Buckets: prometheus.DefBuckets,
+	})
+
+	// MetricsCollectorPodsCollected counts pods for which metrics were collected.
+	MetricsCollectorPodsCollected = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "agent_metrics_collector_pods_collected_total",
+		Help: "Total number of pods for which metrics were collected.",
+	})
+
+	// MetricsCollectorIngestSuccess counts successful metric ingests.
+	MetricsCollectorIngestSuccess = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "agent_metrics_collector_ingest_success_total",
+		Help: "Total number of successful metric ingests to the control plane.",
+	})
+
+	// MetricsCollectorIngestFailure counts failed metric ingests.
+	MetricsCollectorIngestFailure = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "agent_metrics_collector_ingest_failure_total",
+		Help: "Total number of failed metric ingests to the control plane.",
+	})
+
+	// MetricsServerAvailable indicates whether metrics-server is available (1) or not (0).
+	MetricsServerAvailable = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "agent_metrics_server_available",
+		Help: "Whether metrics-server is available in the cluster (1) or not (0).",
+	})
+
+	// ---- Log Shipper -------------------------------------------------------
+
+	// LogShipperPodsTailed is the current number of pods being actively tailed.
+	LogShipperPodsTailed = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "agent_log_shipper_pods_tailed",
+		Help: "Current number of pods being actively tailed for logs.",
+	})
+
+	// LogShipperPodsSkipped is the number of pods that couldn't be tailed due to cap.
+	LogShipperPodsSkipped = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "agent_log_shipper_pods_skipped",
+		Help: "Number of eligible pods not being tailed due to MAX_TAILED_PODS cap.",
+	})
+
+	// LogShipperLinesShipped counts log lines shipped to the control plane.
+	LogShipperLinesShipped = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "agent_log_shipper_lines_shipped_total",
+		Help: "Total number of log lines shipped to the control plane.",
+	})
+
+	// LogShipperBatchesSent counts log batches sent to the control plane.
+	LogShipperBatchesSent = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "agent_log_shipper_batches_sent_total",
+		Help: "Total number of log batches sent to the control plane.",
+	})
+
+	// LogShipperBatchesFailures counts failed log batch sends.
+	LogShipperBatchesFailures = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "agent_log_shipper_batches_failures_total",
+		Help: "Total number of failed log batch sends to the control plane.",
+	})
+
+	// LogShipperCapExceeded counts times the pod cap was exceeded.
+	LogShipperCapExceeded = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "agent_log_shipper_cap_exceeded_total",
+		Help: "Number of times the MAX_TAILED_PODS cap was hit (warning logged).",
+	})
 )
 
 func init() {
@@ -253,6 +330,20 @@ func init() {
 		IngressApplyDuration,
 		IngressDrift,
 		IngressDelete,
+		// Metrics collector
+		MetricsCollectorCycles,
+		MetricsCollectorCycleDuration,
+		MetricsCollectorPodsCollected,
+		MetricsCollectorIngestSuccess,
+		MetricsCollectorIngestFailure,
+		MetricsServerAvailable,
+		// Log shipper
+		LogShipperPodsTailed,
+		LogShipperPodsSkipped,
+		LogShipperLinesShipped,
+		LogShipperBatchesSent,
+		LogShipperBatchesFailures,
+		LogShipperCapExceeded,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)

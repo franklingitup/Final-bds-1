@@ -21,6 +21,7 @@ type ClusterStore interface {
 	Create(ctx context.Context, c *Cluster) error
 	GetByID(ctx context.Context, id string) (*Cluster, error)
 	GetByIDWithoutTenant(ctx context.Context, id string) (*Cluster, error)
+	ListConnectedWithoutTenant(ctx context.Context) ([]Cluster, error)
 	GetBySlug(ctx context.Context, slug string) (*Cluster, error)
 	List(ctx context.Context, req database.PageRequest, status string) (database.Page[Cluster], error)
 	Update(ctx context.Context, c *Cluster) error
@@ -94,6 +95,17 @@ func (r *clusterRepo) GetByIDWithoutTenant(ctx context.Context, id string) (*Clu
 		return nil, err
 	}
 	return &c, nil
+}
+
+// ListConnectedWithoutTenant is used only by the global staleness monitor,
+// before an organization scope is known.
+func (r *clusterRepo) ListConnectedWithoutTenant(ctx context.Context) ([]Cluster, error) {
+	return database.QueryAll[Cluster](
+		ctx,
+		r.db.Pool,
+		"SELECT * FROM clusters WHERE status = $1",
+		StatusConnected,
+	)
 }
 
 func (r *clusterRepo) GetBySlug(ctx context.Context, slug string) (*Cluster, error) {

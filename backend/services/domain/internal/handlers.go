@@ -389,11 +389,21 @@ func (h *Handler) GetIngress(c *fiber.Ctx) error {
 // Agent Handlers
 // ----------------------------------------------------------------------------
 
+// requireAgent extracts the authenticated agent identity from the request context.
+// Returns an error if no agent identity is present (middleware not applied).
+func requireAgent(c *fiber.Ctx) (*AgentIdentity, error) {
+	agent := AgentFromContext(c.UserContext())
+	if agent == nil {
+		return nil, apperrors.Unauthorized("agent authentication required")
+	}
+	return agent, nil
+}
+
 // GetIngressesForAgent returns pending ingresses for a cluster.
 func (h *Handler) GetIngressesForAgent(c *fiber.Ctx) error {
-	orgID := extractOrgID(c)
-	if orgID == "" {
-		return apperrors.Validation("organization ID is required")
+	agent, err := requireAgent(c)
+	if err != nil {
+		return err
 	}
 
 	clusterID := c.Params("clusterId")
@@ -401,7 +411,12 @@ func (h *Handler) GetIngressesForAgent(c *fiber.Ctx) error {
 		return apperrors.Validation("cluster ID is required")
 	}
 
-	specs, err := h.svc.GetIngressesForAgent(c.Context(), orgID, clusterID)
+	// Verify the agent is authorized for this cluster.
+	if agent.ClusterID != clusterID {
+		return apperrors.Forbidden("agent is not authorized for this cluster")
+	}
+
+	specs, err := h.svc.GetIngressesForAgent(c.Context(), agent.OrganizationID, clusterID)
 	if err != nil {
 		return err
 	}
@@ -411,9 +426,9 @@ func (h *Handler) GetIngressesForAgent(c *fiber.Ctx) error {
 
 // ReportIngressSync reports ingress sync status from agent.
 func (h *Handler) ReportIngressSync(c *fiber.Ctx) error {
-	orgID := extractOrgID(c)
-	if orgID == "" {
-		return apperrors.Validation("organization ID is required")
+	agent, err := requireAgent(c)
+	if err != nil {
+		return err
 	}
 
 	ingressID := c.Params("ingressId")
@@ -430,7 +445,8 @@ func (h *Handler) ReportIngressSync(c *fiber.Ctx) error {
 		return apperrors.Validation("invalid request body")
 	}
 
-	if err := h.svc.ReportIngressSync(c.Context(), orgID, ingressID, req.Status, req.ObservedGeneration, req.Error); err != nil {
+	// Use the authenticated org ID, not a user-supplied one.
+	if err := h.svc.ReportIngressSync(c.Context(), agent.OrganizationID, ingressID, req.Status, req.ObservedGeneration, req.Error); err != nil {
 		return err
 	}
 

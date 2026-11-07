@@ -28,12 +28,15 @@ type ArgoRegistrar interface {
 
 // Deps holds service dependencies.
 type Deps struct {
-	Applications ApplicationStore
-	Deployments  DeploymentStore
-	Releases     ReleaseStore
-	OrgMembers   authz.OrgMemberStore // For org membership authorization
-	Outbox       events.Outbox
-	Tenant       TenantRunner
+	Applications   ApplicationStore
+	Deployments    DeploymentStore
+	Releases       ReleaseStore
+	Environments   EnvironmentStore
+	Promotions     PromotionStore
+	OrgMembers     authz.OrgMemberStore     // For org membership authorization
+	ProjectMembers authz.ProjectMemberStore // For project membership authorization
+	Outbox         events.Outbox
+	Tenant         TenantRunner
 	// Argo, when set, enables GitOps: CreateDeployment registers an Argo CD
 	// Application when the request carries a GitOps source. Optional.
 	Argo   ArgoRegistrar
@@ -46,6 +49,8 @@ type Service struct {
 	apps       ApplicationStore
 	deps       DeploymentStore
 	rels       ReleaseStore
+	envs       EnvironmentStore
+	promos     PromotionStore
 	orgMembers authz.OrgMemberStore
 	outbox     events.Outbox
 	tenant     TenantRunner
@@ -63,15 +68,21 @@ func NewService(d Deps) *Service {
 	if d.Now == nil {
 		d.Now = time.Now
 	}
+	authSvc := authz.NewAuthorizationService(d.Tenant, d.OrgMembers, nil)
+	if d.ProjectMembers != nil {
+		authSvc = authSvc.WithProjectMembers(d.ProjectMembers)
+	}
 	return &Service{
 		apps:       d.Applications,
 		deps:       d.Deployments,
 		rels:       d.Releases,
+		envs:       d.Environments,
+		promos:     d.Promotions,
 		orgMembers: d.OrgMembers,
 		outbox:     d.Outbox,
 		tenant:     d.Tenant,
 		argo:       d.Argo,
-		authSvc:    authz.NewAuthorizationService(d.Tenant, d.OrgMembers, nil),
+		authSvc:    authSvc,
 		log:        d.Logger,
 		now:        d.Now,
 	}
@@ -88,10 +99,10 @@ func (s *Service) SetArgoRegistrar(a ArgoRegistrar) { s.argo = a }
 // ----------------------------------------------------------------------------
 
 // CreateApplication creates a new application within a project.
-// SECURITY: Requires org membership with deployment write privileges.
+// SECURITY: Requires org admin/owner OR project membership with deploy privileges.
 func (s *Service) CreateApplication(ctx context.Context, orgID, projectID, userID string, req CreateApplicationRequest) (*Application, error) {
-	// SECURITY: Verify caller has deployment write privileges
-	if _, err := s.authSvc.AuthorizeOrgMember(ctx, orgID, userID, authz.ActionDeploy); err != nil {
+	// SECURITY: Verify caller has deployment write privileges (org-level or project-level)
+	if _, err := s.authSvc.AuthorizeProjectMember(ctx, orgID, projectID, userID, authz.ActionDeploy); err != nil {
 		return nil, err
 	}
 
@@ -148,25 +159,14 @@ func (s *Service) CreateApplication(ctx context.Context, orgID, projectID, userI
 // GetApplication returns an application by ID.
 // SECURITY: Requires org membership to read applications.
 func (s *Service) GetApplication(ctx context.Context, orgID, userID, appID string) (*Application, error) {
-	// SECURITY: Verify caller is org member
-	if _, err := s.authSvc.AuthorizeOrgRead(ctx, orgID, userID); err != nil {
-		return nil, err
-	}
-
-	var app *Application
-	err := s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
-		var err error
-		app, err = s.apps.GetByID(ctx, appID)
-		return err
-	})
-	return app, err
+	return s.authorizeApplication(ctx, orgID, userID, appID, authz.ActionReadDeployment)
 }
 
 // ListApplications returns applications for a project.
-// SECURITY: Requires org membership to list applications.
+// SECURITY: Requires org admin/owner OR project membership with read privileges.
 func (s *Service) ListApplications(ctx context.Context, orgID, userID, projectID string, page database.PageRequest) (database.Page[Application], error) {
-	// SECURITY: Verify caller is org member
-	if _, err := s.authSvc.AuthorizeOrgRead(ctx, orgID, userID); err != nil {
+	// SECURITY: Verify caller has read privileges (org-level or project-level)
+	if _, err := s.authSvc.AuthorizeProjectMember(ctx, orgID, projectID, userID, authz.ActionReadDeployment); err != nil {
 		return database.Page[Application]{}, err
 	}
 
@@ -182,8 +182,7 @@ func (s *Service) ListApplications(ctx context.Context, orgID, userID, projectID
 // UpdateApplication updates an application.
 // SECURITY: Requires org membership with deployment write privileges.
 func (s *Service) UpdateApplication(ctx context.Context, orgID, userID, appID string, req UpdateApplicationRequest) (*Application, error) {
-	// SECURITY: Verify caller has deployment write privileges
-	if _, err := s.authSvc.AuthorizeOrgMember(ctx, orgID, userID, authz.ActionDeploy); err != nil {
+	if _, err := s.authorizeApplication(ctx, orgID, userID, appID, authz.ActionDeploy); err != nil {
 		return nil, err
 	}
 
@@ -220,8 +219,7 @@ func (s *Service) UpdateApplication(ctx context.Context, orgID, userID, appID st
 // DeleteApplication deletes an application.
 // SECURITY: Requires org membership with deployment write privileges.
 func (s *Service) DeleteApplication(ctx context.Context, orgID, userID, appID string) error {
-	// SECURITY: Verify caller has deployment write privileges
-	if _, err := s.authSvc.AuthorizeOrgMember(ctx, orgID, userID, authz.ActionDeploy); err != nil {
+	if _, err := s.authorizeApplication(ctx, orgID, userID, appID, authz.ActionDeploy); err != nil {
 		return err
 	}
 
@@ -244,8 +242,7 @@ func (s *Service) DeleteApplication(ctx context.Context, orgID, userID, appID st
 // CreateDeployment creates a new deployment and initial release.
 // SECURITY: Requires org membership with deployment write privileges.
 func (s *Service) CreateDeployment(ctx context.Context, orgID, userID string, req CreateDeploymentRequest) (*Deployment, *Release, error) {
-	// SECURITY: Verify caller has deployment write privileges
-	if _, err := s.authSvc.AuthorizeOrgMember(ctx, orgID, userID, authz.ActionDeploy); err != nil {
+	if _, err := s.authorizeApplication(ctx, orgID, userID, req.ApplicationID, authz.ActionDeploy); err != nil {
 		return nil, nil, err
 	}
 
@@ -356,19 +353,13 @@ func (s *Service) CreateDeployment(ctx context.Context, orgID, userID string, re
 // GetDeployment returns a deployment by ID.
 // SECURITY: Requires org membership to read deployments.
 func (s *Service) GetDeployment(ctx context.Context, orgID, userID, depID string) (*Deployment, *int, error) {
-	// SECURITY: Verify caller is org member
-	if _, err := s.authSvc.AuthorizeOrgRead(ctx, orgID, userID); err != nil {
+	dep, err := s.authorizeDeployment(ctx, orgID, userID, depID, authz.ActionReadDeployment)
+	if err != nil {
 		return nil, nil, err
 	}
 
-	var dep *Deployment
 	var currentRev *int
-	err := s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
-		var err error
-		dep, err = s.deps.GetByID(ctx, depID)
-		if err != nil {
-			return err
-		}
+	err = s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
 		// Get latest revision.
 		rel, err := s.rels.GetLatest(ctx, depID)
 		if err == nil {
@@ -382,8 +373,7 @@ func (s *Service) GetDeployment(ctx context.Context, orgID, userID, depID string
 // ListDeployments returns deployments for an application.
 // SECURITY: Requires org membership to list deployments.
 func (s *Service) ListDeployments(ctx context.Context, orgID, userID, appID string, page database.PageRequest) (database.Page[Deployment], error) {
-	// SECURITY: Verify caller is org member
-	if _, err := s.authSvc.AuthorizeOrgRead(ctx, orgID, userID); err != nil {
+	if _, err := s.authorizeApplication(ctx, orgID, userID, appID, authz.ActionReadDeployment); err != nil {
 		return database.Page[Deployment]{}, err
 	}
 
@@ -433,8 +423,7 @@ func (s *Service) ListOrgDeployments(ctx context.Context, orgID, userID string, 
 // DeleteDeployment soft-deletes a deployment.
 // SECURITY: Requires org membership with deployment write privileges.
 func (s *Service) DeleteDeployment(ctx context.Context, orgID, userID, depID string) error {
-	// SECURITY: Verify caller has deployment write privileges
-	if _, err := s.authSvc.AuthorizeOrgMember(ctx, orgID, userID, authz.ActionDeploy); err != nil {
+	if _, err := s.authorizeDeployment(ctx, orgID, userID, depID, authz.ActionDeploy); err != nil {
 		return err
 	}
 
@@ -460,8 +449,7 @@ func (s *Service) DeleteDeployment(ctx context.Context, orgID, userID, depID str
 // UpdateDeployment updates a deployment and creates a new release.
 // SECURITY: Requires org membership with deployment write privileges.
 func (s *Service) UpdateDeployment(ctx context.Context, orgID, userID, depID string, req UpdateDeploymentRequest) (*Deployment, *Release, error) {
-	// SECURITY: Verify caller has deployment write privileges
-	if _, err := s.authSvc.AuthorizeOrgMember(ctx, orgID, userID, authz.ActionDeploy); err != nil {
+	if _, err := s.authorizeDeployment(ctx, orgID, userID, depID, authz.ActionDeploy); err != nil {
 		return nil, nil, err
 	}
 
@@ -561,8 +549,7 @@ func (s *Service) UpdateDeployment(ctx context.Context, orgID, userID, depID str
 // Rollback rolls back to a previous successful release.
 // SECURITY: Requires org membership with deployment write privileges.
 func (s *Service) Rollback(ctx context.Context, orgID, userID, depID string, req RollbackRequest) (*Deployment, *Release, error) {
-	// SECURITY: Verify caller has deployment write privileges
-	if _, err := s.authSvc.AuthorizeOrgMember(ctx, orgID, userID, authz.ActionDeploy); err != nil {
+	if _, err := s.authorizeDeployment(ctx, orgID, userID, depID, authz.ActionDeploy); err != nil {
 		return nil, nil, err
 	}
 
@@ -644,8 +631,7 @@ func (s *Service) Rollback(ctx context.Context, orgID, userID, depID string, req
 // MarkDeploymentStarted marks a release as started.
 // SECURITY: Requires org membership with deployment privileges.
 func (s *Service) MarkDeploymentStarted(ctx context.Context, orgID, userID, depID, releaseID string) error {
-	// SECURITY: Verify caller has deployment privileges
-	if _, err := s.authSvc.AuthorizeOrgMember(ctx, orgID, userID, authz.ActionDeploy); err != nil {
+	if _, err := s.authorizeDeployment(ctx, orgID, userID, depID, authz.ActionDeploy); err != nil {
 		return err
 	}
 
@@ -675,8 +661,7 @@ func (s *Service) MarkDeploymentStarted(ctx context.Context, orgID, userID, depI
 // MarkDeploymentSucceeded marks a release as succeeded.
 // SECURITY: Requires org membership with deployment privileges.
 func (s *Service) MarkDeploymentSucceeded(ctx context.Context, orgID, userID, depID, releaseID string, readyReplicas int) error {
-	// SECURITY: Verify caller has deployment privileges
-	if _, err := s.authSvc.AuthorizeOrgMember(ctx, orgID, userID, authz.ActionDeploy); err != nil {
+	if _, err := s.authorizeDeployment(ctx, orgID, userID, depID, authz.ActionDeploy); err != nil {
 		return err
 	}
 
@@ -706,8 +691,7 @@ func (s *Service) MarkDeploymentSucceeded(ctx context.Context, orgID, userID, de
 // MarkDeploymentFailed marks a release as failed.
 // SECURITY: Requires org membership with deployment privileges.
 func (s *Service) MarkDeploymentFailed(ctx context.Context, orgID, userID, depID, releaseID string, errorMsg string) error {
-	// SECURITY: Verify caller has deployment privileges
-	if _, err := s.authSvc.AuthorizeOrgMember(ctx, orgID, userID, authz.ActionDeploy); err != nil {
+	if _, err := s.authorizeDeployment(ctx, orgID, userID, depID, authz.ActionDeploy); err != nil {
 		return err
 	}
 
@@ -742,8 +726,7 @@ func (s *Service) MarkDeploymentFailed(ctx context.Context, orgID, userID, depID
 // ListReleases returns releases for a deployment.
 // SECURITY: Requires org membership to list releases.
 func (s *Service) ListReleases(ctx context.Context, orgID, userID, depID string, page database.PageRequest) (database.Page[Release], error) {
-	// SECURITY: Verify caller is org member
-	if _, err := s.authSvc.AuthorizeOrgRead(ctx, orgID, userID); err != nil {
+	if _, err := s.authorizeDeployment(ctx, orgID, userID, depID, authz.ActionReadDeployment); err != nil {
 		return database.Page[Release]{}, err
 	}
 
@@ -759,23 +742,73 @@ func (s *Service) ListReleases(ctx context.Context, orgID, userID, depID string,
 // GetRelease returns a release by ID.
 // SECURITY: Requires org membership to read releases.
 func (s *Service) GetRelease(ctx context.Context, orgID, userID, releaseID string) (*Release, error) {
-	// SECURITY: Verify caller is org member
+	rel, err := s.authorizeRelease(ctx, orgID, userID, releaseID, authz.ActionReadDeployment)
+	if err != nil {
+		return nil, err
+	}
+	return rel, nil
+}
+
+// ----------------------------------------------------------------------------
+// Helpers
+// ----------------------------------------------------------------------------
+
+func (s *Service) authorizeApplication(ctx context.Context, orgID, userID, appID string, action authz.Action) (*Application, error) {
 	if _, err := s.authSvc.AuthorizeOrgRead(ctx, orgID, userID); err != nil {
 		return nil, err
 	}
+	var app *Application
+	err := s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
+		var err error
+		app, err = s.apps.GetByID(ctx, appID)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.authSvc.AuthorizeProjectMember(ctx, orgID, app.ProjectID, userID, action); err != nil {
+		return nil, err
+	}
+	return app, nil
+}
 
+func (s *Service) authorizeDeployment(ctx context.Context, orgID, userID, depID string, action authz.Action) (*Deployment, error) {
+	if _, err := s.authSvc.AuthorizeOrgRead(ctx, orgID, userID); err != nil {
+		return nil, err
+	}
+	var dep *Deployment
+	err := s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
+		var err error
+		dep, err = s.deps.GetByID(ctx, depID)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.authorizeApplication(ctx, orgID, userID, dep.ApplicationID, action); err != nil {
+		return nil, err
+	}
+	return dep, nil
+}
+
+func (s *Service) authorizeRelease(ctx context.Context, orgID, userID, releaseID string, action authz.Action) (*Release, error) {
+	if _, err := s.authSvc.AuthorizeOrgRead(ctx, orgID, userID); err != nil {
+		return nil, err
+	}
 	var rel *Release
 	err := s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
 		var err error
 		rel, err = s.rels.GetByID(ctx, releaseID)
 		return err
 	})
-	return rel, err
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.authorizeDeployment(ctx, orgID, userID, rel.DeploymentID, action); err != nil {
+		return nil, err
+	}
+	return rel, nil
 }
-
-// ----------------------------------------------------------------------------
-// Helpers
-// ----------------------------------------------------------------------------
 
 func validateName(name string) error {
 	if l := len(name); l < 2 || l > 64 {

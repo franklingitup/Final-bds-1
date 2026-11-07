@@ -75,9 +75,6 @@ CREATE INDEX IF NOT EXISTS metric_samples_resource_idx
 CREATE INDEX IF NOT EXISTS metric_samples_time_idx
     ON metric_samples (timestamp DESC);
 
--- Partition by time for efficient cleanup (simplified - in production use partitioning)
-CREATE INDEX IF NOT EXISTS metric_samples_cleanup_idx
-    ON metric_samples (timestamp) WHERE timestamp < now() - INTERVAL '7 days';
 
 ALTER TABLE metric_samples ENABLE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON metric_samples

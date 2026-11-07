@@ -2,6 +2,7 @@ package audit
 
 import (
 	"context"
+	stderrors "errors"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/bdsplatform/platform/backend/libs/database"
 	apperrors "github.com/bdsplatform/platform/backend/libs/errors"
 	"github.com/bdsplatform/platform/backend/libs/events"
+	"github.com/bdsplatform/platform/backend/libs/internalapi"
 )
 
 // ----------------------------------------------------------------------------
@@ -223,5 +225,99 @@ func TestSupportedDomains(t *testing.T) {
 		if !got[want] {
 			t.Errorf("expected %q to be a supported domain", want)
 		}
+	}
+}
+
+type fakeUserLookup struct {
+	users map[string]internalapi.UserSummary
+	err   error
+	calls int
+}
+
+func (f *fakeUserLookup) GetUsers(_ context.Context, ids []string) (map[string]internalapi.UserSummary, error) {
+	f.calls++
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := make(map[string]internalapi.UserSummary)
+	for _, id := range ids {
+		if u, ok := f.users[id]; ok {
+			out[id] = u
+		}
+	}
+	return out, nil
+}
+
+func TestAuditLogViews_ResolvesUserActorsSkipsSystem(t *testing.T) {
+	e := newTestEnv()
+	userID := uuid.NewString()
+	lookup := &fakeUserLookup{users: map[string]internalapi.UserSummary{
+		userID: {ID: userID, Name: "Ada", Email: "ada@example.com"},
+	}}
+	e.svc.users = lookup
+	org := uuid.NewString()
+	userEnv := mustEnvelope(t, "tenant.organization.created", org, userID, "organization", org)
+	sysEnv, err := events.New("tenant.organization.updated", 1, org, map[string]any{"k": "v"},
+		events.WithActor(events.Actor{Type: "system", ID: "system"}),
+		events.WithResource(events.Resource{Type: "organization", ID: org}))
+	if err != nil {
+		t.Fatalf("system envelope: %v", err)
+	}
+	if _, err := e.svc.RecordEvent(context.Background(), userEnv); err != nil {
+		t.Fatalf("record user: %v", err)
+	}
+	if _, err := e.svc.RecordEvent(context.Background(), sysEnv); err != nil {
+		t.Fatalf("record system: %v", err)
+	}
+	page, err := e.svc.ListLogs(context.Background(), org, uuid.NewString(), AuditFilter{}, database.PageRequest{})
+	if err != nil {
+		t.Fatalf("ListLogs: %v", err)
+	}
+	views := e.svc.auditLogViews(context.Background(), page.Items)
+	if lookup.calls != 1 {
+		t.Fatalf("GetUsers calls = %d, want 1", lookup.calls)
+	}
+	var sawUser, sawSystem bool
+	for _, v := range views {
+		switch v.ActorID {
+		case userID:
+			sawUser = true
+			if v.ActorName != "Ada" {
+				t.Errorf("actorName = %q", v.ActorName)
+			}
+		case "system":
+			sawSystem = true
+			if v.ActorName != "" {
+				t.Errorf("system actorName = %q", v.ActorName)
+			}
+		}
+	}
+	if !sawUser || !sawSystem {
+		t.Fatalf("expected both actors, views=%+v", views)
+	}
+}
+
+func TestAuditLogViews_DegradesWhenAuthFails(t *testing.T) {
+	e := newTestEnv()
+	lookup := &fakeUserLookup{err: stderrors.New("auth down")}
+	e.svc.users = lookup
+	org := uuid.NewString()
+	actor := uuid.NewString()
+	if _, err := e.svc.RecordEvent(context.Background(), mustEnvelope(t, "tenant.organization.created", org, actor, "organization", org)); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	page, err := e.svc.ListLogs(context.Background(), org, uuid.NewString(), AuditFilter{}, database.PageRequest{})
+	if err != nil {
+		t.Fatalf("ListLogs should not fail when auth is down: %v", err)
+	}
+	views := e.svc.auditLogViews(context.Background(), page.Items)
+	if len(views) != 1 {
+		t.Fatalf("len(views) = %d", len(views))
+	}
+	if views[0].ActorName != "" {
+		t.Errorf("expected empty actorName, got %q", views[0].ActorName)
+	}
+	if views[0].ActorID != actor {
+		t.Errorf("actorId = %s", views[0].ActorID)
 	}
 }

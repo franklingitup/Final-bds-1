@@ -38,7 +38,7 @@ func newPod(name, appSlug string, ready bool, waitingReason string) *corev1.Pod 
 func TestGetPodHealth_Empty(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	m := NewManager(client, "default")
-	h, err := m.GetPodHealth(context.Background(), "my-app")
+	h, err := m.GetPodHealth(context.Background(), "default", "my-app")
 	require.NoError(t, err)
 	assert.Equal(t, 0, h.Total)
 	assert.Equal(t, "", h.Issue)
@@ -50,7 +50,7 @@ func TestGetPodHealth_AllReady(t *testing.T) {
 		newPod("p2", "my-app", true, ""),
 	)
 	m := NewManager(client, "default")
-	h, err := m.GetPodHealth(context.Background(), "my-app")
+	h, err := m.GetPodHealth(context.Background(), "default", "my-app")
 	require.NoError(t, err)
 	assert.Equal(t, 2, h.Total)
 	assert.Equal(t, 2, h.Ready)
@@ -60,7 +60,7 @@ func TestGetPodHealth_AllReady(t *testing.T) {
 func TestGetPodHealth_ImagePullBackOff(t *testing.T) {
 	client := fake.NewSimpleClientset(newPod("p1", "my-app", false, "ImagePullBackOff"))
 	m := NewManager(client, "default")
-	h, err := m.GetPodHealth(context.Background(), "my-app")
+	h, err := m.GetPodHealth(context.Background(), "default", "my-app")
 	require.NoError(t, err)
 	assert.Equal(t, "ImagePullBackOff", h.Issue)
 	assert.Contains(t, h.Message, "p1")
@@ -69,7 +69,7 @@ func TestGetPodHealth_ImagePullBackOff(t *testing.T) {
 func TestGetPodHealth_CrashLoopBackOff(t *testing.T) {
 	client := fake.NewSimpleClientset(newPod("p1", "my-app", false, "CrashLoopBackOff"))
 	m := NewManager(client, "default")
-	h, err := m.GetPodHealth(context.Background(), "my-app")
+	h, err := m.GetPodHealth(context.Background(), "default", "my-app")
 	require.NoError(t, err)
 	assert.Equal(t, "CrashLoopBackOff", h.Issue)
 }
@@ -82,7 +82,7 @@ func TestGetPodHealth_Unschedulable(t *testing.T) {
 	})
 	client := fake.NewSimpleClientset(pod)
 	m := NewManager(client, "default")
-	h, err := m.GetPodHealth(context.Background(), "my-app")
+	h, err := m.GetPodHealth(context.Background(), "default", "my-app")
 	require.NoError(t, err)
 	assert.Equal(t, "Unschedulable", h.Issue)
 	assert.Contains(t, h.Message, "unschedulable")
@@ -92,7 +92,7 @@ func TestGetPodHealth_NonFatalWaitingIsHealthy(t *testing.T) {
 	// ContainerCreating is a transient, non-fatal reason and must not be flagged.
 	client := fake.NewSimpleClientset(newPod("p1", "my-app", false, "ContainerCreating"))
 	m := NewManager(client, "default")
-	h, err := m.GetPodHealth(context.Background(), "my-app")
+	h, err := m.GetPodHealth(context.Background(), "default", "my-app")
 	require.NoError(t, err)
 	assert.Equal(t, "", h.Issue)
 }
@@ -140,7 +140,7 @@ func TestGetDeploymentStatus_EnrichedFields(t *testing.T) {
 	client := fake.NewSimpleClientset(dep)
 	m := NewManager(client, "default")
 
-	st, err := m.GetDeploymentStatus(context.Background(), "my-app")
+	st, err := m.GetDeploymentStatus(context.Background(), "default", "my-app")
 	require.NoError(t, err)
 	require.NotNil(t, st)
 	assert.Equal(t, 3, st.DesiredReplicas)
@@ -170,7 +170,7 @@ func TestGetDeploymentStatus_ProgressDeadlineExceeded(t *testing.T) {
 	client := fake.NewSimpleClientset(dep)
 	m := NewManager(client, "default")
 
-	st, err := m.GetDeploymentStatus(context.Background(), "my-app")
+	st, err := m.GetDeploymentStatus(context.Background(), "default", "my-app")
 	require.NoError(t, err)
 	assert.True(t, st.ProgressDeadlineExceeded)
 	assert.True(t, st.Failed)

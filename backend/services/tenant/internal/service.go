@@ -13,6 +13,7 @@ import (
 	"github.com/bdsplatform/platform/backend/libs/database"
 	apperrors "github.com/bdsplatform/platform/backend/libs/errors"
 	"github.com/bdsplatform/platform/backend/libs/events"
+	"github.com/bdsplatform/platform/backend/libs/internalapi"
 )
 
 const defaultInviteTTL = 7 * 24 * time.Hour
@@ -30,6 +31,7 @@ type Deps struct {
 	Authorizer  authz.Authorizer
 	// Notifier delivers invitation tokens over a secure channel (optional).
 	Notifier  Notifier
+	Users     internalapi.UserLookup
 	Logger    *slog.Logger
 	Now       func() time.Time
 	InviteTTL time.Duration
@@ -44,6 +46,7 @@ type Service struct {
 	tenant     TenantRunner
 	authorizer authz.Authorizer
 	notifier   Notifier
+	users      internalapi.UserLookup
 	log        *slog.Logger
 	now        func() time.Time
 	inviteTTL  time.Duration
@@ -71,6 +74,7 @@ func NewService(d Deps) *Service {
 		tenant:     d.Tenant,
 		authorizer: d.Authorizer,
 		notifier:   d.Notifier,
+		users:      d.Users,
 		log:        d.Logger,
 		now:        d.Now,
 		inviteTTL:  d.InviteTTL,
@@ -225,6 +229,34 @@ func (s *Service) ListMembers(ctx context.Context, userID, orgID string, page da
 		return err
 	})
 	return out, err
+}
+
+// memberViews projects membership rows and batch-resolves display names from
+// auth. Auth lookup failures degrade to User: nil rather than failing the list.
+func (s *Service) memberViews(ctx context.Context, members []Member) []MemberView {
+	views := make([]MemberView, 0, len(members))
+	ids := make([]string, 0, len(members))
+	for _, m := range members {
+		ids = append(ids, m.UserID)
+		views = append(views, toMemberView(m))
+	}
+	if s.users == nil || len(ids) == 0 {
+		return views
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, internalapi.DefaultTimeout)
+	defer cancel()
+	resolved, err := s.users.GetUsers(lookupCtx, ids)
+	if err != nil {
+		s.log.Warn("auth user lookup failed; returning members without enrichment", "error", err)
+		return views
+	}
+	for i := range views {
+		if u, ok := resolved[views[i].UserID]; ok {
+			cp := u
+			views[i].User = &cp
+		}
+	}
+	return views
 }
 
 // InviteMember creates a pending invitation and emits an invited event carrying

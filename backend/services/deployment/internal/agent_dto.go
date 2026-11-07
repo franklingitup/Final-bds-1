@@ -11,6 +11,8 @@ type DesiredDeployment struct {
 	ApplicationID   string `json:"applicationId"`
 	ApplicationName string `json:"applicationName"`
 	ApplicationSlug string `json:"applicationSlug"`
+	ProjectID       string `json:"projectId"`
+	ProjectSlug     string `json:"projectSlug"`
 
 	Namespace string `json:"namespace,omitempty"`
 
@@ -47,6 +49,8 @@ type desiredDeploymentRow struct {
 	ApplicationID   string  `db:"application_id"`
 	ApplicationName string  `db:"application_name"`
 	ApplicationSlug string  `db:"application_slug"`
+	ProjectID       string  `db:"project_id"`
+	ProjectSlug     string  `db:"project_slug"`
 	Image           string  `db:"image"`
 	Revision        int     `db:"revision"`
 	Replicas        int     `db:"replicas"`
@@ -57,6 +61,10 @@ type desiredDeploymentRow struct {
 	MemoryRequest   *string `db:"memory_request"`
 	MemoryLimit     *string `db:"memory_limit"`
 	Status          string  `db:"status"`
+	// Namespace is populated from environments.namespace for environment-bound
+	// deployments, or "" for unbound (legacy) deployments.
+	// COALESCE(e.namespace, '') in the SQL guarantees this is never NULL.
+	Namespace string `db:"namespace"`
 }
 
 // toDesiredDeployment converts a database row to the agent DTO.
@@ -67,6 +75,8 @@ func (r *desiredDeploymentRow) toDesiredDeployment(namespace string) DesiredDepl
 		ApplicationID:   r.ApplicationID,
 		ApplicationName: r.ApplicationName,
 		ApplicationSlug: r.ApplicationSlug,
+		ProjectID:       r.ProjectID,
+		ProjectSlug:     r.ProjectSlug,
 		Namespace:       namespace,
 		Image:           r.Image,
 		Revision:        r.Revision,

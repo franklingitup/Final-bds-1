@@ -5,6 +5,7 @@ import (
 
 	"github.com/bdsplatform/platform/backend/libs/authz"
 	"github.com/bdsplatform/platform/backend/libs/database"
+	"github.com/bdsplatform/platform/backend/libs/internalapi"
 )
 
 // Role is an organization membership role. Owner is the superuser of an org;
@@ -154,14 +155,16 @@ func toOrganizationView(o *Organization) OrganizationView {
 
 // MemberView is the public projection of a membership.
 type MemberView struct {
-	UserID    string    `json:"userId"`
-	Role      Role      `json:"role"`
-	Status    string    `json:"status"`
-	CreatedAt time.Time `json:"createdAt"`
+	ID        string                   `json:"id"`
+	UserID    string                   `json:"userId"`
+	Role      Role                     `json:"role"`
+	Status    string                   `json:"status"`
+	CreatedAt time.Time                `json:"createdAt"`
+	User      *internalapi.UserSummary `json:"user,omitempty"`
 }
 
 func toMemberView(m Member) MemberView {
-	return MemberView{UserID: m.UserID, Role: m.Role, Status: m.Status, CreatedAt: m.CreatedAt}
+	return MemberView{ID: m.ID, UserID: m.UserID, Role: m.Role, Status: m.Status, CreatedAt: m.CreatedAt}
 }
 
 // InvitationView is the public projection of an invitation (no token).

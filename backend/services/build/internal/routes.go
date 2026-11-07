@@ -8,27 +8,29 @@ import "github.com/gofiber/fiber/v2"
 func RegisterRoutes(app *fiber.App, h *Handler) {
 	v1 := app.Group("/v1")
 
-	// Authenticated routes (user JWT).
-	authenticated := v1.Group("", h.RequireAuth())
+	// User JWT must be scoped to org routes only. A Group("", RequireAuth) on
+	// /v1 registers Fiber USE /v1, which intercepts later-mounted GitHub
+	// callback and webhook routes registered in main.go after this function.
+	authenticated := v1.Group("/organizations/:orgId", h.RequireAuth())
 
 	// Git Repositories (scoped to org/project).
-	repos := authenticated.Group("/organizations/:orgId/projects/:projectId/repositories")
+	repos := authenticated.Group("/projects/:projectId/repositories")
 	repos.Post("", h.CreateRepository)
 	repos.Get("", h.ListRepositories)
 
 	// Single repository operations.
-	singleRepo := authenticated.Group("/organizations/:orgId/repositories/:repoId")
+	singleRepo := authenticated.Group("/repositories/:repoId")
 	singleRepo.Get("", h.GetRepository)
 	singleRepo.Patch("", h.UpdateRepository)
 	singleRepo.Delete("", h.DeleteRepository)
 
 	// Builds at org level.
-	builds := authenticated.Group("/organizations/:orgId/builds")
+	builds := authenticated.Group("/builds")
 	builds.Post("", h.CreateBuild)
 	builds.Get("", h.ListBuilds)
 
 	// Single build operations.
-	build := authenticated.Group("/organizations/:orgId/builds/:buildId")
+	build := authenticated.Group("/builds/:buildId")
 	build.Get("", h.GetBuild)
 	build.Post("/cancel", h.CancelBuild)
 	build.Post("/retry", h.RetryBuild)

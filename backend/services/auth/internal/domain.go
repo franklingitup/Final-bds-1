@@ -34,6 +34,19 @@ type User struct {
 	LockedUntil         *time.Time `db:"locked_until"`
 }
 
+// UserPublic is the internal-network display projection of a user. It is safe
+// to return across services: no password hash, tokens, or MFA material.
+type UserPublic struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Email     string `json:"email"`
+	AvatarURL string `json:"avatarUrl,omitempty"`
+}
+
+func toUserPublic(u User) UserPublic {
+	return UserPublic{ID: u.ID, Name: u.Name, Email: u.Email}
+}
+
 // IsLocked reports whether the account is currently locked out.
 func (u *User) IsLocked(now time.Time) bool {
 	if u.Status == UserStatusLocked {

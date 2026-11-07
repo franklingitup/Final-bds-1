@@ -5,7 +5,9 @@ package observability
 import "github.com/gofiber/fiber/v2"
 
 // RegisterRoutes mounts observability routes onto the app with the given handler and auth middleware.
-func RegisterRoutes(app *fiber.App, h *Handler, auth fiber.Handler) {
+// auth: user JWT middleware for org-scoped endpoints
+// agentAuth: cluster credential middleware for agent ingest endpoints
+func RegisterRoutes(app *fiber.App, h *Handler, auth, agentAuth fiber.Handler) {
 	v1 := app.Group("/v1")
 
 	// Health check (public)
@@ -50,8 +52,8 @@ func RegisterRoutes(app *fiber.App, h *Handler, auth fiber.Handler) {
 	// Overview (requires auth)
 	v1.Get("/organizations/:orgId/observability/overview", auth, h.GetOverview)
 
-	// Agent ingest endpoints (credential-based, no user auth)
-	agent := v1.Group("/agent")
+	// Agent ingest endpoints (cluster-credential-based authentication)
+	agent := v1.Group("/agent", agentAuth)
 	agent.Post("/metrics", h.IngestMetrics)
 	agent.Post("/logs", h.IngestLogs)
 	agent.Post("/health", h.ReportHealth)

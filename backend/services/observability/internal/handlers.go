@@ -551,14 +551,21 @@ func (h *Handler) GetOverview(c *fiber.Ctx) error {
 // Agent Ingest Handlers
 // ----------------------------------------------------------------------------
 
+// requireAgent extracts the authenticated agent identity from context.
+// Returns an error if the agent identity is not present (middleware not applied).
+func requireAgent(c *fiber.Ctx) (*AgentIdentity, error) {
+	agent := AgentFromContext(c.UserContext())
+	if agent == nil {
+		return nil, apperrors.Unauthorized("agent authentication required")
+	}
+	return agent, nil
+}
+
 // IngestMetrics ingests metrics from an agent.
 func (h *Handler) IngestMetrics(c *fiber.Ctx) error {
-	orgID := c.Get("X-Organization-ID")
-	if orgID == "" {
-		orgID = extractOrgID(c)
-	}
-	if orgID == "" {
-		return apperrors.Validation("organization ID is required")
+	agent, err := requireAgent(c)
+	if err != nil {
+		return err
 	}
 
 	var req IngestMetricsRequest
@@ -566,7 +573,12 @@ func (h *Handler) IngestMetrics(c *fiber.Ctx) error {
 		return apperrors.Validation("invalid request body")
 	}
 
-	if err := h.svc.IngestMetrics(c.Context(), orgID, req); err != nil {
+	// Verify the cluster ID in the request body matches the authenticated cluster
+	if req.ClusterID != "" && req.ClusterID != agent.ClusterID {
+		return apperrors.Forbidden("cluster ID mismatch")
+	}
+
+	if err := h.svc.IngestMetrics(c.Context(), agent.OrganizationID, req); err != nil {
 		return err
 	}
 
@@ -575,12 +587,9 @@ func (h *Handler) IngestMetrics(c *fiber.Ctx) error {
 
 // IngestLogs ingests logs from an agent.
 func (h *Handler) IngestLogs(c *fiber.Ctx) error {
-	orgID := c.Get("X-Organization-ID")
-	if orgID == "" {
-		orgID = extractOrgID(c)
-	}
-	if orgID == "" {
-		return apperrors.Validation("organization ID is required")
+	agent, err := requireAgent(c)
+	if err != nil {
+		return err
 	}
 
 	var req IngestLogsRequest
@@ -588,7 +597,26 @@ func (h *Handler) IngestLogs(c *fiber.Ctx) error {
 		return apperrors.Validation("invalid request body")
 	}
 
-	if err := h.svc.IngestLogs(c.Context(), orgID, req); err != nil {
+	// Verify the cluster ID in the request body matches the authenticated cluster
+	if req.ClusterID != "" && req.ClusterID != agent.ClusterID {
+		return apperrors.Forbidden("cluster ID mismatch")
+	}
+
+	lineCount := 0
+	for _, s := range req.Streams {
+		lineCount += len(s.Values)
+	}
+	h.log.Debug("agent log ingest request",
+		"cluster_id", agent.ClusterID,
+		"org_id", agent.OrganizationID,
+		"streams", len(req.Streams),
+		"lines", lineCount)
+
+	if err := h.svc.IngestLogs(c.Context(), agent.OrganizationID, req); err != nil {
+		h.log.Error("log ingest failed",
+			"error", err,
+			"cluster_id", agent.ClusterID,
+			"org_id", agent.OrganizationID)
 		return err
 	}
 
@@ -597,12 +625,9 @@ func (h *Handler) IngestLogs(c *fiber.Ctx) error {
 
 // ReportHealth reports health from an agent.
 func (h *Handler) ReportHealth(c *fiber.Ctx) error {
-	orgID := c.Get("X-Organization-ID")
-	if orgID == "" {
-		orgID = extractOrgID(c)
-	}
-	if orgID == "" {
-		return apperrors.Validation("organization ID is required")
+	agent, err := requireAgent(c)
+	if err != nil {
+		return err
 	}
 
 	var req ReportHealthRequest
@@ -610,7 +635,7 @@ func (h *Handler) ReportHealth(c *fiber.Ctx) error {
 		return apperrors.Validation("invalid request body")
 	}
 
-	if err := h.svc.ReportHealth(c.Context(), orgID, req); err != nil {
+	if err := h.svc.ReportHealth(c.Context(), agent.OrganizationID, req); err != nil {
 		return err
 	}
 

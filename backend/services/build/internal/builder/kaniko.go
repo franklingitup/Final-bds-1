@@ -222,6 +222,20 @@ func (b *MultiBuilder) buildKanikoJobSpec(ctx context.Context, job *build.BuildJ
 		return JobSpec{}, fmt.Errorf("no git URL specified")
 	}
 
+	// Second-layer SSRF check — defence against DNS rebinding.
+	//
+	// The first check runs at the API boundary (CreateBuild /
+	// TriggerBuildFromWebhook). This second check catches the case where a
+	// hostname resolved to a public IP at request time but resolves to a private
+	// or link-local address (e.g. 169.254.169.254) by the time the worker picks
+	// up the build — a classic DNS rebinding attack.
+	//
+	// build.ValidateGitURL uses build.LookupHostFunc, which is replaceable in
+	// tests (see kaniko_test.go TestMain) so CI never needs real DNS.
+	if err := build.ValidateGitURL(ctx, gitURL); err != nil {
+		return JobSpec{}, fmt.Errorf("git URL SSRF pre-launch check: %w", err)
+	}
+
 	args, err := buildKanikoArgs(bd)
 	if err != nil {
 		return JobSpec{}, err

@@ -53,6 +53,7 @@ func main() {
 		BuildArtifacts: build.NewBuildArtifactStore(db),
 		BuildQueue:     build.NewBuildQueueStore(db),
 		OrgMembers:     authz.NewOrgMemberRepo(db),
+		ProjectMembers: authz.NewProjectMemberRepo(db),
 		Outbox:         outbox,
 		Tenant:         db,
 		Logger:         log,

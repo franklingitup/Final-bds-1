@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"crypto/subtle"
 	"strings"
 
 	"github.com/gofiber/fiber/v2"
@@ -11,13 +12,35 @@ import (
 
 // Handler adapts the cluster Service to Fiber HTTP handlers.
 type Handler struct {
-	svc      *Service
-	verifier *TokenVerifier
+	svc           *Service
+	verifier      *TokenVerifier
+	internalToken string
 }
 
 // NewHandler constructs an HTTP handler.
 func NewHandler(svc *Service, verifier *TokenVerifier) *Handler {
 	return &Handler{svc: svc, verifier: verifier}
+}
+
+// WithInternalToken sets the optional shared secret required on /internal/*.
+func (h *Handler) WithInternalToken(token string) *Handler {
+	h.internalToken = token
+	return h
+}
+
+// requireInternalToken returns middleware that checks the X-Internal-Token header.
+func (h *Handler) requireInternalToken() fiber.Handler {
+	want := h.internalToken
+	return func(c *fiber.Ctx) error {
+		if want == "" {
+			return c.Next()
+		}
+		got := c.Get("X-Internal-Token")
+		if subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
+			return apperrors.Unauthorized("internal token required")
+		}
+		return c.Next()
+	}
 }
 
 func parseBody[T any](c *fiber.Ctx) (T, error) {
@@ -152,6 +175,19 @@ func (h *Handler) RevokeRegistrationToken(c *fiber.Ctx) error {
 // Agent Endpoints (capability-based, no user auth required)
 // ----------------------------------------------------------------------------
 
+func (h *Handler) GetInstallManifest(c *fiber.Ctx) error {
+	manifest, err := h.svc.GetInstallManifest(
+		c.UserContext(),
+		c.Params("token"),
+		c.Query("controlPlaneEndpoint"),
+	)
+	if err != nil {
+		return err
+	}
+	c.Set(fiber.HeaderContentType, "application/yaml")
+	return c.SendString(manifest)
+}
+
 func (h *Handler) RegisterAgent(c *fiber.Ctx) error {
 	req, err := parseBody[AgentRegisterRequest](c)
 	if err != nil {
@@ -218,4 +254,40 @@ func (h *Handler) GetHeartbeats(c *fiber.Ctx) error {
 		views = append(views, toHeartbeatView(&hb))
 	}
 	return c.JSON(fiber.Map{"items": views})
+}
+
+// ----------------------------------------------------------------------------
+// Internal API (service-to-service)
+// ----------------------------------------------------------------------------
+
+// CreateClusterWithToken handles POST /internal/organizations/:orgId/clusters.
+// This is used by the provisioning service to create a cluster with registration
+// token in a single atomic operation before starting Terraform provisioning.
+func (h *Handler) CreateClusterWithToken(c *fiber.Ctx) error {
+	org := orgID(c)
+	if org == "" {
+		return errOrgRequired
+	}
+	req, err := parseBody[InternalCreateClusterRequest](c)
+	if err != nil {
+		return err
+	}
+	result, err := h.svc.CreateClusterWithToken(c.UserContext(), org, req)
+	if err != nil {
+		return err
+	}
+	return c.Status(fiber.StatusCreated).JSON(result)
+}
+
+// GetClusterInternal handles GET /internal/organizations/:orgId/clusters/:clusterId.
+func (h *Handler) GetClusterInternal(c *fiber.Ctx) error {
+	org := orgID(c)
+	if org == "" {
+		return errOrgRequired
+	}
+	result, err := h.svc.GetClusterInternal(c.UserContext(), org, clusterID(c))
+	if err != nil {
+		return err
+	}
+	return c.JSON(result)
 }

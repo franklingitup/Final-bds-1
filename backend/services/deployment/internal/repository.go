@@ -29,6 +29,10 @@ type ApplicationStore interface {
 type DeploymentStore interface {
 	Create(ctx context.Context, d *Deployment) error
 	GetByID(ctx context.Context, id string) (*Deployment, error)
+	// GetLatestByEnvironment returns the most-recently-created non-deleted deployment
+	// bound to the given environment. Returns NotFound if the environment has no
+	// deployment yet (first promotion into a new environment).
+	GetLatestByEnvironment(ctx context.Context, envID string) (*Deployment, error)
 	List(ctx context.Context, appID string, req database.PageRequest) (database.Page[Deployment], error)
 	ListByOrg(ctx context.Context, req database.PageRequest) (database.Page[Deployment], error)
 	// ListAllActive returns every non-deleted deployment visible in the current
@@ -173,22 +177,34 @@ func (r *deploymentRepo) Create(ctx context.Context, d *Deployment) error {
 	d.DesiredReplicas = d.Replicas
 
 	const sql = `
-INSERT INTO deployments (id, org_id, application_id, cluster_id, image, replicas, 
-    cpu_request, cpu_limit, memory_request, memory_limit, port, env_vars, 
-    status, desired_replicas, created_by)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+INSERT INTO deployments (id, org_id, application_id, cluster_id, image, replicas,
+    cpu_request, cpu_limit, memory_request, memory_limit, port, env_vars,
+    status, desired_replicas, created_by, environment_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 RETURNING created_at, updated_at, version`
 
 	row := r.db.Conn(ctx).QueryRow(ctx, sql,
 		d.ID, d.OrgID, d.ApplicationID, d.ClusterID, d.Image, d.Replicas,
 		d.CPURequest, d.CPULimit, d.MemoryRequest, d.MemoryLimit, d.Port, d.EnvVars,
-		d.Status, d.DesiredReplicas, d.CreatedBy)
+		d.Status, d.DesiredReplicas, d.CreatedBy, d.EnvironmentID)
 	return database.MapError(row.Scan(&d.CreatedAt, &d.UpdatedAt, &d.Version))
 }
 
 func (r *deploymentRepo) GetByID(ctx context.Context, id string) (*Deployment, error) {
 	d, err := database.QueryOne[Deployment](ctx, r.db.Conn(ctx),
 		"SELECT * FROM deployments WHERE id = $1 AND status != 'deleted'", id)
+	if err != nil {
+		return nil, err
+	}
+	return &d, nil
+}
+
+func (r *deploymentRepo) GetLatestByEnvironment(ctx context.Context, envID string) (*Deployment, error) {
+	d, err := database.QueryOne[Deployment](ctx, r.db.Conn(ctx),
+		`SELECT * FROM deployments
+		 WHERE environment_id = $1 AND status != 'deleted'
+		 ORDER BY created_at DESC, id DESC
+		 LIMIT 1`, envID)
 	if err != nil {
 		return nil, err
 	}

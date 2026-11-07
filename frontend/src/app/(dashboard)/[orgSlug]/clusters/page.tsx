@@ -2,9 +2,16 @@
 
 import * as React from "react";
 import { useParams } from "next/navigation";
-import { Plus, Server } from "lucide-react";
+import Link from "next/link";
+import { Plus, Server, Cloud, ChevronDown } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { PageHeader } from "@/components/shared/page-header";
 import { EmptyState } from "@/components/shared/empty-state";
 import { LoadingState } from "@/components/shared/loading-state";
@@ -39,10 +46,27 @@ export default function ClustersPage() {
         title="Clusters"
         description="Manage your Kubernetes clusters"
         action={
-          <Button onClick={() => setCreateDialogOpen(true)}>
-            <Plus className="mr-2 h-4 w-4" />
-            Add Cluster
-          </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button>
+                <Plus className="mr-2 h-4 w-4" />
+                Add Cluster
+                <ChevronDown className="ml-2 h-4 w-4" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onClick={() => setCreateDialogOpen(true)}>
+                <Server className="mr-2 h-4 w-4" />
+                Register Existing Cluster
+              </DropdownMenuItem>
+              <DropdownMenuItem asChild>
+                <Link href={`/${orgSlug}/clusters/provision`}>
+                  <Cloud className="mr-2 h-4 w-4" />
+                  Provision New Cluster
+                </Link>
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         }
       />
 
@@ -52,10 +76,18 @@ export default function ClustersPage() {
           title="No clusters yet"
           description="Connect your first Kubernetes cluster to start deploying"
           action={
-            <Button onClick={() => setCreateDialogOpen(true)}>
-              <Plus className="mr-2 h-4 w-4" />
-              Add Cluster
-            </Button>
+            <div className="flex gap-2">
+              <Button variant="outline" onClick={() => setCreateDialogOpen(true)}>
+                <Server className="mr-2 h-4 w-4" />
+                Register Existing
+              </Button>
+              <Link href={`/${orgSlug}/clusters/provision`}>
+                <Button>
+                  <Cloud className="mr-2 h-4 w-4" />
+                  Provision New
+                </Button>
+              </Link>
+            </div>
           }
         />
       ) : (
@@ -64,6 +96,7 @@ export default function ClustersPage() {
             <ClusterCard
               key={cluster.id}
               cluster={cluster}
+              orgId={organization?.id || ""}
               orgSlug={orgSlug}
             />
           ))}

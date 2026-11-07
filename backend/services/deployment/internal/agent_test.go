@@ -742,3 +742,7 @@ func (f *fakeDeploymentStoreForAgent) Delete(ctx context.Context, id string) err
 func (f *fakeDeploymentStoreForAgent) ListAllActive(ctx context.Context) ([]Deployment, error) {
 	return nil, nil
 }
+
+func (f *fakeDeploymentStoreForAgent) GetLatestByEnvironment(ctx context.Context, envID string) (*Deployment, error) {
+	return nil, apperrors.NotFound("no deployment for environment")
+}

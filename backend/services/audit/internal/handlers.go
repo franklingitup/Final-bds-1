@@ -65,10 +65,7 @@ func (h *Handler) ListAuditLogs(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	views := make([]AuditLogView, 0, len(page.Items))
-	for _, a := range page.Items {
-		views = append(views, toAuditLogView(a))
-	}
+	views := h.svc.auditLogViews(c.UserContext(), page.Items)
 	return c.JSON(fiber.Map{"items": views, "nextCursor": page.NextCursor})
 }
 
@@ -82,5 +79,6 @@ func (h *Handler) GetAuditLog(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return c.JSON(toAuditLogView(rec))
+	views := h.svc.auditLogViews(c.UserContext(), []AuditLog{rec})
+	return c.JSON(views[0])
 }

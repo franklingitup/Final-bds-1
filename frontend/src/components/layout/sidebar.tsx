@@ -13,6 +13,8 @@ import {
   Shield,
   Settings,
   ChevronDown,
+  ShieldCheck,
+  Plug,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -48,6 +50,16 @@ const navItems: NavItem[] = [
     title: "Deployments",
     href: "/deployments",
     icon: Rocket,
+  },
+  {
+    title: "Access",
+    href: "/access",
+    icon: ShieldCheck,
+  },
+  {
+    title: "Integrations",
+    href: "/integrations",
+    icon: Plug,
   },
   {
     title: "Audit Logs",

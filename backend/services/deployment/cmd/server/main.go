@@ -49,13 +49,14 @@ func main() {
 
 	outbox := events.NewPostgresOutbox(db, "outbox")
 	svc := deployment.NewService(deployment.Deps{
-		Applications: deployment.NewApplicationStore(db),
-		Deployments:  deployment.NewDeploymentStore(db),
-		Releases:     deployment.NewReleaseStore(db),
-		OrgMembers:   authz.NewOrgMemberRepo(db), // For org membership authorization
-		Outbox:       outbox,
-		Tenant:       db,
-		Logger:       log,
+		Applications:   deployment.NewApplicationStore(db),
+		Deployments:    deployment.NewDeploymentStore(db),
+		Releases:       deployment.NewReleaseStore(db),
+		OrgMembers:     authz.NewOrgMemberRepo(db),     // For org membership authorization
+		ProjectMembers: authz.NewProjectMemberRepo(db), // For project membership authorization
+		Outbox:         outbox,
+		Tenant:         db,
+		Logger:         log,
 	})
 	handler := deployment.NewHandler(svc, deployment.NewTokenVerifier(cfg.Auth))
 
@@ -88,6 +89,7 @@ func main() {
 		Deployments:       pipelineAdapter,
 		Releases:          pipelineAdapter,
 		OrgMembers:        authz.NewOrgMemberRepo(db),
+		ProjectMembers:    authz.NewProjectMemberRepo(db),
 		Outbox:            outbox,
 		Tenant:            db,
 		Logger:            log,
@@ -133,16 +135,17 @@ func main() {
 			os.Exit(1)
 		}
 		argoSvc := deployment.NewArgoService(deployment.ArgoServiceDeps{
-			Client:       argoClient,
-			ArgoApps:     deployment.NewArgoApplicationStore(db),
-			Applications: deployment.NewApplicationStore(db),
-			Deployments:  deployment.NewDeploymentStore(db),
-			Releases:     deployment.NewReleaseStore(db),
-			Rollouts:     deployment.NewRolloutStatusStore(db),
-			OrgMembers:   authz.NewOrgMemberRepo(db),
-			Outbox:       outbox,
-			Tenant:       db,
-			Logger:       log,
+			Client:         argoClient,
+			ArgoApps:       deployment.NewArgoApplicationStore(db),
+			Applications:   deployment.NewApplicationStore(db),
+			Deployments:    deployment.NewDeploymentStore(db),
+			Releases:       deployment.NewReleaseStore(db),
+			Rollouts:       deployment.NewRolloutStatusStore(db),
+			OrgMembers:     authz.NewOrgMemberRepo(db),
+			ProjectMembers: authz.NewProjectMemberRepo(db),
+			Outbox:         outbox,
+			Tenant:         db,
+			Logger:         log,
 		})
 		argoHandler = deployment.NewArgoHandler(argoSvc)
 		// Enable inline GitOps registration from CreateDeployment (opt-in per
@@ -167,7 +170,7 @@ func main() {
 	if err := httpserver.Run(cfg, func(app *fiber.App) {
 		deployment.RegisterRoutes(app, handler)
 		deployment.RegisterAgentRoutes(app, agentHandler, agentAuth, deployment.NewReleaseStore(db), deployment.NewDeploymentStore(db))
-		pipeline.RegisterRoutes(app, pipelineHandler, handler.RequireAuth())
+		pipeline.RegisterRoutes(app, pipelineHandler, handler.RequireAuth(), agentAuth)
 		if argoHandler != nil {
 			deployment.RegisterArgoRoutes(app, argoHandler, handler.RequireAuth())
 		}

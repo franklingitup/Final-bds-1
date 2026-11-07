@@ -3,6 +3,7 @@ package builder
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	build "github.com/bdsplatform/platform/backend/services/build/internal"
@@ -360,7 +362,24 @@ func (b *MultiBuilder) detectDockerfile(workDir, contextPath string) (string, er
 	return "", fmt.Errorf("no Dockerfile found in %s", contextDir)
 }
 
-// runCommand executes a command and streams output to the build log.
+// runCommand executes a command, streams stdout/stderr to the build log in
+// real time, and returns once BOTH the process has exited AND all output has
+// been written to the log.
+//
+// Why the WaitGroup matters (Bug A fix):
+//   cmd.Wait() closes the pipes as soon as the process exits. Without
+//   synchronisation the goroutines are still draining the pipe buffer when the
+//   caller returns. The caller's defer cancel() then fires (Bug B), making every
+//   subsequent AppendBuildLog call fail with context.Canceled — so the Docker
+//   stderr output (the actual error) is silently discarded (Bug C).
+//   wg.Wait() after cmd.Wait() guarantees all log writes are committed to the
+//   database before runCommand returns, which is before cancel() can fire.
+//
+// Why stderr is captured in addition to streamed (empty-log fix):
+//   On failure, cmd.Wait() only carries the exit status ("exit status 1"), not
+//   the error text. By accumulating stderr into a buffer we can embed the actual
+//   Docker/git output in the returned error, giving callers (and the build log)
+//   a meaningful failure message even if the real-time log writes succeeded.
 func (b *MultiBuilder) runCommand(ctx context.Context, cmd *exec.Cmd, job *build.BuildJob) error {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -375,17 +394,48 @@ func (b *MultiBuilder) runCommand(ctx context.Context, cmd *exec.Cmd, job *build
 		return err
 	}
 
-	// Stream output
-	go b.streamOutput(stdout, build.StreamStdout, job)
-	go b.streamOutput(stderr, build.StreamStderr, job)
+	// stderrCapture accumulates all stderr lines. Only the stderr goroutine
+	// writes to it, and we only read from it after wg.Wait(), so no mutex is
+	// required.
+	var stderrCapture bytes.Buffer
 
-	return cmd.Wait()
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		b.streamOutput(stdout, build.StreamStdout, job, nil)
+	}()
+	go func() {
+		defer wg.Done()
+		b.streamOutput(stderr, build.StreamStderr, job, &stderrCapture)
+	}()
+
+	// cmd.Wait() waits for the process to exit and closes the pipes,
+	// signalling EOF to the goroutines.
+	exitErr := cmd.Wait()
+
+	// wg.Wait() blocks until both goroutines have drained the pipes and
+	// committed all log entries. This MUST come after cmd.Wait().
+	wg.Wait()
+
+	if exitErr != nil {
+		if captured := strings.TrimSpace(stderrCapture.String()); captured != "" {
+			// Embed the actual command output in the error so callers can log
+			// something useful beyond "exit status 1".
+			return fmt.Errorf("%w\noutput:\n%s", exitErr, captured)
+		}
+	}
+	return exitErr
 }
 
-func (b *MultiBuilder) streamOutput(r io.Reader, stream string, job *build.BuildJob) {
+// streamOutput reads lines from r, writes each to the build log via
+// job.LogWriter, and optionally appends each line to capture (used by
+// runCommand to buffer stderr for inclusion in error messages).
+func (b *MultiBuilder) streamOutput(r io.Reader, stream string, job *build.BuildJob, capture *bytes.Buffer) {
 	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024) // Allow large lines
-	
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024) // allow large lines
+
 	for scanner.Scan() {
 		line := scanner.Text()
 		level := build.LevelInfo
@@ -393,5 +443,8 @@ func (b *MultiBuilder) streamOutput(r io.Reader, stream string, job *build.Build
 			level = build.LevelWarn
 		}
 		job.LogWriter(level, stream, line, nil)
+		if capture != nil {
+			capture.WriteString(line + "\n")
+		}
 	}
 }

@@ -128,6 +128,15 @@ func (s *Service) GetResourceMetrics(ctx context.Context, orgID, userID, resourc
 		metrics.Health = aggregateHealth(checks)
 	}
 
+	// Agent-collected deployment metrics are persisted in metric_samples.
+	// Read those samples directly because the ingest path does not remote-write
+	// them to Prometheus.
+	if resourceType == ResourceDeployment && s.metricSamples != nil {
+		if err := s.fetchDeploymentMetricsFromSamples(ctx, orgID, metrics, resourceID); err != nil {
+			return nil, err
+		}
+	}
+
 	// If Prometheus is available, fetch real metrics
 	if s.prometheus != nil {
 		s.fetchResourceMetricsFromPrometheus(ctx, metrics, resourceType, resourceID)
@@ -172,6 +181,82 @@ func (s *Service) fetchClusterMetrics(ctx context.Context, metrics *ResourceMetr
 
 func (s *Service) fetchDeploymentMetrics(ctx context.Context, metrics *ResourceMetrics, deploymentID string) {
 	// Simplified - in production, would need to resolve deployment name and namespace
+}
+
+func (s *Service) fetchDeploymentMetricsFromSamples(ctx context.Context, orgID string, metrics *ResourceMetrics, deploymentID string) error {
+	definitions := []struct {
+		name string
+		key  string
+		unit string
+	}{
+		{name: "container_cpu_usage_cores", key: "cpu_usage", unit: "cores"},
+		{name: "container_memory_usage_bytes", key: "memory_usage", unit: "bytes"},
+	}
+
+	return s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
+		for _, definition := range definitions {
+			samples, err := s.metricSamples.ListByResource(
+				ctx,
+				ResourceDeployment,
+				deploymentID,
+				definition.name,
+				1000,
+			)
+			if err != nil {
+				return err
+			}
+
+			value, updatedAt, ok := aggregateLatestMetricSamples(samples)
+			if !ok {
+				continue
+			}
+
+			metrics.Metrics[definition.key] = MetricValue{
+				Value: value,
+				Unit:  definition.unit,
+			}
+			if updatedAt.After(parseUpdatedAt(metrics.UpdatedAt)) {
+				metrics.UpdatedAt = updatedAt.Format(time.RFC3339)
+			}
+		}
+		return nil
+	})
+}
+
+// aggregateLatestMetricSamples sums the newest sample for each pod/container
+// stream. The repository returns newest-first data, so older collection cycles
+// must not be added to the current deployment total.
+func aggregateLatestMetricSamples(samples []MetricSample) (float64, time.Time, bool) {
+	latestByStream := make(map[string]MetricSample)
+	var newest time.Time
+
+	for _, sample := range samples {
+		var labels map[string]string
+		_ = json.Unmarshal(sample.Labels, &labels)
+		streamKey := labels["namespace"] + "\x00" + labels["pod"] + "\x00" + labels["container"]
+		if existing, ok := latestByStream[streamKey]; ok && !sample.Timestamp.After(existing.Timestamp) {
+			continue
+		}
+		latestByStream[streamKey] = sample
+		if sample.Timestamp.After(newest) {
+			newest = sample.Timestamp
+		}
+	}
+
+	if len(latestByStream) == 0 {
+		return 0, time.Time{}, false
+	}
+
+	var total float64
+	for _, sample := range latestByStream {
+		total += sample.Value
+	}
+	return total, newest, true
+}
+
+func parseUpdatedAt(value string) time.Time {
+	parsed, _ := time.Parse(time.RFC3339, value)
+	return parsed
 }
 
 func (s *Service) fetchApplicationMetrics(ctx context.Context, metrics *ResourceMetrics, appID string) {
@@ -554,21 +639,54 @@ func (s *Service) IngestMetrics(ctx context.Context, orgID string, req IngestMet
 
 // IngestLogs ingests logs from an agent.
 func (s *Service) IngestLogs(ctx context.Context, orgID string, req IngestLogsRequest) error {
-	// Forward to Loki if available
+	s.log.Debug("ingesting logs", "org_id", orgID, "streams", len(req.Streams))
+
+	// Forward to Loki if available.
+	// Loki is optional; its failure does not abort the ingest so the agent gets
+	// 204 and retries are managed by Loki's own durability guarantees.
 	if s.loki != nil {
 		if err := s.loki.Push(ctx, req.Streams); err != nil {
-			s.log.Warn("failed to push logs to loki", "error", err)
+			// Log at Error (not Warn) — a failing push means logs are being lost.
+			s.log.Error("failed to push logs to loki",
+				"error", err,
+				"streams", len(req.Streams),
+				"org_id", orgID)
+		} else {
+			s.log.Debug("pushed logs to loki", "streams", len(req.Streams))
 		}
 	}
 
-	// Track log streams
-	return s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
+	// Track log stream metadata (best-effort).
+	//
+	// Design note: the platform's log shipper labels streams with "deployment_id"
+	// (not "resource_id") because that is the natural identity from the agent's
+	// perspective. The service normalises that here. An empty resource_id would
+	// cause a PostgreSQL UUID cast failure that aborts the transaction; such
+	// streams are skipped rather than failing the entire ingest.
+	if err := s.tenant.WithTenant(ctx, orgID, func(ctx context.Context) error {
 		for _, entry := range req.Streams {
 			streamName := buildStreamName(entry.Stream)
+
+			// Resolve resource identity: shipper uses "deployment_id"; fall back to
+			// "resource_id" if an older/alternative shipper sets it directly.
+			resourceID := entry.Stream["deployment_id"]
+			if resourceID == "" {
+				resourceID = entry.Stream["resource_id"]
+			}
 			resourceType := entry.Stream["resource_type"]
-			resourceID := entry.Stream["resource_id"]
+			if resourceType == "" && resourceID != "" {
+				resourceType = "deployment" // deployment_id present → deployment stream
+			}
 			if resourceType == "" {
 				resourceType = "unknown"
+			}
+
+			// A non-UUID resource_id would cause a PostgreSQL cast error and abort
+			// the whole transaction. Skip the metadata record rather than failing.
+			if resourceID == "" {
+				s.log.Warn("skipping log stream metadata: no resource_id or deployment_id in stream labels",
+					"stream", streamName, "labels", entry.Stream)
+				continue
 			}
 
 			stream := &LogStream{
@@ -579,12 +697,24 @@ func (s *Service) IngestLogs(ctx context.Context, orgID string, req IngestLogsRe
 				Labels:       marshalJSON(entry.Stream),
 			}
 
+			// Return the error so WithTenant can roll back cleanly. A failed Upsert
+			// leaves the PostgreSQL transaction in aborted state; returning nil and
+			// then committing would produce a misleading "database: commit" error.
 			if err := s.logStreams.Upsert(ctx, stream); err != nil {
-				s.log.Warn("failed to upsert log stream", "error", err, "stream", streamName)
+				return fmt.Errorf("upsert log stream %q: %w", streamName, err)
 			}
 		}
 		return nil
-	})
+	}); err != nil {
+		// Metadata tracking is best-effort. Log at Error for operator visibility,
+		// but do not propagate — the agent's data was already forwarded to Loki.
+		s.log.Error("failed to track log stream metadata",
+			"error", err,
+			"org_id", orgID,
+			"streams", len(req.Streams))
+	}
+
+	return nil
 }
 
 // ----------------------------------------------------------------------------
@@ -640,7 +770,13 @@ func parseTimeRange(startStr, endStr string) (time.Time, time.Time, error) {
 	start := now.Add(-1 * time.Hour)
 	if startStr != "" {
 		if d, err := time.ParseDuration(startStr); err == nil {
-			start = now.Add(-d)
+			// Accept both lookback duration forms used by the API:
+			// "1h" means one hour ago, while "-1h" is relative to now.
+			if d < 0 {
+				start = now.Add(d)
+			} else {
+				start = now.Add(-d)
+			}
 		} else if t, err := time.Parse(time.RFC3339, startStr); err == nil {
 			start = t
 		}
