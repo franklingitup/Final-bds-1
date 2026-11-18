@@ -240,10 +240,14 @@ export interface Deployment {
   memoryLimit?: string;
   port?: number;
   envVars?: EnvVar[];
-  status: "pending" | "running" | "succeeded" | "failed" | "rolled_back";
+  status: "pending" | "running" | "succeeded" | "failed" | "rolled_back" | "awaiting_build" | "build_failed";
   readyReplicas: number;
   desiredReplicas: number;
   currentRevision?: number;
+  /** Set when the deployment was created from source rather than a pre-built image. */
+  sourceRepositoryId?: string;
+  /** ID of the most recent build associated with this source deployment. */
+  sourceBuildId?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -259,6 +263,8 @@ export interface CreateDeploymentRequest {
   memoryLimit?: string;
   port?: number;
   envVars?: EnvVar[];
+  /** When set, creates a source-based deployment in awaiting_build status. */
+  sourceRepositoryId?: string;
 }
 
 export interface UpdateDeploymentRequest {

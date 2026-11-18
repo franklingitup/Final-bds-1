@@ -93,6 +93,16 @@ const (
 
 	// DeploymentRolledBack indicates the deployment was rolled back.
 	DeploymentRolledBack DeploymentStatus = "rolled_back"
+
+	// DeploymentAwaitingBuild indicates the deployment was created from source and
+	// is waiting for its first build to complete before the agent can reconcile it.
+	// No releases exist yet; the build consumer creates the first release on success.
+	DeploymentAwaitingBuild DeploymentStatus = "awaiting_build"
+
+	// DeploymentBuildFailed indicates the most recent build for this source
+	// deployment failed. The deployment remains unreconciled until the user
+	// triggers a retry build.
+	DeploymentBuildFailed DeploymentStatus = "build_failed"
 )
 
 // String returns the string representation of the status.
@@ -103,7 +113,8 @@ func (s DeploymentStatus) String() string {
 // ValidDeploymentStatus checks if a string is a valid deployment status.
 func ValidDeploymentStatus(s string) bool {
 	switch DeploymentStatus(s) {
-	case DeploymentPending, DeploymentRunning, DeploymentSucceeded, DeploymentFailed, DeploymentRolledBack:
+	case DeploymentPending, DeploymentRunning, DeploymentSucceeded, DeploymentFailed, DeploymentRolledBack,
+		DeploymentAwaitingBuild, DeploymentBuildFailed:
 		return true
 	default:
 		return false

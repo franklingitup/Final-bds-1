@@ -1,5 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { deploymentsApi } from "@/lib/api";
+import { buildsApi } from "@/lib/api/builds";
 import type { CreateDeploymentRequest, UpdateDeploymentRequest, RollbackRequest } from "@/types/api";
 import { toast } from "@/hooks/use-toast";
 
@@ -109,6 +110,35 @@ export function useRollback(orgId: string, deploymentId: string) {
     onError: (error) => {
       toast({
         title: "Failed to rollback",
+        description: error.message,
+        variant: "destructive",
+      });
+    },
+  });
+}
+
+/**
+ * Retry the latest failed build for a source deployment.
+ * Reads the deployment's sourceBuildId and calls the build retry API.
+ */
+export function useRetryBuild(orgId: string, deploymentId: string) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (_: undefined) => {
+      const deployment = await deploymentsApi.get(orgId, deploymentId);
+      if (!deployment.sourceBuildId) {
+        throw new Error("No build associated with this deployment");
+      }
+      return buildsApi.retryBuild(orgId, deployment.sourceBuildId);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["organizations", orgId, "deployments", deploymentId] });
+      toast({ title: "Build retry triggered", description: "A new build has been queued." });
+    },
+    onError: (error: Error) => {
+      toast({
+        title: "Failed to retry build",
         description: error.message,
         variant: "destructive",
       });

@@ -18,11 +18,13 @@ const (
 // Deployment statuses - aliases for the canonical shared package.
 // Use deploymentstatus.DeploymentStatus constants directly when possible.
 const (
-	StatusPending    = string(deploymentstatus.DeploymentPending)
-	StatusRunning    = string(deploymentstatus.DeploymentRunning)
-	StatusSucceeded  = string(deploymentstatus.DeploymentSucceeded)
-	StatusFailed     = string(deploymentstatus.DeploymentFailed)
-	StatusRolledBack = string(deploymentstatus.DeploymentRolledBack)
+	StatusPending       = string(deploymentstatus.DeploymentPending)
+	StatusRunning       = string(deploymentstatus.DeploymentRunning)
+	StatusSucceeded     = string(deploymentstatus.DeploymentSucceeded)
+	StatusFailed        = string(deploymentstatus.DeploymentFailed)
+	StatusRolledBack    = string(deploymentstatus.DeploymentRolledBack)
+	StatusAwaitingBuild = string(deploymentstatus.DeploymentAwaitingBuild)
+	StatusBuildFailed   = string(deploymentstatus.DeploymentBuildFailed)
 )
 
 // Release statuses - aliases for the canonical shared package.
@@ -68,6 +70,14 @@ type Deployment struct {
 	// and applies its own fallback — preserving pre-environment behaviour exactly.
 	// Additive and optional — omitting it leaves existing deployments unchanged.
 	EnvironmentID *string `db:"environment_id"`
+	// SourceRepositoryID, when set, indicates this deployment was created from
+	// source rather than from a pre-built image. The build consumer matches
+	// incoming build.succeeded / build.failed events by imageRepository and
+	// transitions the deployment out of awaiting_build.
+	SourceRepositoryID *string `db:"source_repository_id"`
+	// SourceBuildID is the ID of the most recent build associated with this
+	// source deployment. Updated by the build consumer on each event.
+	SourceBuildID *string `db:"source_build_id"`
 }
 
 // Promotion statuses.
@@ -169,6 +179,12 @@ type CreateDeploymentRequest struct {
 	// Additive and optional — omitting it preserves the existing image-based
 	// deployment behaviour exactly.
 	GitOps *GitOpsSource `json:"gitops,omitempty"`
+	// SourceRepositoryID, when set, creates a "deploy from source" deployment.
+	// The deployment is created in awaiting_build status with no initial release;
+	// Image should be the full {registry}/{image} path (without tag) so the build
+	// consumer can match build events by imageRepository. The caller must trigger
+	// a build after creating the deployment.
+	SourceRepositoryID *string `json:"sourceRepositoryId,omitempty"`
 }
 
 type UpdateDeploymentRequest struct {
@@ -265,11 +281,13 @@ type DeploymentView struct {
 	MemoryLimit     string    `json:"memoryLimit,omitempty"`
 	Port            *int      `json:"port,omitempty"`
 	EnvVars         []EnvVar  `json:"envVars,omitempty"`
-	Status          string    `json:"status"`
-	ReadyReplicas   int       `json:"readyReplicas"`
-	DesiredReplicas int       `json:"desiredReplicas"`
-	CurrentRevision *int      `json:"currentRevision,omitempty"`
-	CreatedAt       time.Time `json:"createdAt"`
+	Status             string    `json:"status"`
+	ReadyReplicas      int       `json:"readyReplicas"`
+	DesiredReplicas    int       `json:"desiredReplicas"`
+	CurrentRevision    *int      `json:"currentRevision,omitempty"`
+	SourceRepositoryID *string   `json:"sourceRepositoryId,omitempty"`
+	SourceBuildID      *string   `json:"sourceBuildId,omitempty"`
+	CreatedAt          time.Time `json:"createdAt"`
 }
 
 func deref(s *string) string {
@@ -299,11 +317,13 @@ func toDeploymentView(d *Deployment, currentRevision *int) DeploymentView {
 		MemoryLimit:     deref(d.MemoryLimit),
 		Port:            d.Port,
 		EnvVars:         envVars,
-		Status:          d.Status,
-		ReadyReplicas:   d.ReadyReplicas,
-		DesiredReplicas: d.DesiredReplicas,
-		CurrentRevision: currentRevision,
-		CreatedAt:       d.CreatedAt,
+		Status:             d.Status,
+		ReadyReplicas:      d.ReadyReplicas,
+		DesiredReplicas:    d.DesiredReplicas,
+		CurrentRevision:    currentRevision,
+		SourceRepositoryID: d.SourceRepositoryID,
+		SourceBuildID:      d.SourceBuildID,
+		CreatedAt:          d.CreatedAt,
 	}
 }
 

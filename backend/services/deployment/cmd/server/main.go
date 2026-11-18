@@ -52,6 +52,8 @@ func main() {
 		Applications:   deployment.NewApplicationStore(db),
 		Deployments:    deployment.NewDeploymentStore(db),
 		Releases:       deployment.NewReleaseStore(db),
+		Environments:   deployment.NewEnvironmentStore(db),
+		Promotions:     deployment.NewPromotionStore(db),
 		OrgMembers:     authz.NewOrgMemberRepo(db),     // For org membership authorization
 		ProjectMembers: authz.NewProjectMemberRepo(db), // For project membership authorization
 		Outbox:         outbox,
@@ -123,6 +125,21 @@ func main() {
 		os.Exit(1)
 	}
 	defer buildConsumer.Stop()
+
+	// Consume build.failed events and transition source deployments to build_failed.
+	buildFailureConsumer := deployment.NewBuildFailureConsumer(deployment.BuildFailureConsumerDeps{
+		Deployments:   deployment.NewDeploymentStore(db),
+		Processed:     deployment.NewProcessedEventStore(db),
+		Tenant:        db,
+		Subscriber:    subscriber,
+		SubjectPrefix: cfg.NATS.SubjectPrefix,
+		Logger:        log,
+	})
+	if err := buildFailureConsumer.Start(ctx); err != nil {
+		log.Error("start build failure consumer", "error", err)
+		os.Exit(1)
+	}
+	defer buildFailureConsumer.Stop()
 
 	// GitOps (Argo CD) deployment engine. Additive and opt-in: enabled only when
 	// ARGOCD_ENABLED=true and an Argo CD server URL is configured. When disabled

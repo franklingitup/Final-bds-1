@@ -84,7 +84,7 @@ INNER JOIN releases r ON r.deployment_id = d.id
 LEFT  JOIN environments e ON e.id = d.environment_id
 WHERE d.cluster_id = $1
   AND d.org_id = $2
-  AND d.status NOT IN ('deleted', 'deleting')
+  AND d.status NOT IN ('deleted', 'deleting', 'awaiting_build', 'build_failed')
   AND r.status IN ('pending', 'deploying', 'succeeded')
 ORDER BY d.id, r.revision DESC`
 

@@ -258,18 +258,25 @@ func (s *Service) CreateDeployment(ctx context.Context, orgID, userID string, re
 		envVars = []byte("[]")
 	}
 
+	// Source deployments start in awaiting_build; image-based deployments are pending.
+	initialStatus := StatusPending
+	if req.SourceRepositoryID != nil {
+		initialStatus = StatusAwaitingBuild
+	}
+
 	dep := &Deployment{
-		ApplicationID: req.ApplicationID,
-		ClusterID:     req.ClusterID,
-		Image:         req.Image,
-		Replicas:      req.Replicas,
-		CPURequest:    req.CPURequest,
-		CPULimit:      req.CPULimit,
-		MemoryRequest: req.MemoryRequest,
-		MemoryLimit:   req.MemoryLimit,
-		Port:          req.Port,
-		EnvVars:       envVars,
-		Status:        StatusPending,
+		ApplicationID:      req.ApplicationID,
+		ClusterID:          req.ClusterID,
+		Image:              req.Image,
+		Replicas:           req.Replicas,
+		CPURequest:         req.CPURequest,
+		CPULimit:           req.CPULimit,
+		MemoryRequest:      req.MemoryRequest,
+		MemoryLimit:        req.MemoryLimit,
+		Port:               req.Port,
+		EnvVars:            envVars,
+		Status:             initialStatus,
+		SourceRepositoryID: req.SourceRepositoryID,
 	}
 	dep.OrgID = orgID
 	dep.CreatedBy = &userID
@@ -289,6 +296,21 @@ func (s *Service) CreateDeployment(ctx context.Context, orgID, userID string, re
 		// Create deployment.
 		if err := s.deps.Create(ctx, dep); err != nil {
 			return err
+		}
+
+		// Source deployments have no initial release — the build consumer creates
+		// the first release when the first build succeeds. Skip release creation.
+		if req.SourceRepositoryID != nil {
+			return s.enqueue(ctx, EventDeploymentCreated, orgID, deploymentCreatedPayload{
+				DeploymentID:  dep.ID,
+				ApplicationID: dep.ApplicationID,
+				ClusterID:     dep.ClusterID,
+				Image:         dep.Image,
+				Replicas:      dep.Replicas,
+				Revision:      0,
+			},
+				events.WithActor(events.Actor{Type: "user", ID: userID}),
+				events.WithResource(events.Resource{Type: "deployment", ID: dep.ID}))
 		}
 
 		// Create initial release (revision 1).

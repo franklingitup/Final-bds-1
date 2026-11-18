@@ -179,14 +179,16 @@ func (r *deploymentRepo) Create(ctx context.Context, d *Deployment) error {
 	const sql = `
 INSERT INTO deployments (id, org_id, application_id, cluster_id, image, replicas,
     cpu_request, cpu_limit, memory_request, memory_limit, port, env_vars,
-    status, desired_replicas, created_by, environment_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+    status, desired_replicas, created_by, environment_id,
+    source_repository_id, source_build_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 RETURNING created_at, updated_at, version`
 
 	row := r.db.Conn(ctx).QueryRow(ctx, sql,
 		d.ID, d.OrgID, d.ApplicationID, d.ClusterID, d.Image, d.Replicas,
 		d.CPURequest, d.CPULimit, d.MemoryRequest, d.MemoryLimit, d.Port, d.EnvVars,
-		d.Status, d.DesiredReplicas, d.CreatedBy, d.EnvironmentID)
+		d.Status, d.DesiredReplicas, d.CreatedBy, d.EnvironmentID,
+		d.SourceRepositoryID, d.SourceBuildID)
 	return database.MapError(row.Scan(&d.CreatedAt, &d.UpdatedAt, &d.Version))
 }
 
@@ -266,13 +268,14 @@ func (r *deploymentRepo) Update(ctx context.Context, d *Deployment) error {
 UPDATE deployments
 SET image = $1, replicas = $2, cpu_request = $3, cpu_limit = $4, 
     memory_request = $5, memory_limit = $6, port = $7, env_vars = $8,
-    desired_replicas = $9, version = version + 1, updated_at = now()
-WHERE id = $10 AND version = $11`
+    desired_replicas = $9, source_build_id = $10,
+    version = version + 1, updated_at = now()
+WHERE id = $11 AND version = $12`
 
 	tag, err := r.db.Conn(ctx).Exec(ctx, sql,
 		d.Image, d.Replicas, d.CPURequest, d.CPULimit,
 		d.MemoryRequest, d.MemoryLimit, d.Port, d.EnvVars,
-		d.Replicas, d.ID, d.Version)
+		d.Replicas, d.SourceBuildID, d.ID, d.Version)
 	if err != nil {
 		return database.MapError(err)
 	}

@@ -10,6 +10,8 @@ type Status =
   | "failed"
   | "deploying"
   | "rolled_back"
+  | "awaiting_build"
+  | "build_failed"
   | "active"
   | "used"
   | "expired"
@@ -25,6 +27,8 @@ const statusConfig: Record<Status, { label: string; variant: BadgeProps["variant
   failed: { label: "Failed", variant: "destructive" },
   deploying: { label: "Deploying", variant: "default" },
   rolled_back: { label: "Rolled Back", variant: "warning" },
+  awaiting_build: { label: "Awaiting Build", variant: "secondary" },
+  build_failed: { label: "Build Failed", variant: "destructive" },
   active: { label: "Active", variant: "success" },
   used: { label: "Used", variant: "secondary" },
   expired: { label: "Expired", variant: "warning" },

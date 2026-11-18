@@ -10,6 +10,7 @@ package middleware
 import (
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -145,7 +146,11 @@ func Recover(log *slog.Logger) fiber.Handler {
 
 		defer func() {
 			if r := recover(); r != nil {
-				log.ErrorContext(c.UserContext(), "panic recovered", slog.Any("panic", r))
+				stack := debug.Stack()
+				log.ErrorContext(c.UserContext(), "panic recovered",
+					slog.Any("panic", r),
+					slog.String("stack", string(stack)),
+				)
 				err = errors.Internal("internal server error")
 			}
 			fmt.Printf("\n=== MIDDLEWARE EXIT ===\nmiddleware=Recover\nstatus=%d\nerror=%v\n", c.Response().StatusCode(), err)

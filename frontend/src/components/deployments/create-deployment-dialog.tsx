@@ -22,17 +22,18 @@ import { useCreateDeployment } from "@/hooks/use-deployments";
 import { useApplications } from "@/hooks/use-applications";
 import { useClusters } from "@/hooks/use-clusters";
 import { useProjects } from "@/hooks/use-projects";
+import { useRepositories, useCreateBuild } from "@/hooks/use-builds";
 
 const envVarSchema = z.object({
   name: z.string().min(1),
   value: z.string().min(1),
 });
 
-const createDeploymentSchema = z.object({
+// Base fields shared by both modes.
+const baseSchema = z.object({
   projectId: z.string().min(1, "Project is required"),
   applicationId: z.string().min(1, "Application is required"),
   clusterId: z.string().min(1, "Cluster is required"),
-  image: z.string().min(1, "Image is required"),
   replicas: z.coerce.number().min(1, "At least 1 replica required").max(100),
   port: z.coerce.number().optional(),
   cpuRequest: z.string().optional(),
@@ -40,7 +41,27 @@ const createDeploymentSchema = z.object({
   memoryRequest: z.string().optional(),
   memoryLimit: z.string().optional(),
   envVars: z.array(envVarSchema).default([]),
+  mode: z.enum(["image", "source"]).default("image"),
 });
+
+const createDeploymentSchema = baseSchema.and(
+  z.discriminatedUnion("mode", [
+    z.object({
+      mode: z.literal("image"),
+      image: z.string().min(1, "Image is required"),
+      sourceRepositoryId: z.string().optional(),
+      targetImage: z.string().optional(),
+    }),
+    z.object({
+      mode: z.literal("source"),
+      image: z.string().optional(),
+      // Repository to build from.
+      sourceRepositoryId: z.string().min(1, "Repository is required"),
+      // The image path (registry/name without tag) to push to and deploy from.
+      targetImage: z.string().min(1, "Target image is required"),
+    }),
+  ])
+);
 
 type CreateDeploymentForm = z.infer<typeof createDeploymentSchema>;
 
@@ -60,6 +81,7 @@ export function CreateDeploymentDialog({
   const orgSlug = params.orgSlug as string;
 
   const createDeployment = useCreateDeployment(orgId);
+  const createBuild = useCreateBuild(orgId);
   const { data: projects } = useProjects(orgId);
   const { data: clusters } = useClusters(orgId, "connected");
 
@@ -69,7 +91,10 @@ export function CreateDeploymentDialog({
       projectId: "",
       applicationId: "",
       clusterId: "",
+      mode: "image",
       image: "",
+      sourceRepositoryId: "",
+      targetImage: "",
       replicas: 1,
       port: undefined,
       cpuRequest: "100m",
@@ -80,28 +105,65 @@ export function CreateDeploymentDialog({
     },
   });
 
-  const { handleSubmit, watch, control, reset, formState: { isSubmitting } } = methods;
+  const { handleSubmit, watch, control, reset, setValue, formState: { isSubmitting } } = methods;
   const { fields, append, remove } = useFieldArray({ control, name: "envVars" });
 
   const selectedProjectId = watch("projectId");
+  const mode = watch("mode");
+
   const { data: apps } = useApplications(orgId, selectedProjectId);
+  const { data: repositories } = useRepositories(orgId, selectedProjectId);
 
   const onSubmit = async (data: CreateDeploymentForm) => {
-    const deployment = await createDeployment.mutateAsync({
-      applicationId: data.applicationId,
-      clusterId: data.clusterId,
-      image: data.image,
-      replicas: data.replicas,
-      port: data.port,
-      cpuRequest: data.cpuRequest,
-      cpuLimit: data.cpuLimit,
-      memoryRequest: data.memoryRequest,
-      memoryLimit: data.memoryLimit,
-      envVars: data.envVars,
-    });
-    reset();
-    onOpenChange(false);
-    router.push(`/${orgSlug}/deployments/${deployment.id}`);
+    if (data.mode === "source") {
+      // Source mode: create deployment in awaiting_build, then trigger the first build.
+      const deployment = await createDeployment.mutateAsync({
+        applicationId: data.applicationId,
+        clusterId: data.clusterId,
+        // image = the target image path (registry/name without tag).
+        // The build consumer will pin to the immutable digest on success.
+        image: data.targetImage!,
+        replicas: data.replicas,
+        port: data.port,
+        cpuRequest: data.cpuRequest,
+        cpuLimit: data.cpuLimit,
+        memoryRequest: data.memoryRequest,
+        memoryLimit: data.memoryLimit,
+        envVars: data.envVars,
+        sourceRepositoryId: data.sourceRepositoryId,
+      });
+
+      // Trigger the first build from the repository's default branch.
+      const repo = repositories?.items.find((r) => r.id === data.sourceRepositoryId);
+      await createBuild.mutateAsync({
+        repositoryId: data.sourceRepositoryId,
+        gitRef: repo?.defaultBranch || "main",
+        targetImage: data.targetImage!,
+        targetRegistry: "", // registry is embedded in targetImage
+        pushToRegistry: true,
+      });
+
+      reset();
+      onOpenChange(false);
+      router.push(`/${orgSlug}/deployments/${deployment.id}`);
+    } else {
+      // Image mode: standard create with initial release.
+      const deployment = await createDeployment.mutateAsync({
+        applicationId: data.applicationId,
+        clusterId: data.clusterId,
+        image: data.image!,
+        replicas: data.replicas,
+        port: data.port,
+        cpuRequest: data.cpuRequest,
+        cpuLimit: data.cpuLimit,
+        memoryRequest: data.memoryRequest,
+        memoryLimit: data.memoryLimit,
+        envVars: data.envVars,
+      });
+      reset();
+      onOpenChange(false);
+      router.push(`/${orgSlug}/deployments/${deployment.id}`);
+    }
   };
 
   return (
@@ -140,20 +202,81 @@ export function CreateDeploymentDialog({
               required
             />
 
-            <div className="grid grid-cols-2 gap-4">
-              <FormInput<CreateDeploymentForm>
-                name="image"
-                label="Docker Image"
-                placeholder="nginx:latest"
-                required
-              />
-              <FormInput<CreateDeploymentForm>
-                name="replicas"
-                label="Replicas"
-                type="number"
-                required
-              />
+            {/* Mode toggle */}
+            <div className="space-y-2">
+              <Label>Deployment Source</Label>
+              <div className="flex rounded-md border">
+                <button
+                  type="button"
+                  className={`flex-1 px-4 py-2 text-sm font-medium rounded-l-md transition-colors ${
+                    mode === "image"
+                      ? "bg-primary text-primary-foreground"
+                      : "hover:bg-muted"
+                  }`}
+                  onClick={() => setValue("mode", "image")}
+                >
+                  Docker Image
+                </button>
+                <button
+                  type="button"
+                  className={`flex-1 px-4 py-2 text-sm font-medium rounded-r-md transition-colors ${
+                    mode === "source"
+                      ? "bg-primary text-primary-foreground"
+                      : "hover:bg-muted"
+                  }`}
+                  onClick={() => setValue("mode", "source")}
+                >
+                  Deploy from Source
+                </button>
+              </div>
             </div>
+
+            {mode === "image" ? (
+              <div className="grid grid-cols-2 gap-4">
+                <FormInput<CreateDeploymentForm>
+                  name="image"
+                  label="Docker Image"
+                  placeholder="nginx:latest"
+                  required
+                />
+                <FormInput<CreateDeploymentForm>
+                  name="replicas"
+                  label="Replicas"
+                  type="number"
+                  required
+                />
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <div className="grid grid-cols-2 gap-4">
+                  <FormSelect<CreateDeploymentForm>
+                    name="sourceRepositoryId"
+                    label="Repository"
+                    placeholder="Select repository"
+                    options={repositories?.items.map((r) => ({ value: r.id, label: r.name })) || []}
+                    required
+                  />
+                  <FormInput<CreateDeploymentForm>
+                    name="replicas"
+                    label="Replicas"
+                    type="number"
+                    required
+                  />
+                </div>
+                <FormInput<CreateDeploymentForm>
+                  name="targetImage"
+                  label="Target Image"
+                  placeholder="registry.example.com/myorg/myapp"
+                  description="The registry/image path (without tag) to push the built image to"
+                  required
+                />
+                <p className="text-xs text-muted-foreground">
+                  A build will be triggered immediately after creating the deployment.
+                  The deployment will stay in <strong>Awaiting Build</strong> status until
+                  the first build completes.
+                </p>
+              </div>
+            )}
 
             <FormInput<CreateDeploymentForm>
               name="port"
@@ -233,7 +356,7 @@ export function CreateDeploymentDialog({
                 Cancel
               </Button>
               <Button type="submit" loading={isSubmitting}>
-                Deploy
+                {mode === "source" ? "Deploy from Source" : "Deploy"}
               </Button>
             </DialogFooter>
           </form>

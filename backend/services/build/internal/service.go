@@ -652,6 +652,8 @@ func (s *Service) MarkBuildFailed(ctx context.Context, orgID, buildID string, er
 			ErrorMessage: errorMsg,
 			Stage:        stage,
 			RetryCount:   b.RetryCount,
+			Image:        b.TargetImage,
+			Registry:     b.TargetRegistry,
 		}, events.WithResource(events.Resource{Type: "build", ID: buildID}))
 	})
 }

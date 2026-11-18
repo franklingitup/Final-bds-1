@@ -26,10 +26,18 @@ const (
 	// ledger).
 	BuildConsumerDurable = "deployment-build-consumer"
 
+	// BuildFailureConsumerDurable is the stable JetStream consumer name for the
+	// build.failed event subscription that transitions source deployments to
+	// build_failed status.
+	BuildFailureConsumerDurable = "deployment-build-failure-consumer"
+
 	// eventBuildSucceeded is the event type owned by the Build service. The
 	// deployment service integrates against the wire contract (event type + JSON
 	// payload), not the build Go package, so the two services stay decoupled.
 	eventBuildSucceeded = "build.succeeded"
+
+	// eventBuildFailed is the build.failed event type, owned by the Build service.
+	eventBuildFailed = "build.failed"
 )
 
 // Consumer outcome labels for the deployment_build_events_total metric.
@@ -307,6 +315,7 @@ func (c *BuildConsumer) process(ctx context.Context, e events.Envelope) (buildPr
 			// pending so the derived desired state the agent pulls (latest
 			// release per deployment) reflects the new revision.
 			d.Image = pinnedImage
+			d.SourceBuildID = &payload.BuildID
 			if err := c.deps.Update(ctx, &d); err != nil {
 				return err
 			}
@@ -365,6 +374,152 @@ func composeImageRef(registry, image string) string {
 		return image
 	}
 	return registry + "/" + image
+}
+
+// ----------------------------------------------------------------------------
+// BuildFailureConsumer — build.failed event subscription
+// ----------------------------------------------------------------------------
+
+// buildFailedEvent is the deployment service's read model of the Build
+// service's build.failed payload. We own our copy of the contract.
+type buildFailedEvent struct {
+	BuildID      string `json:"buildId"`
+	ErrorMessage string `json:"errorMessage"`
+	Stage        string `json:"stage"`
+	RetryCount   int    `json:"retryCount"`
+	Image        string `json:"image"`
+	Registry     string `json:"registry"`
+}
+
+// BuildFailureConsumerDeps are the dependencies of the build failure consumer.
+type BuildFailureConsumerDeps struct {
+	Deployments   DeploymentStore
+	Processed     ProcessedEventStore
+	Tenant        TenantRunner
+	Subscriber    events.Subscriber
+	SubjectPrefix string
+	Logger        *slog.Logger
+	Now           func() time.Time
+}
+
+// BuildFailureConsumer subscribes to build.failed events and transitions
+// source deployments that are awaiting_build to build_failed status.
+// Only deployments with matching imageRepository and in awaiting_build status
+// are affected; running deployments are not touched by build failures.
+type BuildFailureConsumer struct {
+	deps       DeploymentStore
+	processed  ProcessedEventStore
+	tenant     TenantRunner
+	subscriber events.Subscriber
+	prefix     string
+	log        *slog.Logger
+	now        func() time.Time
+	sub        events.Subscription
+}
+
+// NewBuildFailureConsumer wires a BuildFailureConsumer from its dependencies.
+func NewBuildFailureConsumer(d BuildFailureConsumerDeps) *BuildFailureConsumer {
+	if d.Logger == nil {
+		d.Logger = slog.Default()
+	}
+	if d.Now == nil {
+		d.Now = time.Now
+	}
+	return &BuildFailureConsumer{
+		deps:       d.Deployments,
+		processed:  d.Processed,
+		tenant:     d.Tenant,
+		subscriber: d.Subscriber,
+		prefix:     d.SubjectPrefix,
+		log:        d.Logger,
+		now:        d.Now,
+	}
+}
+
+// Start registers the durable subscription filtered to build.failed events.
+func (c *BuildFailureConsumer) Start(ctx context.Context) error {
+	filter := eventBuildFailed + ".*"
+	if c.prefix != "" {
+		filter = c.prefix + "." + filter
+	}
+	sub, err := c.subscriber.Subscribe(ctx, events.SubscriptionOptions{
+		Durable:       BuildFailureConsumerDurable,
+		FilterSubject: filter,
+	}, c.handle)
+	if err != nil {
+		return err
+	}
+	c.sub = sub
+	return nil
+}
+
+// Stop halts delivery.
+func (c *BuildFailureConsumer) Stop() {
+	if c.sub != nil {
+		c.sub.Stop()
+	}
+}
+
+func (c *BuildFailureConsumer) handle(ctx context.Context, e events.Envelope) error {
+	if e.Type != eventBuildFailed {
+		return nil
+	}
+	if e.OrgID == "" {
+		c.log.WarnContext(ctx, "build.failed missing orgId", "eventId", e.EventID)
+		return nil
+	}
+
+	payload, err := events.DecodePayload[buildFailedEvent](e)
+	if err != nil {
+		c.log.WarnContext(ctx, "build.failed payload decode failed", "eventId", e.EventID, "error", err)
+		return nil
+	}
+
+	if payload.Image == "" {
+		// Legacy event without image info — cannot match a deployment, skip safely.
+		return nil
+	}
+
+	buildRepo := imageRepository(composeImageRef(payload.Registry, payload.Image))
+
+	return c.tenant.WithTenant(ctx, e.OrgID, func(ctx context.Context) error {
+		// Idempotency guard.
+		inserted, err := c.processed.MarkProcessed(ctx, BuildFailureConsumerDurable, e.EventID, e.OrgID)
+		if err != nil {
+			return err
+		}
+		if !inserted {
+			return nil // already handled
+		}
+
+		deployments, err := c.deps.ListAllActive(ctx)
+		if err != nil {
+			return err
+		}
+
+		errMsg := payload.ErrorMessage
+		for i := range deployments {
+			d := deployments[i]
+			// Only source deployments stuck in awaiting_build are transitioned.
+			if d.Status != StatusAwaitingBuild {
+				continue
+			}
+			if imageRepository(d.Image) != buildRepo {
+				continue
+			}
+			// Record which build caused the failure so the UI can offer retry.
+			d.SourceBuildID = &payload.BuildID
+			if err := c.deps.Update(ctx, &d); err != nil {
+				return err
+			}
+			if err := c.deps.UpdateStatus(ctx, d.ID, StatusBuildFailed, nil, &errMsg); err != nil {
+				return err
+			}
+			c.log.InfoContext(ctx, "source deployment transitioned to build_failed",
+				"deploymentId", d.ID, "buildId", payload.BuildID, "stage", payload.Stage)
+		}
+		return nil
+	})
 }
 
 // imageRepository strips any tag and digest from an image reference, returning

@@ -23,7 +23,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { useDeployment, useReleases, useRollback } from "@/hooks/use-deployments";
+import { useDeployment, useReleases, useRollback, useRetryBuild } from "@/hooks/use-deployments";
 import { useOrganization } from "@/providers/organization-provider";
 import { formatDate, formatRelativeTime } from "@/lib/utils";
 import { observabilityApi, type LogsResponse, type ResourceMetrics } from "@/lib/api/observability";
@@ -102,6 +102,7 @@ export default function DeploymentDetailPage() {
   const { data: deployment, isLoading, error, refetch } = useDeployment(orgId, deploymentId);
   const { data: releases } = useReleases(orgId, deploymentId);
   const rollback = useRollback(orgId, deploymentId);
+  const retryBuild = useRetryBuild(orgId, deploymentId);
   
   // State for active tab to enable lazy loading of observability data
   const [activeTab, setActiveTab] = React.useState("releases");
@@ -199,20 +200,39 @@ export default function DeploymentDetailPage() {
         action={
           <div className="flex items-center gap-2">
             <DeploymentStatusBadge status={deployment.status} />
-            <ConfirmDialog
-              trigger={
-                <Button variant="outline">
-                  <RotateCcw className="mr-2 h-4 w-4" />
-                  Rollback
-                </Button>
-              }
-              title="Rollback Deployment"
-              description="This will rollback to the previous release. Are you sure?"
-              confirmLabel="Rollback"
-              onConfirm={async () => {
-                await rollback.mutateAsync(undefined);
-              }}
-            />
+            {/* build_failed: offer retry; failed/rolled_back: offer rollback; awaiting_build: no action */}
+            {deployment.status === "build_failed" && (
+              <ConfirmDialog
+                trigger={
+                  <Button variant="outline">
+                    <RefreshCw className="mr-2 h-4 w-4" />
+                    Retry Build
+                  </Button>
+                }
+                title="Retry Build"
+                description="This will trigger a new build from the source repository. Are you sure?"
+                confirmLabel="Retry"
+                onConfirm={async () => {
+                  await retryBuild.mutateAsync(undefined);
+                }}
+              />
+            )}
+            {(deployment.status === "failed" || deployment.status === "rolled_back") && (
+              <ConfirmDialog
+                trigger={
+                  <Button variant="outline">
+                    <RotateCcw className="mr-2 h-4 w-4" />
+                    Rollback
+                  </Button>
+                }
+                title="Rollback Deployment"
+                description="This will rollback to the previous release. Are you sure?"
+                confirmLabel="Rollback"
+                onConfirm={async () => {
+                  await rollback.mutateAsync(undefined);
+                }}
+              />
+            )}
           </div>
         }
       />

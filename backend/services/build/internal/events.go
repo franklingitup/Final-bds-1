@@ -80,6 +80,12 @@ type buildFailedPayload struct {
 	ErrorMessage string `json:"errorMessage"`
 	Stage        string `json:"stage"` // cloning | building | pushing
 	RetryCount   int    `json:"retryCount"`
+	// Image and Registry identify the target image, mirroring buildSucceededPayload.
+	// They let downstream consumers (e.g. the deployment service) identify which
+	// source deployments are affected and transition them to build_failed.
+	// Additive to the v1 contract; older consumers ignore them.
+	Image    string `json:"image,omitempty"`
+	Registry string `json:"registry,omitempty"`
 }
 
 type buildCancelledPayload struct {
